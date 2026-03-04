@@ -12,30 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! An QUIC server based on the high level endpoint API.
+//! A raw-QUIC throughput server (reverse mode, like `iperf3 -R`).
+//! HTTP/3 and HTTP/0.9 have been removed.  All QUIC transport features
+//! (congestion control, multipath, qlog …) are preserved.
+//!
+//! The server waits for the client to open a bidirectional stream, then pumps
+//! bulk data back on that same stream.
 
 use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
-use std::path;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
-use std::vec;
 
 use bytes::Bytes;
 use clap::Parser;
-
 use log::*;
 use mio::event::Event;
 use rustc_hash::FxHashMap;
 
-use tquic::h3::connection::Http3Connection;
-use tquic::h3::Header;
-use tquic::h3::Http3Config;
-use tquic::h3::NameValue;
 use tquic::CertCompressionAlgorithm;
 use tquic::Config;
 use tquic::CongestionControlAlgorithm;
@@ -46,7 +43,6 @@ use tquic::MultipathAlgorithm;
 use tquic::PacketInfo;
 use tquic::TlsConfig;
 use tquic::TransportHandler;
-use tquic_tools::ApplicationProto;
 use tquic_tools::CertCompressionAlgorithmArg;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
@@ -55,41 +51,37 @@ use tquic_tools::Result;
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+// ─────────────────────────────── CLI options ─────────────────────────────────
+
 #[derive(Parser, Debug)]
-#[clap(name = "server", version=env!("CARGO_PKG_VERSION"))]
+#[clap(name = "server", version = env!("CARGO_PKG_VERSION"))]
 pub struct ServerOpt {
-    /// Address to listen.
+    /// Address to listen on.
     #[clap(short, long, default_value = "0.0.0.0:4433", value_name = "ADDR")]
     pub listen: SocketAddr,
 
     /// TLS certificate in PEM format.
-    #[clap(
-        short,
-        long = "cert",
-        default_value = "./cert.crt",
-        value_name = "FILE"
-    )]
+    #[clap(short, long = "cert", default_value = "./cert.crt", value_name = "FILE")]
     pub cert_file: String,
 
     /// TLS private key in PEM format.
     #[clap(short, long = "key", default_value = "./cert.key", value_name = "FILE")]
     pub key_file: String,
 
-    /// Document root directory.
-    #[clap(short, long, default_value = "./", value_name = "DIR")]
-    pub root: String,
+    /// Total bytes to send per stream (0 = unlimited until client closes connection).
+    #[clap(long, default_value = "0", value_name = "BYTES", help_heading = "Transfer")]
+    pub send_size: usize,
 
+    /// Chunk size for each stream_write call.
+    #[clap(long, default_value = "65536", value_name = "BYTES", help_heading = "Transfer")]
+    pub chunk_size: usize,
+
+    // ── Protocol ──────────────────────────────────────────────────────────────
     /// Session ticket key.
-    #[clap(
-        short,
-        long,
-        default_value = "tquic key",
-        value_name = "STR",
-        help_heading = "Protocol"
-    )]
+    #[clap(short, long, default_value = "tquic key", value_name = "STR", help_heading = "Protocol")]
     pub ticket_key: String,
 
-    /// Key for generating address token.
+    /// Key for generating address tokens.
     #[clap(long, value_name = "STR", help_heading = "Protocol")]
     pub address_token_key: Option<String>,
 
@@ -110,126 +102,67 @@ pub struct ServerOpt {
     pub congestion_control_algor: CongestionControlAlgorithm,
 
     /// Initial congestion window in packets.
-    #[clap(
-        long,
-        default_value = "32",
-        value_name = "NUM",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "32", value_name = "NUM", help_heading = "Protocol")]
     pub initial_congestion_window: u64,
 
     /// Minimum congestion window in packets.
-    #[clap(
-        long,
-        default_value = "4",
-        value_name = "NUM",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "4", value_name = "NUM", help_heading = "Protocol")]
     pub min_congestion_window: u64,
 
     /// Enable multipath transport.
     #[clap(short, long, help_heading = "Protocol")]
     pub enable_multipath: bool,
 
-    /// Multipath scheduling algorithm
+    /// Multipath scheduling algorithm.
     #[clap(short, long, default_value = "MINRTT", help_heading = "Protocol")]
     pub multipath_algor: MultipathAlgorithm,
 
-    /// Set active_connection_id_limit transport parameter. Values lower than 2 will be ignored.
-    #[clap(
-        long,
-        default_value = "2",
-        value_name = "NUM",
-        help_heading = "Protocol"
-    )]
+    /// Set active_connection_id_limit transport parameter.
+    #[clap(long, default_value = "2", value_name = "NUM", help_heading = "Protocol")]
     pub active_cid_limit: u64,
 
     /// Set max_udp_payload_size transport parameter.
-    #[clap(
-        long,
-        default_value = "65527",
-        value_name = "NUM",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "65527", value_name = "NUM", help_heading = "Protocol")]
     pub recv_udp_payload_size: u16,
 
     /// Set the maximum outgoing UDP payload size.
-    #[clap(
-        long,
-        default_value = "1200",
-        value_name = "NUM",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "1200", value_name = "NUM", help_heading = "Protocol")]
     pub send_udp_payload_size: usize,
 
     /// Handshake timeout in microseconds.
-    #[clap(
-        long,
-        default_value = "10000",
-        value_name = "TIME",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "10000", value_name = "TIME", help_heading = "Protocol")]
     pub handshake_timeout: u64,
 
     /// Connection idle timeout in microseconds.
-    #[clap(
-        long,
-        default_value = "30000",
-        value_name = "TIME",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "30000", value_name = "TIME", help_heading = "Protocol")]
     pub idle_timeout: u64,
 
     /// Initial RTT in milliseconds.
-    #[clap(
-        long,
-        default_value = "333",
-        value_name = "TIME",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "333", value_name = "TIME", help_heading = "Protocol")]
     pub initial_rtt: u64,
 
     /// Linear factor for calculating the probe timeout.
-    #[clap(
-        long,
-        default_value = "10",
-        value_name = "NUM",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "10", value_name = "NUM", help_heading = "Protocol")]
     pub pto_linear_factor: u64,
 
     /// Upper limit of probe timeout in microseconds.
-    #[clap(
-        long,
-        default_value = "10000",
-        value_name = "TIME",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "10000", value_name = "TIME", help_heading = "Protocol")]
     pub max_pto: u64,
 
     /// Anti amplification factor.
-    #[clap(
-        long,
-        default_value = "3",
-        value_name = "NUM",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "3", value_name = "NUM", help_heading = "Protocol")]
     pub anti_amplification_factor: usize,
 
     /// Length of connection id in bytes.
-    #[clap(
-        long,
-        default_value = "8",
-        value_name = "NUM",
-        help_heading = "Protocol"
-    )]
+    #[clap(long, default_value = "8", value_name = "NUM", help_heading = "Protocol")]
     pub cid_len: usize,
 
-    /// Log level, support OFF/ERROR/WARN/INFO/DEBUG/TRACE.
+    // ── Output ────────────────────────────────────────────────────────────────
+    /// Log level (OFF/ERROR/WARN/INFO/DEBUG/TRACE).
     #[clap(long, default_value = "INFO", help_heading = "Output")]
     pub log_level: log::LevelFilter,
 
-    /// Log file path. If no file is specified, logs will be written to `stderr`.
+    /// Log file path (defaults to stderr).
     #[clap(long, value_name = "FILE", help_heading = "Output")]
     pub log_file: Option<String>,
 
@@ -241,17 +174,13 @@ pub struct ServerOpt {
     #[clap(long, value_name = "DIR", help_heading = "Output")]
     pub qlog_dir: Option<String>,
 
+    // ── Misc ──────────────────────────────────────────────────────────────────
     /// Batch size for sending packets.
     #[clap(long, default_value = "16", value_name = "NUM", help_heading = "Misc")]
     pub send_batch_size: usize,
 
-    /// buffer size for disordered zerortt packets on the server.
-    #[clap(
-        long,
-        default_value = "1000",
-        value_name = "NUM",
-        help_heading = "Misc"
-    )]
+    /// Buffer size for disordered 0-RTT packets.
+    #[clap(long, default_value = "1000", value_name = "NUM", help_heading = "Misc")]
     pub zerortt_buffer_size: usize,
 
     /// Disable encryption on 1-RTT packets.
@@ -259,20 +188,254 @@ pub struct ServerOpt {
     pub disable_encryption: bool,
 }
 
+// ─────────────────────────── Per-stream send state ───────────────────────────
+
+struct StreamSendState {
+    bytes_sent: usize,
+    finished: bool,
+}
+
+// ─────────────────────────── Per-connection handler ──────────────────────────
+
+#[derive(Default)]
+struct ConnectionHandler {
+    /// Total bytes to send per stream (0 = unlimited).
+    send_size: usize,
+    streams: HashMap<u64, StreamSendState>,
+}
+
+impl ConnectionHandler {
+    /// Register a new stream and start pumping data.
+    fn on_new_stream(&mut self, conn: &mut Connection, stream_id: u64, buf: &[u8]) {
+        self.streams.insert(
+            stream_id,
+            StreamSendState {
+                bytes_sent: 0,
+                finished: false,
+            },
+        );
+        self.pump(conn, stream_id, buf);
+    }
+
+    /// Push as many bytes as possible; registers `stream_want_write` on backpressure.
+    fn pump(&mut self, conn: &mut Connection, stream_id: u64, buf: &[u8]) {
+        let state = match self.streams.get_mut(&stream_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if state.finished {
+            return;
+        }
+
+        loop {
+            let to_send = if self.send_size > 0 {
+                let remaining = self.send_size.saturating_sub(state.bytes_sent);
+                if remaining == 0 {
+                    // Done: send FIN.
+                    match conn.stream_write(stream_id, Bytes::new(), true) {
+                        Ok(_) | Err(Error::Done) => {}
+                        Err(e) => error!("{} stream FIN error: {:?}", conn.trace_id(), e),
+                    }
+                    state.finished = true;
+                    return;
+                }
+                remaining.min(buf.len())
+            } else {
+                buf.len()
+            };
+
+            let fin =
+                self.send_size > 0 && (state.bytes_sent + to_send >= self.send_size);
+
+            match conn.stream_write(
+                stream_id,
+                Bytes::copy_from_slice(&buf[..to_send]),
+                fin,
+            ) {
+                Ok(written) => {
+                    state.bytes_sent += written;
+                    if fin && written == to_send {
+                        state.finished = true;
+                        return;
+                    }
+                    if written < to_send {
+                        _ = conn.stream_want_write(stream_id, true);
+                        return;
+                    }
+                }
+                Err(Error::Done) => {
+                    _ = conn.stream_want_write(stream_id, true);
+                    return;
+                }
+                Err(e) => {
+                    error!("{} stream {} write: {:?}", conn.trace_id(), stream_id, e);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────── ServerHandler ───────────────────────────────
+
+struct ServerHandler {
+    conns: FxHashMap<u64, ConnectionHandler>,
+    /// Scratch buffer for discarding client data.
+    recv_buf: Vec<u8>,
+    /// Zero-filled send buffer.
+    send_buf: Vec<u8>,
+    send_size: usize,
+    keylog: Option<File>,
+    qlog_dir: Option<String>,
+}
+
+impl ServerHandler {
+    fn new(option: &ServerOpt) -> Result<Self> {
+        let keylog = match &option.keylog_file {
+            Some(f) => Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(f)?,
+            ),
+            None => None,
+        };
+
+        Ok(Self {
+            conns: FxHashMap::default(),
+            recv_buf: vec![0u8; option.chunk_size],
+            send_buf: vec![0u8; option.chunk_size],
+            send_size: option.send_size,
+            keylog,
+            qlog_dir: option.qlog_dir.clone(),
+        })
+    }
+
+    fn ensure_conn_handler(&mut self, conn: &mut Connection) {
+        let idx = conn.index().unwrap();
+        if self.conns.contains_key(&idx) {
+            return;
+        }
+        self.conns.insert(
+            idx,
+            ConnectionHandler {
+                send_size: self.send_size,
+                streams: HashMap::default(),
+            },
+        );
+    }
+}
+
+impl TransportHandler for ServerHandler {
+    fn on_conn_created(&mut self, conn: &mut Connection) {
+        debug!("{} connection created", conn.trace_id());
+
+        if let Some(keylog) = &mut self.keylog {
+            if let Ok(kl) = keylog.try_clone() {
+                conn.set_keylog(Box::new(kl));
+            }
+        }
+
+        if let Some(qlog_dir) = &self.qlog_dir {
+            let path = Path::new(qlog_dir).join(format!("{}.qlog", conn.trace_id()));
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                conn.set_qlog(
+                    Box::new(f),
+                    "server qlog".into(),
+                    format!("id={}", conn.trace_id()),
+                );
+            } else {
+                error!("{} set qlog {:?} failed", conn.trace_id(), path);
+            }
+        }
+    }
+
+    fn on_conn_established(&mut self, conn: &mut Connection) {
+        debug!("{} connection established", conn.trace_id());
+        self.ensure_conn_handler(conn);
+    }
+
+    fn on_conn_closed(&mut self, conn: &mut Connection) {
+        let s = conn.stats();
+        info!(
+            "{} connection closed — recv pkts/bytes: {}/{}, sent pkts/bytes: {}/{}, lost pkts/bytes: {}/{}",
+            conn.trace_id(),
+            s.recv_count, s.recv_bytes,
+            s.sent_count, s.sent_bytes,
+            s.lost_count, s.lost_bytes,
+        );
+        self.conns.remove(&conn.index().unwrap());
+    }
+
+    fn on_stream_created(&mut self, conn: &mut Connection, stream_id: u64) {
+        debug!("{} stream {} created", conn.trace_id(), stream_id);
+
+        // 0-RTT: stream may arrive before on_conn_established.
+        self.ensure_conn_handler(conn);
+
+        // Only handle client-initiated streams (even IDs: bidi 0,4,8,…; uni 2,6,10,…).
+        if stream_id % 2 == 1 {
+            return;
+        }
+
+        let idx = conn.index().unwrap();
+        let send_buf = self.send_buf.clone();
+        if let Some(handler) = self.conns.get_mut(&idx) {
+            handler.on_new_stream(conn, stream_id, &send_buf);
+        }
+    }
+
+    fn on_stream_readable(&mut self, conn: &mut Connection, stream_id: u64) {
+        // Drain and discard — the trigger data sent by the client is irrelevant.
+        loop {
+            match conn.stream_read(stream_id, &mut self.recv_buf) {
+                Ok((0, _)) | Err(Error::Done) => break,
+                Ok((n, _)) => debug!(
+                    "{} discarded {} client bytes on stream {}",
+                    conn.trace_id(),
+                    n,
+                    stream_id
+                ),
+                Err(e) => {
+                    error!("{} stream_read error: {:?}", conn.trace_id(), e);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn on_stream_writable(&mut self, conn: &mut Connection, stream_id: u64) {
+        _ = conn.stream_want_write(stream_id, false);
+        let idx = conn.index().unwrap();
+        let send_buf = self.send_buf.clone();
+        if let Some(handler) = self.conns.get_mut(&idx) {
+            handler.pump(conn, stream_id, &send_buf);
+        }
+    }
+
+    fn on_stream_closed(&mut self, conn: &mut Connection, stream_id: u64) {
+        debug!("{} stream {} closed", conn.trace_id(), stream_id);
+        if let Some(handler) = self.conns.get_mut(&conn.index().unwrap()) {
+            handler.streams.remove(&stream_id);
+        }
+    }
+
+    fn on_new_token(&mut self, _conn: &mut Connection, _token: Vec<u8>) {}
+}
+
+// ─────────────────────────────── Server event loop ───────────────────────────
+
 const MAX_BUF_SIZE: usize = 65536;
 
-/// An HTTP file Server which support HTTP/3 and HTTP/0.9 over QUIC.
 struct Server {
-    /// QUIC endpoint
     endpoint: Endpoint,
-
-    /// Event poll
     poll: mio::Poll,
-
-    /// Listen socket
     sock: Rc<QuicSocket>,
-
-    /// Packet read buffer
     recv_buf: Vec<u8>,
 }
 
@@ -284,7 +447,6 @@ impl Server {
         config.set_max_handshake_timeout(option.handshake_timeout);
         config.enable_retry(option.enable_retry);
         config.enable_stateless_reset(!option.disable_stateless_reset);
-        config.set_max_handshake_timeout(option.handshake_timeout);
         config.set_max_idle_timeout(option.idle_timeout);
         config.set_initial_rtt(option.initial_rtt);
         config.set_pto_linear_factor(option.pto_linear_factor);
@@ -301,52 +463,34 @@ impl Server {
         config.set_active_connection_id_limit(option.active_cid_limit);
         config.enable_encryption(!option.disable_encryption);
 
-        if let Some(address_token_key) = &option.address_token_key {
-            let address_token_key = convert_address_token_key(address_token_key);
-            config.set_address_token_key(vec![address_token_key])?;
+        if let Some(ak) = &option.address_token_key {
+            config.set_address_token_key(vec![convert_address_token_key(ak)])?;
         }
 
-        let application_protos = vec![b"h3".to_vec(), b"http/0.9".to_vec(), b"hq-interop".to_vec()];
         let mut tls_config = TlsConfig::new_server_config(
             &option.cert_file,
             &option.key_file,
-            application_protos,
+            vec![b"rawquic".to_vec()],
             true,
         )?;
         let mut ticket_key = option.ticket_key.clone().into_bytes();
         ticket_key.resize(48, 0);
         tls_config.set_ticket_key(&ticket_key)?;
 
-        // Configure certificate compression if specified
         if !option.certificate_compression.is_empty() {
-            let compression_algorithms: Vec<CertCompressionAlgorithm> = option
-                .certificate_compression
-                .iter()
-                .map(|&arg| arg.into())
-                .collect();
-
-            tls_config.enable_certificate_compression(compression_algorithms)?;
-            let algorithm_names: Vec<String> = option
-                .certificate_compression
-                .iter()
-                .map(|arg| format!("{:?}", arg).to_lowercase())
-                .collect();
-            info!(
-                "Enabled certificate compression: {}",
-                algorithm_names.join(", ")
-            );
+            let algs: Vec<CertCompressionAlgorithm> =
+                option.certificate_compression.iter().map(|&a| a.into()).collect();
+            tls_config.enable_certificate_compression(algs)?;
         }
 
         config.set_tls_config(tls_config);
 
         let poll = mio::Poll::new()?;
-        let registry = poll.registry();
-
-        let handlers = ServerHandler::new(option)?;
-        let sock = Rc::new(QuicSocket::new(&option.listen, registry)?);
+        let handler = ServerHandler::new(option)?;
+        let sock = Rc::new(QuicSocket::new(&option.listen, poll.registry())?);
 
         Ok(Server {
-            endpoint: Endpoint::new(Box::new(config), true, Box::new(handlers), sock.clone()),
+            endpoint: Endpoint::new(Box::new(config), true, Box::new(handler), sock.clone()),
             poll,
             sock,
             recv_buf: vec![0u8; MAX_BUF_SIZE],
@@ -355,745 +499,36 @@ impl Server {
 
     fn process_read_event(&mut self, event: &Event) -> Result<()> {
         loop {
-            // Read datagram from the socket.
-            // TODO: support recvmmsg
-            let (len, local, remote) = match self.sock.recv_from(&mut self.recv_buf, event.token())
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
+            let (len, local, remote) =
+                match self.sock.recv_from(&mut self.recv_buf, event.token()) {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         debug!("socket recv would block");
                         break;
                     }
-                    return Err(format!("socket recv error: {:?}", e).into());
-                }
-            };
+                    Err(e) => return Err(format!("socket recv error: {:?}", e).into()),
+                };
             debug!("socket recv {} bytes from {:?}", len, remote);
 
-            let pkt_buf = &mut self.recv_buf[..len];
             let pkt_info = PacketInfo {
                 src: remote,
                 dst: local,
                 time: Instant::now(),
             };
-
-            // Process the incoming packet.
-            match self.endpoint.recv(pkt_buf, &pkt_info) {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("recv failed: {:?}", e);
-                    continue;
-                }
-            };
+            if let Err(e) = self.endpoint.recv(&mut self.recv_buf[..len], &pkt_info) {
+                error!("endpoint recv error: {:?}", e);
+            }
         }
-
         Ok(())
     }
 }
 
 fn convert_address_token_key(key: &str) -> [u8; 16] {
-    let mut key_data = key.to_owned().into_bytes();
-    key_data.resize(16, 0);
-
-    let mut token_key = [0_u8; 16];
-    token_key.copy_from_slice(&key_data[..]);
-    token_key
-}
-
-struct Response {
-    headers: Option<Vec<tquic::h3::Header>>,
-    body: Bytes,
-    body_written: usize,
-}
-
-#[derive(Default)]
-struct ConnectionHandler {
-    /// Application protocol.
-    app_proto: ApplicationProto,
-
-    /// File root directory.
-    root: String,
-
-    /// Number of processed requests.
-    processed_requests: u64,
-
-    /// Mapping stream id to http/0.9 request line data, only used in http/0.9 mode.
-    http09_requests: HashMap<u64, Vec<u8>>,
-
-    /// H3 connection, only used in h3 mode.
-    h3_conn: Option<Http3Connection>,
-
-    /// Mapping stream id to response.
-    responses: HashMap<u64, Response>,
-
-    /// Mapping stream id to request headers.
-    request_headers: HashMap<u64, Vec<Header>>,
-
-    /// Mapping stream id to request body data.
-    request_bodies: HashMap<u64, Vec<u8>>,
-}
-
-impl ConnectionHandler {
-    // Parse a Range header.
-    //
-    // Returns Ok((start, end)) or an error string.
-    fn parse_range(
-        &self,
-        range_str: &str,
-        file_size: u64,
-    ) -> std::result::Result<(u64, u64), &'static str> {
-        // For simplicity, we follow Nginx's strategy and do not support multi-part ranges.
-        if range_str.contains(',') {
-            return Err("Multi-part ranges not supported");
-        }
-
-        if !range_str.starts_with("bytes=") {
-            return Err("Invalid range unit");
-        }
-        let range_val = &range_str["bytes=".len()..];
-
-        let (start_str, end_str) = match range_val.split_once('-') {
-            Some((s, e)) => (s, e),
-            None => return Err("Invalid range format"),
-        };
-
-        if start_str.is_empty() {
-            // Format: "bytes=-<suffix-length>"
-            let suffix_len = end_str
-                .parse::<u64>()
-                .map_err(|_| "Invalid suffix length")?;
-            if suffix_len == 0 || suffix_len > file_size {
-                return Err("Suffix length out of bounds");
-            }
-            let start = file_size - suffix_len;
-            Ok((start, file_size - 1))
-        } else {
-            // Format: "bytes=<start>-" or "bytes=<start>-<end>"
-            let start = start_str
-                .parse::<u64>()
-                .map_err(|_| "Invalid start value")?;
-            if start >= file_size {
-                return Err("Start is out of bounds"); // This will lead to 416
-            }
-
-            let end = if end_str.is_empty() {
-                file_size - 1
-            } else {
-                end_str.parse::<u64>().map_err(|_| "Invalid end value")?
-            };
-
-            if start > end || end >= file_size {
-                return Err("End is out of bounds");
-            }
-            Ok((start, end))
-        }
-    }
-
-    fn generate_file_path(uri: &str, root: &str) -> path::PathBuf {
-        let uri = path::Path::new(uri);
-        let mut path = path::PathBuf::from(root);
-
-        for c in uri.components() {
-            if let path::Component::Normal(v) = c {
-                path.push(v)
-            }
-        }
-
-        path
-    }
-
-    fn process_http09_request(
-        &mut self,
-        request_line: &[u8],
-        conn: &mut Connection,
-        stream_id: u64,
-    ) -> Result<()> {
-        self.http09_requests.remove(&stream_id);
-
-        let uri = &request_line[4..request_line.len() - 2];
-        let uri = String::from_utf8(uri.to_vec())?;
-        let uri = match uri.lines().next() {
-            Some(uri) => uri,
-            None => return Err(format!("request format error {:?}", request_line).into()),
-        };
-        let path = Self::generate_file_path(uri, &self.root);
-        debug!(
-            "{} got GET request for {:?} on stream {}",
-            conn.trace_id(),
-            path,
-            stream_id
-        );
-
-        let body = std::fs::read(path.as_path()).unwrap_or_else(|_| b"Not Found!\r\n".to_vec());
-        debug!(
-            "{} sending response of size {} on stream {}",
-            conn.trace_id(),
-            body.len(),
-            stream_id
-        );
-        let body = Bytes::from(body);
-
-        let written = match conn.stream_write(stream_id, body.clone(), true) {
-            Ok(v) => v,
-            Err(tquic::error::Error::Done) => 0,
-            Err(e) => {
-                error!("{} stream write failed {:?}", conn.trace_id(), e);
-                return Ok(());
-            }
-        };
-        if written < body.len() {
-            _ = conn.stream_want_write(stream_id, true);
-
-            let response = Response {
-                headers: None,
-                body,
-                body_written: written,
-            };
-
-            self.responses.insert(stream_id, response);
-        }
-
-        Ok(())
-    }
-
-    fn recv_http09_request(&mut self, buf: &mut [u8], conn: &mut Connection, stream_id: u64) {
-        if !self.http09_requests.contains_key(&stream_id) {
-            debug!("{} stream {} not exists", conn.trace_id(), stream_id);
-            return;
-        }
-
-        while let Ok((read, fin)) = conn.stream_read(stream_id, buf) {
-            let request_line = &buf[..read];
-            debug!(
-                "{} stream {} has {} bytes (fin? {})",
-                conn.trace_id(),
-                stream_id,
-                request_line.len(),
-                fin
-            );
-
-            let request_line = if let Some(request_data) = self.http09_requests.get_mut(&stream_id)
-            {
-                request_data.extend_from_slice(request_line);
-
-                if !request_data.ends_with(b"\r\n") {
-                    return;
-                }
-
-                request_data.clone()
-            } else {
-                if !request_line.ends_with(b"\r\n") {
-                    self.http09_requests
-                        .insert(stream_id, request_line.to_vec());
-                    return;
-                }
-
-                request_line.to_vec()
-            };
-
-            if !request_line.starts_with(b"GET ")
-                || self
-                    .process_http09_request(&request_line, conn, stream_id)
-                    .is_err()
-            {
-                error!("{} request[{}] format error", conn.trace_id(), stream_id);
-                match conn.close(true, 0x00, b"bad request") {
-                    Ok(_) | Err(Error::Done) => (),
-                    Err(e) => debug!("{} connection close error {:?}", conn.trace_id(), e),
-                }
-            }
-        }
-    }
-
-    fn build_h3_response(&self, headers: &[Header], data: &[u8]) -> (Vec<Header>, Bytes) {
-        let mut path = "";
-        let mut range_header = None;
-        let mut method = "";
-        for header in headers {
-            if header.name() == b":path" {
-                path = std::str::from_utf8(header.value()).unwrap();
-            } else if header.name() == b":method" {
-                method = std::str::from_utf8(header.value()).unwrap();
-            } else if header.name() == b"range" {
-                range_header = Some(std::str::from_utf8(header.value()).unwrap());
-            }
-        }
-
-        match method {
-            "GET" => {
-                let path = Self::generate_file_path(path, &self.root);
-
-                if let Ok(file) = std::fs::File::open(&path) {
-                    let file_size = file.metadata().unwrap().len();
-
-                    // Process range request
-                    if let Some(range_str) = range_header {
-                        match self.parse_range(range_str, file_size) {
-                            Ok((start, end)) => {
-                                let mut file = file;
-                                let len = end - start + 1;
-                                let mut buffer = vec![0; len as usize];
-
-                                // Read the specified range from the file
-                                if file.seek(SeekFrom::Start(start)).is_ok()
-                                    && file.read_exact(&mut buffer).is_ok()
-                                {
-                                    let headers = vec![
-                                        tquic::h3::Header::new(b":status", b"206"),
-                                        tquic::h3::Header::new(b"server", b"tquic"),
-                                        tquic::h3::Header::new(b"accept-ranges", b"bytes"),
-                                        tquic::h3::Header::new(
-                                            b"content-range",
-                                            format!("bytes {}-{}/{}", start, end, file_size)
-                                                .as_bytes(),
-                                        ),
-                                        tquic::h3::Header::new(
-                                            b"content-length",
-                                            len.to_string().as_bytes(),
-                                        ),
-                                    ];
-                                    return (headers, Bytes::from(buffer));
-                                }
-                            }
-                            Err(e) => {
-                                // If range is invalid or multi-part, return 416 or 200.
-                                // Here we follow Nginx's strategy for multi-part ranges.
-                                if e != "Multi-part ranges not supported" {
-                                    // Invalid range, return 416
-                                    let headers = vec![
-                                        tquic::h3::Header::new(b":status", b"416"),
-                                        tquic::h3::Header::new(b"server", b"tquic"),
-                                        tquic::h3::Header::new(
-                                            b"content-range",
-                                            format!("bytes */{}", file_size).as_bytes(),
-                                        ),
-                                    ];
-                                    return (headers, Bytes::new());
-                                }
-                                // Fall through to serve the whole file with 200 OK for multi-part
-                            }
-                        }
-                    }
-
-                    // Default case: serve the whole file with 200 OK
-                    let body = std::fs::read(path).unwrap_or_else(|_| b"Not Found!".to_vec());
-                    let headers = vec![
-                        tquic::h3::Header::new(b":status", b"200"),
-                        tquic::h3::Header::new(b"server", b"tquic"),
-                        tquic::h3::Header::new(b"accept-ranges", b"bytes"),
-                        tquic::h3::Header::new(
-                            b"content-length",
-                            body.len().to_string().as_bytes(),
-                        ),
-                    ];
-                    (headers, Bytes::from(body))
-                } else {
-                    // File not found
-                    let body = b"Not Found!".to_vec();
-                    let headers = vec![
-                        tquic::h3::Header::new(b":status", b"404"),
-                        tquic::h3::Header::new(b"server", b"tquic"),
-                        tquic::h3::Header::new(
-                            b"content-length",
-                            body.len().to_string().as_bytes(),
-                        ),
-                    ];
-                    (headers, Bytes::from(body))
-                }
-            }
-            "POST" => {
-                let md5_hash = md5::compute(data);
-                let md5_hex = format!("{:x}", md5_hash);
-                debug!("POST data MD5: {}", md5_hex);
-                let body = md5_hex.into_bytes();
-                let headers = vec![
-                    tquic::h3::Header::new(b":status", b"200"),
-                    tquic::h3::Header::new(b"server", b"tquic"),
-                    tquic::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
-                ];
-                (headers, Bytes::from(body))
-            }
-            _ => {
-                // Method not allowed
-                let headers = vec![
-                    tquic::h3::Header::new(b":status", b"405"),
-                    tquic::h3::Header::new(b"server", b"tquic"),
-                    tquic::h3::Header::new(b"content-length", b"18"),
-                ];
-                (headers, Bytes::from_static(b"Method Not Allowed"))
-            }
-        }
-    }
-
-    fn process_h3_request(
-        &mut self,
-        headers: &[Header],
-        conn: &mut Connection,
-        stream_id: u64,
-        data: &[u8],
-    ) -> Result<()> {
-        conn.stream_shutdown(stream_id, tquic::Shutdown::Read, 0)?;
-        self.processed_requests = std::cmp::max(self.processed_requests, stream_id);
-
-        let (headers, body) = self.build_h3_response(headers, data);
-        let h3_conn = self.h3_conn.as_mut().unwrap();
-        match h3_conn.send_headers(conn, stream_id, &headers, false) {
-            Ok(v) => v,
-            Err(tquic::h3::Http3Error::StreamBlocked) => {
-                let response = Response {
-                    headers: Some(headers),
-                    body,
-                    body_written: 0,
-                };
-
-                self.responses.insert(stream_id, response);
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(format!("{} stream send failed {:?}", conn.trace_id(), e).into());
-            }
-        }
-
-        let written = match h3_conn.send_body(conn, stream_id, body.clone(), true) {
-            Ok(v) => v,
-            Err(tquic::h3::Http3Error::Done) => 0,
-            Err(e) => {
-                return Err(format!("{} stream send failed {:?}", conn.trace_id(), e).into());
-            }
-        };
-        if written < body.len() {
-            _ = conn.stream_want_write(stream_id, true);
-
-            let response = Response {
-                headers: None,
-                body,
-                body_written: written,
-            };
-
-            self.responses.insert(stream_id, response);
-        }
-
-        Ok(())
-    }
-
-    fn process_goaway(&mut self, conn: &mut Connection, goaway_id: u64) {
-        debug!("{} got GOAWAY with ID {} ", conn.trace_id(), goaway_id);
-        let h3_conn = self.h3_conn.as_mut().unwrap();
-        _ = h3_conn.send_goaway(conn, self.processed_requests);
-    }
-
-    fn recv_h3_request(&mut self, conn: &mut Connection, buf: &mut [u8]) {
-        loop {
-            match self.h3_conn.as_mut().unwrap().poll(conn) {
-                Ok((stream_id, tquic::h3::Http3Event::Headers { headers, .. })) => {
-                    debug!(
-                        "{} got request {:?} on stream id {}",
-                        conn.trace_id(),
-                        headers,
-                        stream_id
-                    );
-                    self.request_headers.insert(stream_id, headers);
-                    self.request_bodies.insert(stream_id, Vec::new());
-                }
-                Ok((stream_id, tquic::h3::Http3Event::Data)) => {
-                    debug!("{} got data on stream id {}", conn.trace_id(), stream_id);
-
-                    if !self.request_headers.contains_key(&stream_id) {
-                        debug!(
-                            "{} received data for stream {} before headers",
-                            conn.trace_id(),
-                            stream_id
-                        );
-                        continue;
-                    }
-
-                    let h3_conn = self.h3_conn.as_mut().unwrap();
-                    while let Ok(read) = h3_conn.recv_body(conn, stream_id, buf) {
-                        debug!(
-                            "{} got {} bytes of request data on stream {}",
-                            conn.trace_id(),
-                            read,
-                            stream_id
-                        );
-
-                        if let Some(body_data) = self.request_bodies.get_mut(&stream_id) {
-                            body_data.extend_from_slice(&buf[..read]);
-                        }
-                    }
-                }
-                Ok((stream_id, tquic::h3::Http3Event::Finished)) => {
-                    debug!("{} stream {} finished", conn.trace_id(), stream_id);
-
-                    if let (Some(headers), Some(body)) = (
-                        self.request_headers.remove(&stream_id),
-                        self.request_bodies.remove(&stream_id),
-                    ) {
-                        debug!(
-                            "{} processing complete request on stream {}, headers: {}, body size: {}",
-                            conn.trace_id(),
-                            stream_id,
-                            headers.len(),
-                            body.len()
-                        );
-
-                        if let Err(e) = self.process_h3_request(&headers, conn, stream_id, &body) {
-                            error!("{:?}", e);
-                        }
-                    }
-                }
-                Ok((_, tquic::h3::Http3Event::Reset { .. })) => (),
-                Ok((_, tquic::h3::Http3Event::PriorityUpdate)) => (),
-                Ok((goaway_id, tquic::h3::Http3Event::GoAway)) => {
-                    self.process_goaway(conn, goaway_id);
-                }
-                Err(tquic::h3::Http3Error::Done) => {
-                    break;
-                }
-                Err(e) => {
-                    error!("{} h3 error {:?}", conn.trace_id(), e);
-                    return;
-                }
-            }
-        }
-    }
-
-    fn recv_request(&mut self, buf: &mut [u8], conn: &mut Connection, stream_id: u64) {
-        match self.app_proto {
-            ApplicationProto::Interop | ApplicationProto::Http09 => {
-                self.recv_http09_request(buf, conn, stream_id)
-            }
-            ApplicationProto::H3 => self.recv_h3_request(conn, buf),
-        }
-    }
-
-    fn send_http09_response(&mut self, conn: &mut Connection, stream_id: u64) {
-        let response = self.responses.get_mut(&stream_id).unwrap();
-        let written = match conn.stream_write(
-            stream_id,
-            response.body.slice(response.body_written..),
-            true,
-        ) {
-            Ok(v) => v,
-            Err(tquic::error::Error::Done) => 0,
-            Err(e) => {
-                self.responses.remove(&stream_id);
-                error!("{} stream write failed {:?}", conn.trace_id(), e);
-                return;
-            }
-        };
-        response.body_written += written;
-        if response.body_written == response.body.len() {
-            self.responses.remove(&stream_id);
-        }
-    }
-
-    fn send_h3_response(&mut self, conn: &mut Connection, stream_id: u64) {
-        let h3_conn = self.h3_conn.as_mut().unwrap();
-        let response = self.responses.get_mut(&stream_id).unwrap();
-        if let Some(ref headers) = response.headers {
-            match h3_conn.send_headers(conn, stream_id, headers, false) {
-                Ok(_) => (),
-                Err(tquic::h3::Http3Error::StreamBlocked) => {
-                    debug!("{} stream blocked", conn.trace_id());
-                    return;
-                }
-                Err(e) => {
-                    error!("{} stream send failed {:?}", conn.trace_id(), e);
-                    return;
-                }
-            }
-        }
-        response.headers = None;
-
-        let written = match h3_conn.send_body(
-            conn,
-            stream_id,
-            response.body.slice(response.body_written..),
-            true,
-        ) {
-            Ok(v) => v,
-            Err(tquic::h3::Http3Error::Done) => 0,
-            Err(e) => {
-                self.responses.remove(&stream_id);
-                error!("{} stream send failed {:?}", conn.trace_id(), e);
-                return;
-            }
-        };
-        response.body_written += written;
-        if response.body_written == response.body.len() {
-            self.responses.remove(&stream_id);
-        }
-    }
-
-    fn send_responses(&mut self, conn: &mut Connection, stream_id: u64) {
-        if !self.responses.contains_key(&stream_id) {
-            return;
-        }
-
-        _ = conn.stream_want_write(stream_id, true);
-
-        match self.app_proto {
-            ApplicationProto::Interop | ApplicationProto::Http09 => {
-                self.send_http09_response(conn, stream_id)
-            }
-            ApplicationProto::H3 => self.send_h3_response(conn, stream_id),
-        }
-    }
-}
-
-struct ServerHandler {
-    /// File root directory.
-    root: String,
-
-    /// HTTP connections
-    conns: FxHashMap<u64, ConnectionHandler>,
-
-    /// Read buffer
-    buf: Vec<u8>,
-
-    /// SSL key logger
-    keylog: Option<File>,
-
-    /// Qlog directory
-    qlog_dir: Option<String>,
-}
-
-impl ServerHandler {
-    fn new(option: &ServerOpt) -> Result<Self> {
-        let keylog = match &option.keylog_file {
-            Some(keylog_file) => Some(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(keylog_file)?,
-            ),
-            None => None,
-        };
-
-        Ok(Self {
-            root: option.root.clone(),
-            buf: vec![0; MAX_BUF_SIZE],
-            conns: FxHashMap::default(),
-            keylog,
-            qlog_dir: option.qlog_dir.clone(),
-        })
-    }
-
-    fn try_new_conn_handler(&mut self, conn: &mut Connection) {
-        let index = conn.index().unwrap();
-        if self.conns.get_mut(&index).is_some() {
-            return;
-        }
-
-        debug!("{} new connection handler", conn.trace_id());
-        let mut conn_handler = ConnectionHandler {
-            app_proto: ApplicationProto::from_slice(conn.application_proto()),
-            root: self.root.clone(),
-            ..Default::default()
-        };
-
-        if conn_handler.app_proto == ApplicationProto::H3 {
-            conn_handler.h3_conn = Some(
-                Http3Connection::new_with_quic_conn(conn, &Http3Config::new().unwrap()).unwrap(),
-            );
-        }
-
-        self.conns.insert(index, conn_handler);
-    }
-}
-
-impl TransportHandler for ServerHandler {
-    fn on_conn_created(&mut self, conn: &mut Connection) {
-        debug!("{} connection is created", conn.trace_id());
-        if let Some(keylog) = &mut self.keylog {
-            if let Ok(keylog) = keylog.try_clone() {
-                conn.set_keylog(Box::new(keylog));
-            }
-        }
-
-        // The qlog of each server connection is written to a different log file
-        // in JSON-SEQ format.
-        //
-        // Note: The server qlogs can also be written to the same file, with a
-        // recommended prefix for each line of logs that includes the trace id.
-        // The qlog of each connection can be then extracted by offline log
-        // processing.
-        if let Some(qlog_dir) = &self.qlog_dir {
-            let qlog_file = format!("{}.qlog", conn.trace_id());
-            let qlog_file = Path::new(qlog_dir).join(qlog_file);
-            if let Ok(qlog) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(qlog_file.as_path())
-            {
-                conn.set_qlog(
-                    Box::new(qlog),
-                    "server qlog".into(),
-                    format!("id={}", conn.trace_id()),
-                );
-            } else {
-                error!("{} set qlog {:?} failed", conn.trace_id(), qlog_file);
-            }
-        }
-    }
-
-    fn on_conn_established(&mut self, conn: &mut Connection) {
-        debug!("{} connection is established", conn.trace_id());
-        self.try_new_conn_handler(conn);
-    }
-
-    fn on_conn_closed(&mut self, conn: &mut Connection) {
-        let stats = conn.stats();
-        log::debug!(
-            "{} connection is closed. recv pkts: {}, sent pkts: {}, \
-            lost pkts: {}, recv bytes: {}, sent bytes: {}, lost bytes: {}",
-            conn.trace_id(),
-            stats.recv_count,
-            stats.sent_count,
-            stats.lost_count,
-            stats.recv_bytes,
-            stats.sent_bytes,
-            stats.lost_bytes
-        );
-
-        let index = conn.index().unwrap();
-        self.conns.remove(&index);
-    }
-
-    fn on_stream_created(&mut self, conn: &mut Connection, stream_id: u64) {
-        debug!("{} stream {} is created", conn.trace_id(), stream_id);
-
-        // Stream may be created before connection is established because the arriving of early data.
-        self.try_new_conn_handler(conn);
-
-        let index = conn.index().unwrap();
-        let conn_handler = self.conns.get_mut(&index).unwrap();
-        if conn_handler.app_proto == ApplicationProto::Interop
-            || conn_handler.app_proto == ApplicationProto::Http09
-        {
-            conn_handler.http09_requests.insert(stream_id, b"".to_vec());
-        }
-    }
-
-    fn on_stream_readable(&mut self, conn: &mut Connection, stream_id: u64) {
-        let index = conn.index().unwrap();
-        let conn_handler = self.conns.get_mut(&index).unwrap();
-        conn_handler.recv_request(&mut self.buf, conn, stream_id);
-    }
-
-    fn on_stream_writable(&mut self, conn: &mut Connection, stream_id: u64) {
-        _ = conn.stream_want_write(stream_id, false);
-
-        let index = conn.index().unwrap();
-        let conn_handler = self.conns.get_mut(&index).unwrap();
-        conn_handler.send_responses(conn, stream_id);
-    }
-
-    fn on_stream_closed(&mut self, conn: &mut Connection, stream_id: u64) {
-        debug!("{} stream {} is closed", conn.trace_id(), stream_id,);
-    }
-
-    fn on_new_token(&mut self, _conn: &mut Connection, _token: Vec<u8>) {}
+    let mut kd = key.to_owned().into_bytes();
+    kd.resize(16, 0);
+    let mut tk = [0u8; 16];
+    tk.copy_from_slice(&kd[..]);
+    tk
 }
 
 fn process_option(option: &mut ServerOpt) -> Result<()> {
@@ -1104,52 +539,43 @@ fn process_option(option: &mut ServerOpt) -> Result<()> {
         .init();
 
     if let Some(qlog_dir) = &option.qlog_dir {
-        if let Err(e) = create_dir_all(qlog_dir) {
-            warn!("create qlog directory {} error: {:?}", qlog_dir, e);
-            return Err(Box::new(e));
-        }
+        create_dir_all(qlog_dir)?;
     }
     Ok(())
 }
 
 fn main() -> Result<()> {
-    // Parse and process server option
     let mut option = ServerOpt::parse();
     process_option(&mut option)?;
 
-    // Initialize HTTP file server.
     let mut server = Server::new(&option)?;
 
-    // Run event loop.
     info!(
-        "{} listen on {:?}",
+        "{} listening on {:?}  send_size={} chunk={} CC={:?} multipath={}",
         server.endpoint.trace_id(),
-        option.listen
+        option.listen,
+        option.send_size,
+        option.chunk_size,
+        option.congestion_control_algor,
+        option.enable_multipath,
     );
+
     let mut events = mio::Events::with_capacity(1024);
     loop {
         if let Err(e) = server.endpoint.process_connections() {
-            error!("process connections error: {:?}", e);
+            error!("process_connections: {:?}", e);
         }
 
-        let timeout = server.endpoint.timeout();
-        debug!(
-            "{} wait for io events, timeout: {:?}",
-            server.endpoint.trace_id(),
-            timeout
-        );
-        server.poll.poll(&mut events, timeout)?;
+        server
+            .poll
+            .poll(&mut events, server.endpoint.timeout())?;
 
-        // Process IO events
         for event in events.iter() {
             if event.is_readable() {
                 server.process_read_event(event)?;
             }
         }
 
-        // Process timeout events.
-        // Note: Since `poll()` doesn't clearly tell if there was a timeout when it returns,
-        // it is up to the endpoint to check for a timeout and deal with it.
         server.endpoint.on_timeout(Instant::now());
     }
 }
