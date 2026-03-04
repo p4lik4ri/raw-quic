@@ -96,6 +96,14 @@ pub struct ClientOpt {
     #[clap(short, long, default_value = "10", value_name = "SEC", help_heading = "Concurrency")]
     pub duration: u64,
 
+    /// Target bandwidth in bits/sec. Accepts K / M / G suffix (e.g. 500M = 500 Mbit/s).
+    /// 0 or omitted means unlimited. The value is negotiated with the server via the
+    /// trigger stream so no server-side flag is needed.
+    #[clap(long, default_value = "0", value_name = "BPS",
+           value_parser = parse_bandwidth_cli,
+           help_heading = "Concurrency")]
+    pub bandwidth: u64,  // stored internally as bytes/sec
+
     // ── Protocol ──────────────────────────────────────────────────────────────
     /// File used for session resumption.
     #[clap(short, long, value_name = "FILE", help_heading = "Protocol")]
@@ -569,7 +577,9 @@ impl WorkerHandler {
         }
     }
 
-    /// Open `streams_per_conn` trigger streams (empty FIN = signal server to send).
+    /// Open `streams_per_conn` trigger streams.
+    /// Sends 8 bytes (bandwidth limit in bytes/sec as u64 LE) + FIN so the
+    /// server knows how fast to send.  0 means unlimited.
     fn open_trigger_streams(&self, conn: &mut Connection) {
         let idx = conn.index().unwrap();
         let mut receivers = self.receivers.borrow_mut();
@@ -577,9 +587,11 @@ impl WorkerHandler {
             Some(r) => r,
             None => return,
         };
+        // 8-byte little-endian bandwidth (bytes/sec).  Sent with FIN.
+        let trigger = Bytes::copy_from_slice(&self.option.bandwidth.to_le_bytes());
         for _ in 0..self.option.streams_per_conn {
             let stream_id = recv.streams_opened * 4; // 0, 4, 8, … client-initiated bidi
-            match conn.stream_write(stream_id, Bytes::new(), true) {
+            match conn.stream_write(stream_id, trigger.clone(), true) {
                 Ok(_) => {
                     recv.streams_opened += 1;
                     debug!("{} opened trigger stream {}", conn.trace_id(), stream_id);
@@ -736,6 +748,23 @@ impl TransportHandler for WorkerHandler {
 
 // ─────────────────────────────── Entry point ─────────────────────────────────
 
+/// Parse a bandwidth string like "500M", "1G", "2.5G" into bytes/sec.
+/// Input is in bits/sec with optional SI suffix (K=1 000, M=1 000 000, G=1 000 000 000).
+fn parse_bandwidth_cli(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    if s == "0" {
+        return Ok(0);
+    }
+    let (num, mul): (&str, u64) =
+        if let Some(p) = s.strip_suffix(['G', 'g']) { (p, 1_000_000_000) }
+        else if let Some(p) = s.strip_suffix(['M', 'm']) { (p, 1_000_000) }
+        else if let Some(p) = s.strip_suffix(['K', 'k']) { (p, 1_000) }
+        else { (s, 1) };
+    let f: f64 = num.parse().map_err(|_| format!("invalid bandwidth '{}'", s))?;
+    let bits_per_sec = (f * mul as f64) as u64;
+    Ok(bits_per_sec / 8) // convert bits/sec → bytes/sec
+}
+
 fn process_option(option: &mut ClientOpt) -> Result<()> {
     env_logger::builder()
         .target(tquic_tools::log_target(&option.log_file)?)
@@ -752,11 +781,17 @@ fn main() -> Result<()> {
     let mut option = ClientOpt::parse();
     process_option(&mut option)?;
 
+    let bw_str = if option.bandwidth == 0 {
+        "unlimited".to_string()
+    } else {
+        format!("{:.1} Mbit/s", option.bandwidth as f64 * 8.0 / 1e6)
+    };
     info!(
-        "Connecting to {:?}  duration={}s streams_per_conn={} CC={:?} multipath={}",
+        "Connecting to {:?}  duration={}s streams_per_conn={} bandwidth={} CC={:?} multipath={}",
         option.connect_to,
         option.duration,
         option.streams_per_conn,
+        bw_str,
         option.congestion_control_algor,
         option.enable_multipath,
     );

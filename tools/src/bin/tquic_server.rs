@@ -193,6 +193,16 @@ pub struct ServerOpt {
 struct StreamSendState {
     bytes_sent: usize,
     finished: bool,
+    /// True once the client trigger (bandwidth header) has been received.
+    ready: bool,
+    /// Accumulates the 8 trigger bytes sent by the client.
+    trigger_buf: Vec<u8>,
+    /// Rate limit in bytes/sec (0 = unlimited).
+    bandwidth_limit: u64,
+    /// Token-bucket: available bytes we may send right now.
+    tokens: f64,
+    /// When the token bucket was last refilled.
+    last_refill: Instant,
 }
 
 // ─────────────────────────── Per-connection handler ──────────────────────────
@@ -205,37 +215,102 @@ struct ConnectionHandler {
 }
 
 impl ConnectionHandler {
-    /// Register a new stream and start pumping data.
-    fn on_new_stream(&mut self, conn: &mut Connection, stream_id: u64, buf: &[u8]) {
+    /// Register a new stream; pumping is deferred until the client trigger arrives.
+    fn register_stream(&mut self, stream_id: u64) {
         self.streams.insert(
             stream_id,
             StreamSendState {
                 bytes_sent: 0,
                 finished: false,
+                ready: false,
+                trigger_buf: Vec::new(),
+                bandwidth_limit: 0,
+                tokens: 0.0,
+                last_refill: Instant::now(),
             },
         );
-        self.pump(conn, stream_id, buf);
     }
 
-    /// Push as many bytes as possible; registers `stream_want_write` on backpressure.
+    /// Read the 8-byte bandwidth trigger from the client.
+    /// Returns true the first time the trigger is fully received so the caller
+    /// can kick off pumping.
+    fn parse_trigger(&mut self, conn: &mut Connection, stream_id: u64) -> bool {
+        let state = match self.streams.get_mut(&stream_id) {
+            Some(s) => s,
+            None => return false,
+        };
+        if state.ready {
+            return false;
+        }
+        let mut tmp = [0u8; 64];
+        loop {
+            match conn.stream_read(stream_id, &mut tmp) {
+                Ok((n, fin)) => {
+                    if n > 0 {
+                        state.trigger_buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let have_header = state.trigger_buf.len() >= 8;
+                    if have_header || fin {
+                        let bw = if have_header {
+                            let arr: [u8; 8] = state.trigger_buf[..8].try_into().unwrap();
+                            u64::from_le_bytes(arr)
+                        } else {
+                            0 // FIN with no data → unlimited
+                        };
+                        state.bandwidth_limit = bw;
+                        state.tokens = 0.0; // start empty; first refill happens in pump()
+                        state.last_refill = Instant::now();
+                        state.ready = true;
+                        return true;
+                    }
+                    if n == 0 { break; }
+                }
+                Err(Error::Done) => break,
+                Err(e) => {
+                    error!("{} trigger read: {:?}", conn.trace_id(), e);
+                    break;
+                }
+            }
+        }
+        false
+    }
+
+    /// Push as many bytes as possible; applies token-bucket rate limiting when
+    /// `bandwidth_limit > 0`.  Registers `stream_want_write` on backpressure.
     fn pump(&mut self, conn: &mut Connection, stream_id: u64, buf: &[u8]) {
         let state = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => return,
         };
 
-        if state.finished {
+        if state.finished || !state.ready {
             return;
         }
 
         loop {
+            // ── Token-bucket rate limiting ────────────────────────────────────
+            if state.bandwidth_limit > 0 {
+                let now = Instant::now();
+                let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+                // Refill; cap at one second's worth of tokens (burst limit).
+                state.tokens = (state.tokens + elapsed * state.bandwidth_limit as f64)
+                    .min(state.bandwidth_limit as f64);
+                state.last_refill = now;
+
+                if state.tokens < 1.0 {
+                    // No tokens yet – re-register and wait for the next callback.
+                    _ = conn.stream_want_write(stream_id, true);
+                    return;
+                }
+            }
+
+            // ── Determine chunk to write ──────────────────────────────────────
             let to_send = if self.send_size > 0 {
                 let remaining = self.send_size.saturating_sub(state.bytes_sent);
                 if remaining == 0 {
-                    // Done: send FIN.
                     match conn.stream_write(stream_id, Bytes::new(), true) {
                         Ok(_) | Err(Error::Done) => {}
-                        Err(e) => error!("{} stream FIN error: {:?}", conn.trace_id(), e),
+                        Err(e) => error!("{} stream FIN: {:?}", conn.trace_id(), e),
                     }
                     state.finished = true;
                     return;
@@ -245,8 +320,14 @@ impl ConnectionHandler {
                 buf.len()
             };
 
-            let fin =
-                self.send_size > 0 && (state.bytes_sent + to_send >= self.send_size);
+            // Honour token budget.
+            let to_send = if state.bandwidth_limit > 0 {
+                to_send.min(state.tokens as usize).max(1)
+            } else {
+                to_send
+            };
+
+            let fin = self.send_size > 0 && (state.bytes_sent + to_send >= self.send_size);
 
             match conn.stream_write(
                 stream_id,
@@ -255,6 +336,9 @@ impl ConnectionHandler {
             ) {
                 Ok(written) => {
                     state.bytes_sent += written;
+                    if state.bandwidth_limit > 0 {
+                        state.tokens -= written as f64;
+                    }
                     if fin && written == to_send {
                         state.finished = true;
                         return;
@@ -281,8 +365,6 @@ impl ConnectionHandler {
 
 struct ServerHandler {
     conns: FxHashMap<u64, ConnectionHandler>,
-    /// Scratch buffer for discarding client data.
-    recv_buf: Vec<u8>,
     /// Zero-filled send buffer.
     send_buf: Vec<u8>,
     send_size: usize,
@@ -304,7 +386,6 @@ impl ServerHandler {
 
         Ok(Self {
             conns: FxHashMap::default(),
-            recv_buf: vec![0u8; option.chunk_size],
             send_buf: vec![0u8; option.chunk_size],
             send_size: option.send_size,
             keylog,
@@ -384,27 +465,30 @@ impl TransportHandler for ServerHandler {
         }
 
         let idx = conn.index().unwrap();
-        let send_buf = self.send_buf.clone();
         if let Some(handler) = self.conns.get_mut(&idx) {
-            handler.on_new_stream(conn, stream_id, &send_buf);
+            handler.register_stream(stream_id);
         }
     }
 
     fn on_stream_readable(&mut self, conn: &mut Connection, stream_id: u64) {
-        // Drain and discard — the trigger data sent by the client is irrelevant.
-        loop {
-            match conn.stream_read(stream_id, &mut self.recv_buf) {
-                Ok((0, _)) | Err(Error::Done) => break,
-                Ok((n, _)) => debug!(
-                    "{} discarded {} client bytes on stream {}",
-                    conn.trace_id(),
-                    n,
-                    stream_id
-                ),
-                Err(e) => {
-                    error!("{} stream_read error: {:?}", conn.trace_id(), e);
-                    break;
-                }
+        // Only even-ID streams are client-initiated; they carry the bandwidth trigger.
+        if stream_id % 2 == 1 {
+            return;
+        }
+        let idx = conn.index().unwrap();
+        // Phase 1: parse the 8-byte bandwidth trigger.
+        let just_ready = {
+            if let Some(handler) = self.conns.get_mut(&idx) {
+                handler.parse_trigger(conn, stream_id)
+            } else {
+                false
+            }
+        };
+        // Phase 2: start pumping the moment the trigger is received.
+        if just_ready {
+            let send_buf = self.send_buf.clone();
+            if let Some(handler) = self.conns.get_mut(&idx) {
+                handler.pump(conn, stream_id, &send_buf);
             }
         }
     }
