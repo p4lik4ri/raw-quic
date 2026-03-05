@@ -232,7 +232,9 @@ struct ConnectionHandler {
     prev_bytes_recv: u64,
     /// Last time on_stream_readable fired (for server-side jitter in uplink).
     last_recv_time: Option<Instant>,
-    /// RFC 3550 running jitter (uplink receiver side).
+    /// Previous inter-arrival interval in ms (for deviation calculation).
+    prev_interval_ms: f64,
+    /// RFC 3550-style running jitter (mean deviation of inter-arrival intervals).
     jitter_ms: f64,
 }
 
@@ -590,9 +592,14 @@ impl TransportHandler for ServerHandler {
                     handler.prev_bytes_recv = stats.recv_bytes;
                     self.live_bytes.fetch_add(delta, Ordering::Relaxed);
                     if let Some(last) = handler.last_recv_time {
-                        let d = now.duration_since(last).as_secs_f64() * 1000.0;
-                        handler.jitter_ms += (d - handler.jitter_ms) / 16.0;
-                        self.live_jitter.store(handler.jitter_ms.to_bits(), Ordering::Relaxed);
+                        let actual_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+                        // Jitter = mean deviation of inter-arrival intervals (RFC 3550 §A.8 style)
+                        if handler.prev_interval_ms > 0.0 {
+                            let deviation = (actual_ms - handler.prev_interval_ms).abs();
+                            handler.jitter_ms += (deviation - handler.jitter_ms) / 16.0;
+                            self.live_jitter.store(handler.jitter_ms.to_bits(), Ordering::Relaxed);
+                        }
+                        handler.prev_interval_ms = actual_ms;
                     }
                     handler.last_recv_time = Some(now);
                 }
