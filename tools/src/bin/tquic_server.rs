@@ -25,6 +25,10 @@ use std::fs::File;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -222,6 +226,14 @@ struct ConnectionHandler {
     /// Total bytes to send per stream (0 = unlimited).
     send_size: usize,
     streams: HashMap<u64, StreamSendState>,
+    /// Snapshot of conn.stats().sent_bytes from the previous reporter update.
+    prev_bytes_sent: u64,
+    /// Snapshot of conn.stats().recv_bytes for uplink tracking.
+    prev_bytes_recv: u64,
+    /// Last time on_stream_readable fired (for server-side jitter in uplink).
+    last_recv_time: Option<Instant>,
+    /// RFC 3550 running jitter (uplink receiver side).
+    jitter_ms: f64,
 }
 
 impl ConnectionHandler {
@@ -408,10 +420,27 @@ struct ServerHandler {
     send_size: usize,
     keylog: Option<File>,
     qlog_dir: Option<String>,
+    /// Shared live counters for the interval reporter thread.
+    live_bytes:  Arc<AtomicU64>,
+    live_lost:   Arc<AtomicU64>,
+    live_sent:   Arc<AtomicU64>,
+    live_jitter: Arc<AtomicU64>,
+    /// True when the active transfer is uplink (client→server).
+    is_uplink: Arc<AtomicBool>,
+    /// Signals the reporter thread to stop (set on connection close).
+    rep_done: Arc<AtomicBool>,
 }
 
 impl ServerHandler {
-    fn new(option: &ServerOpt) -> Result<Self> {
+    fn new(
+        option: &ServerOpt,
+        live_bytes:  Arc<AtomicU64>,
+        live_lost:   Arc<AtomicU64>,
+        live_sent:   Arc<AtomicU64>,
+        live_jitter: Arc<AtomicU64>,
+        is_uplink:   Arc<AtomicBool>,
+        rep_done:    Arc<AtomicBool>,
+    ) -> Result<Self> {
         let keylog = match &option.keylog_file {
             Some(f) => Some(
                 std::fs::OpenOptions::new()
@@ -428,6 +457,12 @@ impl ServerHandler {
             send_size: option.send_size,
             keylog,
             qlog_dir: option.qlog_dir.clone(),
+            live_bytes,
+            live_lost,
+            live_sent,
+            live_jitter,
+            is_uplink,
+            rep_done,
         })
     }
 
@@ -438,10 +473,7 @@ impl ServerHandler {
         }
         self.conns.insert(
             idx,
-            ConnectionHandler {
-                send_size: self.send_size,
-                streams: HashMap::default(),
-            },
+            ConnectionHandler { send_size: self.send_size, ..Default::default() },
         );
     }
 }
@@ -489,6 +521,8 @@ impl TransportHandler for ServerHandler {
             s.lost_count, s.lost_bytes,
         );
         self.conns.remove(&conn.index().unwrap());
+        // Stop the interval reporter as soon as the transfer finishes.
+        self.rep_done.store(true, Ordering::Relaxed);
     }
 
     fn on_stream_created(&mut self, conn: &mut Connection, stream_id: u64) {
@@ -529,23 +563,42 @@ impl TransportHandler for ServerHandler {
                 .unwrap_or(TransferMode::Downlink);
             match mode {
                 TransferMode::Downlink => {
-                    // Server starts pumping bulk data to client.
                     let send_buf = self.send_buf.clone();
                     if let Some(handler) = self.conns.get_mut(&idx) {
                         handler.pump(conn, stream_id, &send_buf);
                     }
                 }
                 TransferMode::Uplink => {
-                    // Client pumps; server just drains the stream buffer.
+                    self.is_uplink.store(true, Ordering::Relaxed);
                     if let Some(handler) = self.conns.get_mut(&idx) {
                         handler.drain_uplink(conn, stream_id);
                     }
                 }
             }
         } else {
-            // Subsequent readable events: drain ongoing uplink data.
             if let Some(handler) = self.conns.get_mut(&idx) {
                 handler.drain_uplink(conn, stream_id);
+            }
+        }
+        // Update live uplink stats for the interval reporter.
+        if self.is_uplink.load(Ordering::Relaxed) {
+            if let Some(handler) = self.conns.get_mut(&idx) {
+                let stats = conn.stats();
+                let now   = Instant::now();
+                let delta = stats.recv_bytes.saturating_sub(handler.prev_bytes_recv);
+                if delta > 0 {
+                    handler.prev_bytes_recv = stats.recv_bytes;
+                    self.live_bytes.fetch_add(delta, Ordering::Relaxed);
+                    if let Some(last) = handler.last_recv_time {
+                        let d = now.duration_since(last).as_secs_f64() * 1000.0;
+                        handler.jitter_ms += (d - handler.jitter_ms) / 16.0;
+                        self.live_jitter.store(handler.jitter_ms.to_bits(), Ordering::Relaxed);
+                    }
+                    handler.last_recv_time = Some(now);
+                }
+                // For uplink server: "sent" = total datagrams received by server.
+                self.live_sent.store(stats.recv_count, Ordering::Relaxed);
+                self.live_lost.store(stats.lost_count, Ordering::Relaxed);
             }
         }
     }
@@ -553,17 +606,25 @@ impl TransportHandler for ServerHandler {
     fn on_stream_writable(&mut self, conn: &mut Connection, stream_id: u64) {
         _ = conn.stream_want_write(stream_id, false);
         let idx = conn.index().unwrap();
-        // Skip uplink streams — the client drives sending, not the server.
-        let is_uplink = self.conns.get(&idx)
+        let is_uplink_stream = self.conns.get(&idx)
             .and_then(|h| h.streams.get(&stream_id))
             .map(|s| s.mode == TransferMode::Uplink)
             .unwrap_or(false);
-        if is_uplink {
+        if is_uplink_stream {
             return;
         }
         let send_buf = self.send_buf.clone();
         if let Some(handler) = self.conns.get_mut(&idx) {
             handler.pump(conn, stream_id, &send_buf);
+            // Update live downlink stats for the interval reporter.
+            let stats = conn.stats();
+            let delta = stats.sent_bytes.saturating_sub(handler.prev_bytes_sent);
+            if delta > 0 {
+                handler.prev_bytes_sent = stats.sent_bytes;
+                self.live_bytes.fetch_add(delta, Ordering::Relaxed);
+            }
+            self.live_sent.store(stats.sent_count, Ordering::Relaxed);
+            self.live_lost.store(stats.lost_count, Ordering::Relaxed);
         }
     }
 
@@ -589,7 +650,15 @@ struct Server {
 }
 
 impl Server {
-    fn new(option: &ServerOpt) -> Result<Self> {
+    fn new(
+        option: &ServerOpt,
+        live_bytes:  Arc<AtomicU64>,
+        live_lost:   Arc<AtomicU64>,
+        live_sent:   Arc<AtomicU64>,
+        live_jitter: Arc<AtomicU64>,
+        is_uplink:   Arc<AtomicBool>,
+        rep_done:    Arc<AtomicBool>,
+    ) -> Result<Self> {
         let mut config = Config::new()?;
         config.set_recv_udp_payload_size(option.recv_udp_payload_size);
         config.set_send_udp_payload_size(option.send_udp_payload_size);
@@ -635,7 +704,7 @@ impl Server {
         config.set_tls_config(tls_config);
 
         let poll = mio::Poll::new()?;
-        let handler = ServerHandler::new(option)?;
+        let handler = ServerHandler::new(option, live_bytes, live_lost, live_sent, live_jitter, is_uplink, rep_done)?;
         let sock = Rc::new(QuicSocket::new(&option.listen, poll.registry())?);
 
         Ok(Server {
@@ -697,7 +766,22 @@ fn main() -> Result<()> {
     let mut option = ServerOpt::parse();
     process_option(&mut option)?;
 
-    let mut server = Server::new(&option)?;
+    // Shared live counters for the interval reporter.
+    let live_bytes   = Arc::new(AtomicU64::new(0));
+    let live_lost    = Arc::new(AtomicU64::new(0));
+    let live_sent    = Arc::new(AtomicU64::new(0));
+    let live_jitter  = Arc::new(AtomicU64::new(0));
+    let is_uplink    = Arc::new(AtomicBool::new(false));
+    let rep_done     = Arc::new(AtomicBool::new(false));
+    let terminated   = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&terminated))?;
+
+    let mut server = Server::new(
+        &option,
+        Arc::clone(&live_bytes), Arc::clone(&live_lost),
+        Arc::clone(&live_sent),  Arc::clone(&live_jitter),
+        Arc::clone(&is_uplink),  Arc::clone(&rep_done),
+    )?;
 
     info!(
         "{} listening on {:?}  send_size={} chunk={} CC={:?} multipath={}",
@@ -709,22 +793,120 @@ fn main() -> Result<()> {
         option.enable_multipath,
     );
 
+    // ── Interval reporter thread ───────────────────────────────────────────────
+    let rb = Arc::clone(&live_bytes);
+    let rl = Arc::clone(&live_lost);
+    let rs = Arc::clone(&live_sent);
+    let rj = Arc::clone(&live_jitter);
+    let ru = Arc::clone(&is_uplink);
+    let rd = Arc::clone(&rep_done);
+    let rt = Arc::clone(&terminated);
+    let reporter = thread::spawn(move || {
+        'session: loop {
+            // ── Wait for a new session (data to start flowing) ────────────────
+            loop {
+                if rt.load(Ordering::Relaxed) { return; }
+                thread::sleep(Duration::from_millis(200));
+                if rb.load(Ordering::Relaxed) > 0 { break; }
+            }
+
+            // ── Per-session header ────────────────────────────────────────────
+            println!();
+            println!("[ rawquic ] Server interval report");
+            println!(
+                "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
+                "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
+            );
+            let mut last_bytes: u64 = 0;
+            let mut last_lost:  u64 = 0;
+            let mut last_sent:  u64 = 0;
+            let mut interval:   u64 = 0;
+
+            // ── Interval loop ─────────────────────────────────────────────────
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let done      = rd.load(Ordering::Relaxed);
+                let current   = rb.load(Ordering::Relaxed);
+                let cur_lost  = rl.load(Ordering::Relaxed);
+                let cur_sent  = rs.load(Ordering::Relaxed);
+                let jitter_ms = f64::from_bits(rj.load(Ordering::Relaxed));
+                let delta  = current.saturating_sub(last_bytes);
+                let d_lost = cur_lost.saturating_sub(last_lost);
+                let d_sent = cur_sent.saturating_sub(last_sent);
+                last_bytes = current; last_lost = cur_lost; last_sent = cur_sent;
+                let t_start  = interval as f64;
+                let t_end    = interval as f64 + 1.0;
+                interval    += 1;
+                let mb       = delta as f64 / 1e6;
+                let mbps     = (delta as f64 * 8.0) / 1e6;
+                let loss_pct = if d_sent > 0 { d_lost as f64 / d_sent as f64 * 100.0 } else { 0.0 };
+                println!(
+                    "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)",
+                    format!("{:.2}-{:.2} s", t_start, t_end),
+                    format!("{:.2} MB", mb),
+                    format!("{:.2} Mbits/sec", mbps),
+                    format!("{:.3} ms", jitter_ms),
+                    d_lost, d_sent, loss_pct,
+                );
+                if rt.load(Ordering::Relaxed) { break 'session; }
+                if done { break; }
+            }
+
+            // ── Summary row ───────────────────────────────────────────────────
+            let current   = rb.load(Ordering::Relaxed);
+            let cur_lost  = rl.load(Ordering::Relaxed);
+            let cur_sent  = rs.load(Ordering::Relaxed);
+            let jitter_ms = f64::from_bits(rj.load(Ordering::Relaxed));
+            if current > 0 {
+                let uplink     = ru.load(Ordering::Relaxed);
+                let total_secs = interval.max(1) as f64;
+                let total_mb   = current as f64 / 1e6;
+                let total_mbps = (current as f64 * 8.0) / 1e6 / total_secs;
+                let loss_pct   = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
+                let role = if uplink { "receiver" } else { "sender" };
+                println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
+                println!(
+                    "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
+                    "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
+                );
+                println!(
+                    "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)  {}",
+                    format!("0.00-{:.2} s", total_secs),
+                    format!("{:.2} MB", total_mb),
+                    format!("{:.2} Mbits/sec", total_mbps),
+                    format!("{:.3} ms", jitter_ms),
+                    cur_lost, cur_sent, loss_pct, role,
+                );
+            }
+
+            // ── Reset all counters for the next session ───────────────────────
+            rb.store(0, Ordering::Relaxed);
+            rl.store(0, Ordering::Relaxed);
+            rs.store(0, Ordering::Relaxed);
+            rj.store(0u64, Ordering::Relaxed);
+            ru.store(false, Ordering::Relaxed);
+            rd.store(false, Ordering::Relaxed);
+        }
+    });
+
+    // ── Main event loop ─────────────────────────────────────────────────────────
     let mut events = mio::Events::with_capacity(1024);
     loop {
+        if terminated.load(Ordering::Relaxed) {
+            rep_done.store(true, Ordering::Relaxed);
+            reporter.join().unwrap();
+            break;
+        }
         if let Err(e) = server.endpoint.process_connections() {
             error!("process_connections: {:?}", e);
         }
-
-        server
-            .poll
-            .poll(&mut events, server.endpoint.timeout())?;
-
+        server.poll.poll(&mut events, server.endpoint.timeout())?;
         for event in events.iter() {
             if event.is_readable() {
                 server.process_read_event(event)?;
             }
         }
-
         server.endpoint.on_timeout(Instant::now());
     }
+    Ok(())
 }

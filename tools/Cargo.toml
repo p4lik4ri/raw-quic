@@ -24,6 +24,10 @@ statrs = "0.16"
 signal-hook = "0.3.17"
 md5 = "0.7"
 tquic = { path = "..", version = "1.5.0"}
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target."cfg(unix)".dependencies]
 jemallocator = { version = "0.5", package = "tikv-jemallocator" }
@@ -39,3 +43,7 @@ path="src/bin/tquic_client.rs"
 [[bin]]
 name="tquic_server"
 path="src/bin/tquic_server.rs"
+
+[[bin]]
+name="tquic_api"
+path="src/bin/tquic_api.rs"

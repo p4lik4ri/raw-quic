@@ -30,8 +30,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
@@ -240,6 +242,7 @@ struct ClientContext {
     bytes_received: u64,
     bytes_sent: u64,
     mode: TransferMode,
+    jitter_ms: f64,
     conn_total: u64,
     conn_handshake_success: u64,
     conn_finish: u64,
@@ -265,6 +268,16 @@ struct Client {
     context: Arc<Mutex<ClientContext>>,
     start_time: Instant,
     terminated: Arc<AtomicBool>,
+    /// Live byte counter incremented by workers on every read/write.
+    live_bytes: Arc<AtomicU64>,
+    /// Cumulative lost packets (delta per second in reporter).
+    live_lost: Arc<AtomicU64>,
+    /// Cumulative sent packets (delta per second in reporter).
+    live_sent: Arc<AtomicU64>,
+    /// Current jitter stored as f64 bits.
+    live_jitter: Arc<AtomicU64>,
+    /// Set by main thread to stop the reporter thread.
+    reporting_done: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -272,21 +285,120 @@ impl Client {
         let context = Arc::new(Mutex::new(ClientContext::default()));
         let terminated = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&terminated))?;
-        Ok(Self { option, context, start_time: Instant::now(), terminated })
+        Ok(Self {
+            option,
+            context,
+            start_time: Instant::now(),
+            terminated,
+            live_bytes:   Arc::new(AtomicU64::new(0)),
+            live_lost:    Arc::new(AtomicU64::new(0)),
+            live_sent:    Arc::new(AtomicU64::new(0)),
+            live_jitter:  Arc::new(AtomicU64::new(0)),
+            reporting_done: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub fn start(&mut self) {
         self.start_time = Instant::now();
+
+        // ── Per-second interval reporter (iperf3 style) ───────────────────
+        let reporter_live    = Arc::clone(&self.live_bytes);
+        let reporter_lost    = Arc::clone(&self.live_lost);
+        let reporter_sent    = Arc::clone(&self.live_sent);
+        let reporter_jitter  = Arc::clone(&self.live_jitter);
+        let reporter_done    = Arc::clone(&self.reporting_done);
+        let reporter_mode    = self.option.mode;
+        let reporter_handle = thread::spawn(move || {
+            let direction = match reporter_mode {
+                TransferMode::Downlink => "server\u{2192}client",
+                TransferMode::Uplink   => "client\u{2192}server",
+            };
+            println!();
+            println!("[ rawquic ] Interval report ({direction})");
+            println!(
+                "  {:<12}  {:>10}  {:>16}  {}",
+                "Interval", "Transfer", "Bitrate", "Total Datagrams"
+            );
+            let mut last_bytes: u64 = 0;
+            let mut last_sent:  u64 = 0;
+            let mut interval:   u64 = 0;
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let done     = reporter_done.load(Ordering::Relaxed);
+                let current  = reporter_live.load(Ordering::Relaxed);
+                let cur_sent = reporter_sent.load(Ordering::Relaxed);
+                let delta  = current.saturating_sub(last_bytes);
+                let d_sent = cur_sent.saturating_sub(last_sent);
+                last_bytes = current;
+                last_sent  = cur_sent;
+                let t_start = interval as f64;
+                let t_end   = interval as f64 + 1.0;
+                interval   += 1;
+                let mb   = delta as f64 / 1e6;
+                let mbps = (delta as f64 * 8.0) / 1e6;
+                if delta > 0 {
+                    println!(
+                        "  {:<12}  {:>10}  {:>16}  {}",
+                        format!("{:.2}-{:.2} s", t_start, t_end),
+                        format!("{:.2} MB", mb),
+                        format!("{:.2} Mbits/sec", mbps),
+                        d_sent,
+                    );
+                }
+                if done { break; }
+            }
+            // ─── Separator + two-line summary (like iperf3) ───────────────────
+            let current   = reporter_live.load(Ordering::Relaxed);
+            let cur_lost  = reporter_lost.load(Ordering::Relaxed);
+            let cur_sent  = reporter_sent.load(Ordering::Relaxed);
+            let jitter_ms = f64::from_bits(reporter_jitter.load(Ordering::Relaxed));
+            if current > 0 {
+                let total_secs = interval.max(1) as f64;
+                let total_mb   = current as f64 / 1e6;
+                let total_mbps = (current as f64 * 8.0) / 1e6 / total_secs;
+                let loss_pct   = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
+                // Uplink  → client is sender  (jitter n/a, show 0.000)
+                // Downlink → client is receiver (show measured jitter)
+                let (role, show_jitter) = match reporter_mode {
+                    TransferMode::Uplink   => ("sender",   0.0_f64),
+                    TransferMode::Downlink => ("receiver", jitter_ms),
+                };
+                println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
+                println!(
+                    "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
+                    "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
+                );
+                println!(
+                    "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.2}%)  {}",
+                    format!("0.00-{:.2} s", total_secs),
+                    format!("{:.2} MB", total_mb),
+                    format!("{:.2} Mbits/sec", total_mbps),
+                    format!("{:.3} ms", show_jitter),
+                    cur_lost, cur_sent, loss_pct, role,
+                );
+            }
+        });
+
+        // ── Worker threads ────────────────────────────────────────────────
         let mut handles = vec![];
         for _ in 0..self.option.threads {
-            let opt = self.option.clone();
-            let ctx = self.context.clone();
-            let term = self.terminated.clone();
+            let opt   = self.option.clone();
+            let ctx   = self.context.clone();
+            let term  = self.terminated.clone();
+            let live   = Arc::clone(&self.live_bytes);
+            let lost   = Arc::clone(&self.live_lost);
+            let sent   = Arc::clone(&self.live_sent);
+            let jitter = Arc::clone(&self.live_jitter);
             handles.push(thread::spawn(move || {
-                Worker::new(opt, ctx, term).unwrap().start().unwrap();
+                Worker::new(opt, ctx, term, live, lost, sent, jitter).unwrap().start().unwrap();
             }));
         }
         for h in handles { h.join().unwrap(); }
+
+        // Signal reporter to stop, wait for it to flush the last interval.
+        self.reporting_done.store(true, Ordering::Relaxed);
+        reporter_handle.join().unwrap();
+
         self.print_stats();
     }
 
@@ -310,9 +422,17 @@ impl Client {
             "  Conns     : total {}, ok {}, failed {}",
             ctx.conn_total, ctx.conn_finish_success, ctx.conn_finish_failed,
         );
+        let recv  = ctx.conn_stats.recv_count;
+        let sent  = ctx.conn_stats.sent_count;
+        let lost  = ctx.conn_stats.lost_count;
+        let loss_pct = if sent > 0 { lost as f64 / sent as f64 * 100.0 } else { 0.0 };
         println!(
-            "  Pkts  recv/sent/lost : {}/{}/{}",
-            ctx.conn_stats.recv_count, ctx.conn_stats.sent_count, ctx.conn_stats.lost_count,
+            "  Jitter    : {:.3} ms",
+            ctx.jitter_ms,
+        );
+        println!(
+            "  Pkts  recv/sent/lost : {}/{}/{}  ({:.2}% loss)",
+            recv, sent, lost, loss_pct,
         );
         println!(
             "  Bytes recv/sent/lost : {}/{}/{}",
@@ -331,6 +451,7 @@ struct WorkerContext {
     token: Option<Vec<u8>>,
     bytes_received: u64,
     bytes_sent: u64,
+    jitter_ms: f64,
     conn_total: u64,
     conn_handshake_success: u64,
     conn_finish: u64,
@@ -360,6 +481,7 @@ impl WorkerContext {
 
 /// Per-stream uplink (client→server) send state — token bucket.
 struct UplinkState {
+
     bandwidth_limit: u64, // bytes/sec, 0 = unlimited
     tokens: f64,
     last_refill: Instant,
@@ -372,6 +494,10 @@ struct DataReceiver {
     streams_opened: u64,
     streams_finished: u64,
     uplink: HashMap<u64, UplinkState>,
+    /// RFC 3550 running interarrival jitter (ms).
+    jitter_ms: f64,
+    /// Timestamp of the last readable event, used for jitter calculation.
+    last_recv_time: Option<Instant>,
 }
 
 impl DataReceiver {
@@ -382,6 +508,8 @@ impl DataReceiver {
             streams_opened: 0,
             streams_finished: 0,
             uplink: HashMap::new(),
+            jitter_ms: 0.0,
+            last_recv_time: None,
         }
     }
 }
@@ -399,6 +527,11 @@ struct Worker {
     start_time: Instant,
     end_time: Option<Instant>,
     terminated: Arc<AtomicBool>,
+    // Kept alive here so WorkerHandler's Arc clones remain valid.
+    #[allow(dead_code)] live_bytes:  Arc<AtomicU64>,
+    #[allow(dead_code)] live_lost:   Arc<AtomicU64>,
+    #[allow(dead_code)] live_sent:   Arc<AtomicU64>,
+    #[allow(dead_code)] live_jitter: Arc<AtomicU64>,
 }
 
 impl Worker {
@@ -406,6 +539,10 @@ impl Worker {
         option: ClientOpt,
         client_ctx: Arc<Mutex<ClientContext>>,
         terminated: Arc<AtomicBool>,
+        live_bytes:  Arc<AtomicU64>,
+        live_lost:   Arc<AtomicU64>,
+        live_sent:   Arc<AtomicU64>,
+        live_jitter: Arc<AtomicU64>,
     ) -> Result<Self> {
         let mut config = Config::new()?;
         config.enable_stateless_reset(!option.disable_stateless_reset);
@@ -465,6 +602,10 @@ impl Worker {
             &assigned_addrs,
             worker_ctx.clone(),
             receivers.clone(),
+            live_bytes.clone(),
+            live_lost.clone(),
+            live_sent.clone(),
+            live_jitter.clone(),
         );
 
         Ok(Worker {
@@ -480,6 +621,10 @@ impl Worker {
             start_time: Instant::now(),
             end_time: None,
             terminated,
+            live_bytes,
+            live_lost,
+            live_sent,
+            live_jitter,
         })
     }
 
@@ -589,6 +734,13 @@ impl Worker {
         client_ctx.bytes_received += ctx.bytes_received;
         client_ctx.bytes_sent += ctx.bytes_sent;
         client_ctx.mode = self.option.mode;
+        // Running mean across threads.
+        let n = client_ctx.conn_finish as f64;
+        client_ctx.jitter_ms = if n == 0.0 {
+            ctx.jitter_ms
+        } else {
+            (client_ctx.jitter_ms * n + ctx.jitter_ms) / (n + 1.0)
+        };
         client_ctx.conn_total += ctx.conn_total;
         client_ctx.conn_handshake_success += ctx.conn_handshake_success;
         client_ctx.conn_finish += ctx.conn_finish;
@@ -612,6 +764,11 @@ struct WorkerHandler {
     recv_buf: Vec<u8>,
     /// Zero-filled send buffer used for uplink bulk transfers.
     send_buf: Vec<u8>,
+    /// Shared live-byte counter for the interval reporter.
+    live_bytes:  Arc<AtomicU64>,
+    live_lost:   Arc<AtomicU64>,
+    live_sent:   Arc<AtomicU64>,
+    live_jitter: Arc<AtomicU64>,
 }
 
 impl WorkerHandler {
@@ -620,6 +777,10 @@ impl WorkerHandler {
         local_addresses: &[SocketAddr],
         worker_ctx: Rc<RefCell<WorkerContext>>,
         receivers: Rc<RefCell<FxHashMap<u64, DataReceiver>>>,
+        live_bytes:  Arc<AtomicU64>,
+        live_lost:   Arc<AtomicU64>,
+        live_sent:   Arc<AtomicU64>,
+        live_jitter: Arc<AtomicU64>,
     ) -> Self {
         Self {
             option: option.clone(),
@@ -629,6 +790,10 @@ impl WorkerHandler {
             local_addresses: local_addresses.to_owned(),
             recv_buf: vec![0u8; MAX_BUF_SIZE],
             send_buf: vec![0u8; MAX_BUF_SIZE],
+            live_bytes,
+            live_lost,
+            live_sent,
+            live_jitter,
         }
     }
 
@@ -742,6 +907,13 @@ impl TransportHandler for WorkerHandler {
         if let Some(recv) = self.receivers.borrow().get(&idx) {
             ctx.bytes_received += recv.bytes_received;
             ctx.bytes_sent += recv.bytes_sent;
+            // Running mean of jitter across connections in this worker.
+            let n = ctx.conn_finish as f64;
+            ctx.jitter_ms = if n == 0.0 {
+                recv.jitter_ms
+            } else {
+                (ctx.jitter_ms * n + recv.jitter_ms) / (n + 1.0)
+            };
         }
         self.receivers.borrow_mut().remove(&idx);
         accum_conn_stats(&mut ctx.conn_stats, conn.stats());
@@ -784,12 +956,26 @@ impl TransportHandler for WorkerHandler {
 
     fn on_stream_readable(&mut self, conn: &mut Connection, stream_id: u64) {
         let idx = conn.index().unwrap();
+        let now = Instant::now();
         loop {
             match conn.stream_read(stream_id, &mut self.recv_buf) {
                 Ok((0, _)) | Err(Error::Done) => break,
                 Ok((n, fin)) => {
+                    self.live_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    // Update live stats for the interval reporter.
+                    let stats = conn.stats();
+                    self.live_lost.store(stats.lost_count, Ordering::Relaxed);
+                    self.live_sent.store(stats.sent_count, Ordering::Relaxed);
                     if let Some(recv) = self.receivers.borrow_mut().get_mut(&idx) {
                         recv.bytes_received += n as u64;
+                        // RFC 3550 §A.8 interarrival jitter.
+                        if let Some(last) = recv.last_recv_time {
+                            let d = now.duration_since(last).as_secs_f64() * 1000.0; // ms
+                            recv.jitter_ms += (d - recv.jitter_ms) / 16.0;
+                        }
+                        recv.last_recv_time = Some(now);
+                        // Publish current jitter as f64 bits.
+                        self.live_jitter.store(recv.jitter_ms.to_bits(), Ordering::Relaxed);
                     }
                     debug!("{} stream {} +{} B fin={}", conn.trace_id(), stream_id, n, fin);
                 }
@@ -841,6 +1027,11 @@ impl TransportHandler for WorkerHandler {
             ) {
                 Ok(written) => {
                     recv.bytes_sent += written as u64;
+                    self.live_bytes.fetch_add(written as u64, Ordering::Relaxed);
+                    // Update live packet stats for the interval reporter (uplink).
+                    let stats = conn.stats();
+                    self.live_lost.store(stats.lost_count, Ordering::Relaxed);
+                    self.live_sent.store(stats.sent_count, Ordering::Relaxed);
                     if state.bandwidth_limit > 0 {
                         state.tokens -= written as f64;
                     }
