@@ -21,6 +21,7 @@
 //! that the server pumps back.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -103,6 +104,10 @@ pub struct ClientOpt {
            value_parser = parse_bandwidth_cli,
            help_heading = "Concurrency")]
     pub bandwidth: u64,  // stored internally as bytes/sec
+
+    /// Transfer direction: downlink (server→client, default) or uplink (client→server).
+    #[clap(long, default_value = "downlink", value_name = "DIR", help_heading = "Concurrency")]
+    pub mode: TransferMode,
 
     // ── Protocol ──────────────────────────────────────────────────────────────
     /// File used for session resumption (TLS session + QUIC transport params).
@@ -217,12 +222,24 @@ pub struct ClientOpt {
 
 const MAX_BUF_SIZE: usize = 65536;
 
+/// Transfer direction — which side pumps bulk data.
+#[derive(Debug, Clone, Copy, PartialEq, Default, clap::ValueEnum)]
+pub enum TransferMode {
+    /// Server sends to client (like iperf3 -R). Default.
+    #[default]
+    Downlink,
+    /// Client sends to server.
+    Uplink,
+}
+
 // ─────────────────────────── Shared client context ───────────────────────────
 
 #[derive(Default)]
 struct ClientContext {
     session: Option<Vec<u8>>,
     bytes_received: u64,
+    bytes_sent: u64,
+    mode: TransferMode,
     conn_total: u64,
     conn_handshake_success: u64,
     conn_finish: u64,
@@ -277,12 +294,15 @@ impl Client {
         let ctx = self.context.lock().unwrap();
         let duration = ctx.end_time.unwrap_or_else(Instant::now) - self.start_time;
         let secs = duration.as_secs_f64().max(1e-9);
-        let bytes = ctx.bytes_received;
+        let (direction, bytes) = match ctx.mode {
+            TransferMode::Downlink => ("server → client", ctx.bytes_received),
+            TransferMode::Uplink   => ("client → server", ctx.bytes_sent),
+        };
         let gbps = (bytes as f64 * 8.0) / 1e9 / secs;
         let mbps = (bytes as f64 * 8.0) / 1e6 / secs;
 
         println!();
-        println!("[ rawquic ] Reverse-mode throughput (server → client)");
+        println!("[ rawquic ] Throughput ({direction})");
         println!("  Duration  : {:.3} s", secs);
         println!("  Transfer  : {} bytes  ({:.3} GB)", bytes, bytes as f64 / 1e9);
         println!("  Bitrate   : {:.3} Gbits/sec  ({:.1} Mbits/sec)", gbps, mbps);
@@ -310,6 +330,7 @@ struct WorkerContext {
     /// Address token saved from on_new_token, used for 0-RTT on next connect.
     token: Option<Vec<u8>>,
     bytes_received: u64,
+    bytes_sent: u64,
     conn_total: u64,
     conn_handshake_success: u64,
     conn_finish: u64,
@@ -337,16 +358,31 @@ impl WorkerContext {
     }
 }
 
-/// Per-connection receive bookkeeping.
+/// Per-stream uplink (client→server) send state — token bucket.
+struct UplinkState {
+    bandwidth_limit: u64, // bytes/sec, 0 = unlimited
+    tokens: f64,
+    last_refill: Instant,
+}
+
+/// Per-connection bookkeeping for both downlink receive and uplink send.
 struct DataReceiver {
     bytes_received: u64,
+    bytes_sent: u64,
     streams_opened: u64,
     streams_finished: u64,
+    uplink: HashMap<u64, UplinkState>,
 }
 
 impl DataReceiver {
     fn new() -> Self {
-        Self { bytes_received: 0, streams_opened: 0, streams_finished: 0 }
+        Self {
+            bytes_received: 0,
+            bytes_sent: 0,
+            streams_opened: 0,
+            streams_finished: 0,
+            uplink: HashMap::new(),
+        }
     }
 }
 
@@ -551,6 +587,8 @@ impl Worker {
         let mut client_ctx = self.client_ctx.lock().unwrap();
         client_ctx.session.clone_from(&ctx.session);
         client_ctx.bytes_received += ctx.bytes_received;
+        client_ctx.bytes_sent += ctx.bytes_sent;
+        client_ctx.mode = self.option.mode;
         client_ctx.conn_total += ctx.conn_total;
         client_ctx.conn_handshake_success += ctx.conn_handshake_success;
         client_ctx.conn_finish += ctx.conn_finish;
@@ -572,6 +610,8 @@ struct WorkerHandler {
     remote: SocketAddr,
     local_addresses: Vec<SocketAddr>,
     recv_buf: Vec<u8>,
+    /// Zero-filled send buffer used for uplink bulk transfers.
+    send_buf: Vec<u8>,
 }
 
 impl WorkerHandler {
@@ -588,12 +628,14 @@ impl WorkerHandler {
             remote: option.connect_to,
             local_addresses: local_addresses.to_owned(),
             recv_buf: vec![0u8; MAX_BUF_SIZE],
+            send_buf: vec![0u8; MAX_BUF_SIZE],
         }
     }
 
     /// Open `streams_per_conn` trigger streams.
-    /// Sends 8 bytes (bandwidth limit in bytes/sec as u64 LE) + FIN so the
-    /// server knows how fast to send.  0 means unlimited.
+    /// Sends 9 bytes: [mode: u8][bandwidth bytes/sec: u64 LE].
+    /// Downlink: FIN sent with trigger — server starts pumping.
+    /// Uplink:   no FIN — client pumps data immediately after.
     fn open_trigger_streams(&self, conn: &mut Connection) {
         let idx = conn.index().unwrap();
         let mut receivers = self.receivers.borrow_mut();
@@ -601,14 +643,30 @@ impl WorkerHandler {
             Some(r) => r,
             None => return,
         };
-        // 8-byte little-endian bandwidth (bytes/sec).  Sent with FIN.
-        let trigger = Bytes::copy_from_slice(&self.option.bandwidth.to_le_bytes());
+        let mode_byte = match self.option.mode {
+            TransferMode::Downlink => 0u8,
+            TransferMode::Uplink   => 1u8,
+        };
+        let fin = self.option.mode == TransferMode::Downlink;
+        // 9-byte trigger: [mode: u8][bandwidth bytes/sec: u64 LE]
+        let mut raw = [0u8; 9];
+        raw[0] = mode_byte;
+        raw[1..9].copy_from_slice(&self.option.bandwidth.to_le_bytes());
+        let trigger = Bytes::copy_from_slice(&raw);
         for _ in 0..self.option.streams_per_conn {
             let stream_id = recv.streams_opened * 4; // 0, 4, 8, … client-initiated bidi
-            match conn.stream_write(stream_id, trigger.clone(), true) {
+            match conn.stream_write(stream_id, trigger.clone(), fin) {
                 Ok(_) => {
                     recv.streams_opened += 1;
-                    debug!("{} opened trigger stream {}", conn.trace_id(), stream_id);
+                    if self.option.mode == TransferMode::Uplink {
+                        recv.uplink.insert(stream_id, UplinkState {
+                            bandwidth_limit: self.option.bandwidth,
+                            tokens: 0.0,
+                            last_refill: Instant::now(),
+                        });
+                        _ = conn.stream_want_write(stream_id, true);
+                    }
+                    debug!("{} opened stream {} {:?}", conn.trace_id(), stream_id, self.option.mode);
                 }
                 Err(Error::StreamLimitError) => {
                     debug!("{} stream limit reached", conn.trace_id());
@@ -683,6 +741,7 @@ impl TransportHandler for WorkerHandler {
         let mut ctx = self.worker_ctx.borrow_mut();
         if let Some(recv) = self.receivers.borrow().get(&idx) {
             ctx.bytes_received += recv.bytes_received;
+            ctx.bytes_sent += recv.bytes_sent;
         }
         self.receivers.borrow_mut().remove(&idx);
         accum_conn_stats(&mut ctx.conn_stats, conn.stats());
@@ -744,6 +803,62 @@ impl TransportHandler for WorkerHandler {
 
     fn on_stream_writable(&mut self, conn: &mut Connection, stream_id: u64) {
         _ = conn.stream_want_write(stream_id, false);
+        if self.option.mode != TransferMode::Uplink {
+            return;
+        }
+        let idx = conn.index().unwrap();
+        let mut receivers = self.receivers.borrow_mut();
+        let recv = match receivers.get_mut(&idx) {
+            Some(r) => r,
+            None => return,
+        };
+        let state = match recv.uplink.get_mut(&stream_id) {
+            Some(s) => s,
+            None => return,
+        };
+        loop {
+            // Token-bucket rate limiting.
+            if state.bandwidth_limit > 0 {
+                let now = Instant::now();
+                let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+                state.tokens = (state.tokens + elapsed * state.bandwidth_limit as f64)
+                    .min(state.bandwidth_limit as f64);
+                state.last_refill = now;
+                if state.tokens < 1.0 {
+                    _ = conn.stream_want_write(stream_id, true);
+                    return;
+                }
+            }
+            let to_send = if state.bandwidth_limit > 0 {
+                self.send_buf.len().min(state.tokens as usize).max(1)
+            } else {
+                self.send_buf.len()
+            };
+            match conn.stream_write(
+                stream_id,
+                Bytes::copy_from_slice(&self.send_buf[..to_send]),
+                false,
+            ) {
+                Ok(written) => {
+                    recv.bytes_sent += written as u64;
+                    if state.bandwidth_limit > 0 {
+                        state.tokens -= written as f64;
+                    }
+                    if written < to_send {
+                        _ = conn.stream_want_write(stream_id, true);
+                        return;
+                    }
+                }
+                Err(Error::Done) => {
+                    _ = conn.stream_want_write(stream_id, true);
+                    return;
+                }
+                Err(e) => {
+                    error!("{} uplink stream {} write: {:?}", conn.trace_id(), stream_id, e);
+                    return;
+                }
+            }
+        }
     }
 
     fn on_stream_closed(&mut self, conn: &mut Connection, stream_id: u64) {
@@ -820,8 +935,9 @@ fn main() -> Result<()> {
         format!("{:.1} Mbit/s", option.bandwidth as f64 * 8.0 / 1e6)
     };
     info!(
-        "Connecting to {:?}  duration={}s streams_per_conn={} bandwidth={} CC={:?} multipath={}",
+        "Connecting to {:?}  mode={:?} duration={}s streams_per_conn={} bandwidth={} CC={:?} multipath={}",
         option.connect_to,
+        option.mode,
         option.duration,
         option.streams_per_conn,
         bw_str,

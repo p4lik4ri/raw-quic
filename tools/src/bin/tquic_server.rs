@@ -188,9 +188,19 @@ pub struct ServerOpt {
     pub disable_encryption: bool,
 }
 
+// ─────────────────────────── Transfer direction ─────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum TransferMode {
+    #[default]
+    Downlink, // Server → Client
+    Uplink,   // Client → Server
+}
+
 // ─────────────────────────── Per-stream send state ───────────────────────────
 
 struct StreamSendState {
+    mode: TransferMode,
     bytes_sent: usize,
     finished: bool,
     /// True once the client trigger (bandwidth header) has been received.
@@ -220,6 +230,7 @@ impl ConnectionHandler {
         self.streams.insert(
             stream_id,
             StreamSendState {
+                mode: TransferMode::Downlink,
                 bytes_sent: 0,
                 finished: false,
                 ready: false,
@@ -249,14 +260,20 @@ impl ConnectionHandler {
                     if n > 0 {
                         state.trigger_buf.extend_from_slice(&tmp[..n]);
                     }
-                    let have_header = state.trigger_buf.len() >= 8;
+                    let have_header = state.trigger_buf.len() >= 9;
                     if have_header || fin {
-                        let bw = if have_header {
-                            let arr: [u8; 8] = state.trigger_buf[..8].try_into().unwrap();
-                            u64::from_le_bytes(arr)
+                        let (mode, bw) = if have_header {
+                            let m = if state.trigger_buf[0] == 1 {
+                                TransferMode::Uplink
+                            } else {
+                                TransferMode::Downlink
+                            };
+                            let arr: [u8; 8] = state.trigger_buf[1..9].try_into().unwrap();
+                            (m, u64::from_le_bytes(arr))
                         } else {
-                            0 // FIN with no data → unlimited
+                            (TransferMode::Downlink, 0) // legacy / FIN with no data
                         };
+                        state.mode = mode;
                         state.bandwidth_limit = bw;
                         state.tokens = 0.0; // start empty; first refill happens in pump()
                         state.last_refill = Instant::now();
@@ -355,6 +372,27 @@ impl ConnectionHandler {
                 Err(e) => {
                     error!("{} stream {} write: {:?}", conn.trace_id(), stream_id, e);
                     return;
+                }
+            }
+        }
+    }
+
+    /// Drain incoming data on an uplink stream (client → server). Data is discarded.
+    fn drain_uplink(&mut self, conn: &mut Connection, stream_id: u64) {
+        let should_drain = self.streams.get(&stream_id)
+            .map(|s| s.ready && s.mode == TransferMode::Uplink)
+            .unwrap_or(false);
+        if !should_drain {
+            return;
+        }
+        let mut tmp = [0u8; 65536];
+        loop {
+            match conn.stream_read(stream_id, &mut tmp) {
+                Ok((0, _)) | Err(Error::Done) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    error!("{} uplink drain {}: {:?}", conn.trace_id(), stream_id, e);
+                    break;
                 }
             }
         }
@@ -471,12 +509,12 @@ impl TransportHandler for ServerHandler {
     }
 
     fn on_stream_readable(&mut self, conn: &mut Connection, stream_id: u64) {
-        // Only even-ID streams are client-initiated; they carry the bandwidth trigger.
+        // Only even-ID streams are client-initiated.
         if stream_id % 2 == 1 {
             return;
         }
         let idx = conn.index().unwrap();
-        // Phase 1: parse the 8-byte bandwidth trigger.
+        // Phase 1: parse the 9-byte trigger ([mode:u8][bandwidth:u64 LE]).
         let just_ready = {
             if let Some(handler) = self.conns.get_mut(&idx) {
                 handler.parse_trigger(conn, stream_id)
@@ -484,11 +522,30 @@ impl TransportHandler for ServerHandler {
                 false
             }
         };
-        // Phase 2: start pumping the moment the trigger is received.
         if just_ready {
-            let send_buf = self.send_buf.clone();
+            let mode = self.conns.get(&idx)
+                .and_then(|h| h.streams.get(&stream_id))
+                .map(|s| s.mode)
+                .unwrap_or(TransferMode::Downlink);
+            match mode {
+                TransferMode::Downlink => {
+                    // Server starts pumping bulk data to client.
+                    let send_buf = self.send_buf.clone();
+                    if let Some(handler) = self.conns.get_mut(&idx) {
+                        handler.pump(conn, stream_id, &send_buf);
+                    }
+                }
+                TransferMode::Uplink => {
+                    // Client pumps; server just drains the stream buffer.
+                    if let Some(handler) = self.conns.get_mut(&idx) {
+                        handler.drain_uplink(conn, stream_id);
+                    }
+                }
+            }
+        } else {
+            // Subsequent readable events: drain ongoing uplink data.
             if let Some(handler) = self.conns.get_mut(&idx) {
-                handler.pump(conn, stream_id, &send_buf);
+                handler.drain_uplink(conn, stream_id);
             }
         }
     }
@@ -496,6 +553,14 @@ impl TransportHandler for ServerHandler {
     fn on_stream_writable(&mut self, conn: &mut Connection, stream_id: u64) {
         _ = conn.stream_want_write(stream_id, false);
         let idx = conn.index().unwrap();
+        // Skip uplink streams — the client drives sending, not the server.
+        let is_uplink = self.conns.get(&idx)
+            .and_then(|h| h.streams.get(&stream_id))
+            .map(|s| s.mode == TransferMode::Uplink)
+            .unwrap_or(false);
+        if is_uplink {
+            return;
+        }
         let send_buf = self.send_buf.clone();
         if let Some(handler) = self.conns.get_mut(&idx) {
             handler.pump(conn, stream_id, &send_buf);
