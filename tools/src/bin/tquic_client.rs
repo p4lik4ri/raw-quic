@@ -105,11 +105,18 @@ pub struct ClientOpt {
     pub bandwidth: u64,  // stored internally as bytes/sec
 
     // ── Protocol ──────────────────────────────────────────────────────────────
-    /// File used for session resumption.
+    /// File used for session resumption (TLS session + QUIC transport params).
+    /// On first run the file is written automatically for reuse on subsequent runs.
     #[clap(short, long, value_name = "FILE", help_heading = "Protocol")]
     pub session_file: Option<String>,
 
-    /// Enable early data.
+    /// File used to store/reload the address token for 0-RTT connections.
+    /// Pair with --session-file and --enable-early-data for full 0-RTT.
+    #[clap(long, value_name = "FILE", help_heading = "Protocol")]
+    pub token_file: Option<String>,
+
+    /// Enable early data (0-RTT).  Requires --session-file and --token-file
+    /// to have been populated by a previous run.
     #[clap(short, long, help_heading = "Protocol")]
     pub enable_early_data: bool,
 
@@ -300,6 +307,8 @@ impl Client {
 #[derive(Default)]
 struct WorkerContext {
     session: Option<Vec<u8>>,
+    /// Address token saved from on_new_token, used for 0-RTT on next connect.
+    token: Option<Vec<u8>>,
     bytes_received: u64,
     conn_total: u64,
     conn_handshake_success: u64,
@@ -317,6 +326,11 @@ impl WorkerContext {
         if let Some(sf) = &opt.session_file {
             if let Ok(data) = std::fs::read(sf) {
                 ctx.session = Some(data);
+            }
+        }
+        if let Some(tf) = &opt.token_file {
+            if let Ok(data) = std::fs::read(tf) {
+                ctx.token = Some(data);
             }
         }
         ctx
@@ -499,7 +513,7 @@ impl Worker {
                 self.remote,
                 sni,
                 ctx.session.as_deref(),
-                None,
+                ctx.token.as_deref(), // address token enables 0-RTT
                 None,
             ) {
                 Ok(_) => {
@@ -637,7 +651,14 @@ impl TransportHandler for WorkerHandler {
     }
 
     fn on_conn_established(&mut self, conn: &mut Connection) {
-        debug!("{} connection established (resumed={})", conn.trace_id(), conn.is_resumed());
+        let early = conn.is_in_early_data();
+        debug!(
+            "{} connection established resumed={} 0rtt={}",
+            conn.trace_id(), conn.is_resumed(), early
+        );
+        if conn.is_resumed() {
+            info!("{} 0-RTT/resumed connection — handshake saved", conn.trace_id());
+        }
         {
             let mut ctx = self.worker_ctx.borrow_mut();
             ctx.conn_handshake_success += 1;
@@ -666,9 +687,13 @@ impl TransportHandler for WorkerHandler {
         self.receivers.borrow_mut().remove(&idx);
         accum_conn_stats(&mut ctx.conn_stats, conn.stats());
 
-        if self.option.session_file.is_some() {
+        // Persist TLS session for next run (enables session resumption / 0-RTT).
+        if let Some(sf) = &self.option.session_file {
             if let Some(session) = conn.session() {
                 ctx.session = Some(session.to_vec());
+                if let Err(e) = std::fs::write(sf, session) {
+                    error!("failed to write session file {}: {:?}", sf, e);
+                }
             }
         }
         ctx.conn_finish += 1;
@@ -743,7 +768,15 @@ impl TransportHandler for WorkerHandler {
         }
     }
 
-    fn on_new_token(&mut self, _conn: &mut Connection, _token: Vec<u8>) {}
+    fn on_new_token(&mut self, conn: &mut Connection, token: Vec<u8>) {
+        // Persist the address token so the next run can use it for 0-RTT.
+        if let Some(tf) = &self.option.token_file {
+            if let Err(e) = std::fs::write(tf, &token) {
+                error!("{} failed to write token file {}: {:?}", conn.trace_id(), tf, e);
+            }
+        }
+        self.worker_ctx.borrow_mut().token = Some(token);
+    }
 }
 
 // ─────────────────────────────── Entry point ─────────────────────────────────
