@@ -584,12 +584,14 @@ struct DataReceiver {
     jitter_ms: f64,
     /// Timestamp of the last readable event, used for jitter calculation.
     last_recv_time: Option<Instant>,
-    /// Accumulator for the 16-byte server stats reply on uplink streams.
+    /// Accumulator for the 16-byte server stats reply (uplink) or stats-request reply (downlink).
     server_reply_buf: Vec<u8>,
-    /// Rolling tail buffer for the 16-byte downlink stats trailer.
-    /// Holds up to the last 16 bytes received; populated only in downlink mode.
-    downlink_trailer: [u8; 16],
-    downlink_trailer_len: usize,
+    /// True once a downlink stats request has been sent on this connection.
+    stats_req_sent: bool,
+    /// Stream ID of the downlink stats request stream.
+    stats_req_stream: Option<u64>,
+    /// True once the downlink stats reply has been fully received.
+    downlink_stats_received: bool,
 }
 
 impl DataReceiver {
@@ -603,8 +605,9 @@ impl DataReceiver {
             jitter_ms: 0.0,
             last_recv_time: None,
             server_reply_buf: Vec::new(),
-            downlink_trailer: [0u8; 16],
-            downlink_trailer_len: 0,
+            stats_req_sent: false,
+            stats_req_stream: None,
+            downlink_stats_received: false,
         }
     }
 }
@@ -775,16 +778,12 @@ impl Worker {
         if self.option.duration > 0
             && (Instant::now() - self.start_time).as_secs() >= self.option.duration
         {
-            if self.option.mode == TransferMode::Uplink {
-                // Signal WorkerHandler to FIN all uplink streams and wait for reply.
-                self.duration_expired.store(true, Ordering::Relaxed);
-                // Set a 2-second hard deadline in case server reply never arrives.
-                if self.fin_deadline.is_none() {
-                    self.fin_deadline = Some(Instant::now() + Duration::from_secs(2));
-                }
-                return false;
+            // Both uplink and downlink: signal expiry and wait for server stats reply.
+            self.duration_expired.store(true, Ordering::Relaxed);
+            if self.fin_deadline.is_none() {
+                self.fin_deadline = Some(Instant::now() + Duration::from_secs(2));
             }
-            return true;
+            return false;
         }
         false
     }
@@ -823,6 +822,57 @@ impl Worker {
             if all_replied || deadline_passed {
                 self.endpoint.close(false);
                 let idxs: Vec<u64> = self.receivers.borrow().keys().cloned().collect();
+                for idx in idxs {
+                    if let Some(conn) = self.endpoint.conn_get_mut(idx) {
+                        _ = conn.close(true, 0x00, b"done");
+                    }
+                }
+                if self.end_time.is_none() {
+                    self.end_time = Some(Instant::now());
+                }
+                if self.receivers.borrow().is_empty() {
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+        }
+
+        // Downlink: duration has expired — send a stats-request stream to each server,
+        // then wait for the 16-byte reply before closing.
+        if self.option.mode == TransferMode::Downlink
+            && self.duration_expired.load(Ordering::Relaxed)
+        {
+            // Send stats request on connections that haven't sent one yet.
+            let idxs: Vec<u64> = self.receivers.borrow().keys().cloned().collect();
+            for idx in &idxs {
+                let needs_req = self.receivers.borrow()
+                    .get(idx)
+                    .map(|r| !r.stats_req_sent)
+                    .unwrap_or(false);
+                if needs_req {
+                    let streams_opened = self.receivers.borrow()
+                        .get(idx)
+                        .map(|r| r.streams_opened)
+                        .unwrap_or(0);
+                    let req_stream_id = streams_opened * 4;
+                    if let Some(conn) = self.endpoint.conn_get_mut(*idx) {
+                        let _ = conn.stream_write(req_stream_id, Bytes::from_static(&[0xFF]), true);
+                        let _ = conn.stream_want_read(req_stream_id, true);
+                    }
+                    if let Some(recv) = self.receivers.borrow_mut().get_mut(idx) {
+                        recv.stats_req_sent = true;
+                        recv.stats_req_stream = Some(req_stream_id);
+                        recv.streams_opened += 1;
+                    }
+                }
+            }
+            let all_replied = self.receivers.borrow().values()
+                .all(|r| r.downlink_stats_received);
+            let deadline_passed = self.fin_deadline
+                .map(|d| Instant::now() >= d)
+                .unwrap_or(false);
+            if all_replied || deadline_passed {
+                self.endpoint.close(false);
                 for idx in idxs {
                     if let Some(conn) = self.endpoint.conn_get_mut(idx) {
                         _ = conn.close(true, 0x00, b"done");
@@ -981,18 +1031,10 @@ impl WorkerHandler {
             TransferMode::Uplink   => 1u8,
         };
         let fin = self.option.mode == TransferMode::Downlink;
-        // 17-byte trigger: [mode: u8][bandwidth bytes/sec: u64 LE][expected_total_bytes: u64 LE]
-        // expected_total_bytes lets the server know exactly how much data to send so it can
-        // append the 16-byte stats trailer + FIN at the right time.
-        let expected_bytes: u64 = if self.option.duration > 0 && self.option.bandwidth > 0 {
-            self.option.bandwidth.saturating_mul(self.option.duration)
-        } else {
-            0
-        };
-        let mut raw = [0u8; 17];
+        // 9-byte trigger: [mode: u8][bandwidth bytes/sec: u64 LE]
+        let mut raw = [0u8; 9];
         raw[0] = mode_byte;
         raw[1..9].copy_from_slice(&self.option.bandwidth.to_le_bytes());
-        raw[9..17].copy_from_slice(&expected_bytes.to_le_bytes());
         let trigger = Bytes::copy_from_slice(&raw);
         for _ in 0..self.option.streams_per_conn {
             let stream_id = recv.streams_opened * 4; // 0, 4, 8, … client-initiated bidi
@@ -1154,38 +1196,28 @@ impl TransportHandler for WorkerHandler {
                         continue; // don't count as live_bytes
                     }
                     let n = n; let fin = _fin;
-                    // Downlink bulk receive path.
-                    // Keep a rolling 16-byte tail so we can detect the stats trailer on FIN.
-                    if let Some(recv) = self.receivers.borrow_mut().get_mut(&idx) {
-                        // Update the 16-byte tail window.
-                        let chunk = &self.recv_buf[..n];
-                        if n >= 16 {
-                            recv.downlink_trailer.copy_from_slice(&chunk[n - 16..]);
-                            recv.downlink_trailer_len = 16;
-                        } else {
-                            // Shift existing tail left and append new bytes.
-                            let existing = recv.downlink_trailer_len;
-                            let total = existing + n;
-                            if total >= 16 {
-                                let keep = 16 - n;
-                                recv.downlink_trailer.copy_within(existing - keep..existing, 0);
-                                recv.downlink_trailer[keep..16].copy_from_slice(chunk);
-                                recv.downlink_trailer_len = 16;
-                            } else {
-                                recv.downlink_trailer[existing..existing + n].copy_from_slice(chunk);
-                                recv.downlink_trailer_len = total;
+                    // Downlink receive path.
+                    // Check if this is the stats-request reply stream.
+                    let is_stats_stream = self.receivers.borrow()
+                        .get(&idx)
+                        .and_then(|r| r.stats_req_stream)
+                        .map(|id| id == stream_id)
+                        .unwrap_or(false);
+                    if is_stats_stream {
+                        if let Some(recv) = self.receivers.borrow_mut().get_mut(&idx) {
+                            recv.server_reply_buf.extend_from_slice(&self.recv_buf[..n]);
+                            if recv.server_reply_buf.len() >= 16 {
+                                let lc = u64::from_le_bytes(recv.server_reply_buf[0..8].try_into().unwrap());
+                                let sc = u64::from_le_bytes(recv.server_reply_buf[8..16].try_into().unwrap());
+                                self.server_lost.store(lc, Ordering::Relaxed);
+                                self.server_sent.store(sc, Ordering::Relaxed);
+                                recv.downlink_stats_received = true;
                             }
                         }
-                        // If FIN arrived, the last 16 bytes are the stats trailer — decode and strip.
-                        if fin && recv.downlink_trailer_len == 16 {
-                            let lc = u64::from_le_bytes(recv.downlink_trailer[0..8].try_into().unwrap());
-                            let sc = u64::from_le_bytes(recv.downlink_trailer[8..16].try_into().unwrap());
-                            self.server_lost.store(lc, Ordering::Relaxed);
-                            self.server_sent.store(sc, Ordering::Relaxed);
-                            // Subtract the 16-byte trailer from the transfer count.
-                            recv.bytes_received = recv.bytes_received.saturating_sub(16);
-                            self.live_bytes.fetch_sub(16u64.min(self.live_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
-                        }
+                        continue; // don't count as live_bytes
+                    }
+                    // Normal downlink bulk data.
+                    if let Some(recv) = self.receivers.borrow_mut().get_mut(&idx) {
                         recv.bytes_received += n as u64;
                         // RFC 3550 §A.8 interarrival jitter.
                         if let Some(last) = recv.last_recv_time {
@@ -1196,7 +1228,7 @@ impl TransportHandler for WorkerHandler {
                         // Publish current jitter as f64 bits.
                         self.live_jitter.store(recv.jitter_ms.to_bits(), Ordering::Relaxed);
                     }
-                    // Count bytes toward transfer (subtract trailer on FIN handled above).
+                    // Count bytes toward transfer.
                     self.live_bytes.fetch_add(n as u64, Ordering::Relaxed);
                     // Update live stats for the interval reporter.
                     let stats = conn.stats();
