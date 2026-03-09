@@ -222,6 +222,8 @@ struct StreamSendState {
     reply_sent: bool,
     /// True once we have written the 16-byte downlink stats trailer (lost+sent) + FIN.
     trailer_sent: bool,
+    /// Per-stream send size from the client trigger (0 = unlimited / use global).
+    stream_send_size: usize,
 }
 
 // ─────────────────────────── Per-connection handler ──────────────────────────
@@ -259,6 +261,7 @@ impl ConnectionHandler {
                 last_refill: Instant::now(),
                 reply_sent: false,
                 trailer_sent: false,
+                stream_send_size: 0,
             },
         );
     }
@@ -281,21 +284,25 @@ impl ConnectionHandler {
                     if n > 0 {
                         state.trigger_buf.extend_from_slice(&tmp[..n]);
                     }
-                    let have_header = state.trigger_buf.len() >= 9;
+                    let have_header = state.trigger_buf.len() >= 17;
                     if have_header || fin {
-                        let (mode, bw) = if have_header {
+                        let (mode, bw, stream_send_size) = if have_header {
                             let m = if state.trigger_buf[0] == 1 {
                                 TransferMode::Uplink
                             } else {
                                 TransferMode::Downlink
                             };
                             let arr: [u8; 8] = state.trigger_buf[1..9].try_into().unwrap();
-                            (m, u64::from_le_bytes(arr))
+                            let bw = u64::from_le_bytes(arr);
+                            let ssz_arr: [u8; 8] = state.trigger_buf[9..17].try_into().unwrap();
+                            let ssz = u64::from_le_bytes(ssz_arr) as usize;
+                            (m, bw, ssz)
                         } else {
-                            (TransferMode::Downlink, 0) // legacy / FIN with no data
+                            (TransferMode::Downlink, 0, 0) // legacy / FIN with no data
                         };
                         state.mode = mode;
                         state.bandwidth_limit = bw;
+                        state.stream_send_size = stream_send_size;
                         state.tokens = 0.0; // start empty; first refill happens in pump()
                         state.last_refill = Instant::now();
                         state.ready = true;
@@ -318,8 +325,7 @@ impl ConnectionHandler {
     /// When the transfer is complete, appends a 16-byte stats trailer
     /// `[lost_count: u64 LE][sent_count: u64 LE]` followed by FIN so the client
     /// can display the server's retransmission count on the sender row.
-    fn pump(&mut self, conn: &mut Connection, stream_id: u64, buf: &[u8],
-            lost_count: u64, sent_count: u64) {
+    fn pump(&mut self, conn: &mut Connection, stream_id: u64, buf: &[u8]) {
         let state = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => return,
@@ -347,15 +353,23 @@ impl ConnectionHandler {
             }
 
             // ── Determine chunk to write ──────────────────────────────────────
-            let to_send = if self.send_size > 0 {
-                let remaining = self.send_size.saturating_sub(state.bytes_sent);
+            // Use per-stream send size (from trigger) if set, else global option.
+            let effective_send_size = if state.stream_send_size > 0 {
+                state.stream_send_size
+            } else {
+                self.send_size
+            };
+            let to_send = if effective_send_size > 0 {
+                let remaining = effective_send_size.saturating_sub(state.bytes_sent);
                 if remaining == 0 {
                     // All data sent — write the 16-byte stats trailer + FIN once.
+                    // Read stats directly from the connection for accuracy.
                     if !state.trailer_sent {
                         state.trailer_sent = true;
+                        let stats = conn.stats();
                         let mut trailer = [0u8; 16];
-                        trailer[0..8].copy_from_slice(&lost_count.to_le_bytes());
-                        trailer[8..16].copy_from_slice(&sent_count.to_le_bytes());
+                        trailer[0..8].copy_from_slice(&stats.lost_count.to_le_bytes());
+                        trailer[8..16].copy_from_slice(&stats.sent_count.to_le_bytes());
                         match conn.stream_write(stream_id, Bytes::copy_from_slice(&trailer), true) {
                             Ok(_) | Err(Error::Done) => {}
                             Err(e) => error!("{} stream trailer: {:?}", conn.trace_id(), e),
@@ -596,10 +610,8 @@ impl TransportHandler for ServerHandler {
             match mode {
                 TransferMode::Downlink => {
                     let send_buf = self.send_buf.clone();
-                    let lc = self.live_lost.load(Ordering::Relaxed);
-                    let sc = self.live_sent.load(Ordering::Relaxed);
                     if let Some(handler) = self.conns.get_mut(&idx) {
-                        handler.pump(conn, stream_id, &send_buf, lc, sc);
+                        handler.pump(conn, stream_id, &send_buf);
                     }
                 }
                 TransferMode::Uplink => {
@@ -658,9 +670,7 @@ impl TransportHandler for ServerHandler {
         }
         let send_buf = self.send_buf.clone();
         if let Some(handler) = self.conns.get_mut(&idx) {
-            let lc = self.live_lost.load(Ordering::Relaxed);
-            let sc = self.live_sent.load(Ordering::Relaxed);
-            handler.pump(conn, stream_id, &send_buf, lc, sc);
+            handler.pump(conn, stream_id, &send_buf);
             // Update live downlink stats for the interval reporter.
             let stats = conn.stats();
             let delta = stats.sent_bytes.saturating_sub(handler.prev_bytes_sent);

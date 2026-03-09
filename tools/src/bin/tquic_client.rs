@@ -981,10 +981,18 @@ impl WorkerHandler {
             TransferMode::Uplink   => 1u8,
         };
         let fin = self.option.mode == TransferMode::Downlink;
-        // 9-byte trigger: [mode: u8][bandwidth bytes/sec: u64 LE]
-        let mut raw = [0u8; 9];
+        // 17-byte trigger: [mode: u8][bandwidth bytes/sec: u64 LE][expected_total_bytes: u64 LE]
+        // expected_total_bytes lets the server know exactly how much data to send so it can
+        // append the 16-byte stats trailer + FIN at the right time.
+        let expected_bytes: u64 = if self.option.duration > 0 && self.option.bandwidth > 0 {
+            self.option.bandwidth.saturating_mul(self.option.duration)
+        } else {
+            0
+        };
+        let mut raw = [0u8; 17];
         raw[0] = mode_byte;
         raw[1..9].copy_from_slice(&self.option.bandwidth.to_le_bytes());
+        raw[9..17].copy_from_slice(&expected_bytes.to_le_bytes());
         let trigger = Bytes::copy_from_slice(&raw);
         for _ in 0..self.option.streams_per_conn {
             let stream_id = recv.streams_opened * 4; // 0, 4, 8, … client-initiated bidi
