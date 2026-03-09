@@ -281,6 +281,8 @@ struct Client {
     server_jitter: Arc<AtomicU64>,
     /// Server-measured lost packet count received in the uplink stats reply.
     server_lost: Arc<AtomicU64>,
+    /// Set when test duration has expired; signals workers to FIN uplink streams.
+    duration_expired: Arc<AtomicBool>,
     /// Set by main thread to stop the reporter thread.
     reporting_done: Arc<AtomicBool>,
 }
@@ -301,6 +303,7 @@ impl Client {
             live_jitter:  Arc::new(AtomicU64::new(0)),
             server_jitter: Arc::new(AtomicU64::new(0)),
             server_lost:   Arc::new(AtomicU64::new(0)),
+            duration_expired: Arc::new(AtomicBool::new(false)),
             reporting_done: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -461,8 +464,9 @@ impl Client {
             let jitter = Arc::clone(&self.live_jitter);
             let srv_jitter = Arc::clone(&self.server_jitter);
             let srv_lost   = Arc::clone(&self.server_lost);
+            let dur_exp    = Arc::clone(&self.duration_expired);
             handles.push(thread::spawn(move || {
-                Worker::new(opt, ctx, term, live, lost, sent, jitter, srv_jitter, srv_lost).unwrap().start().unwrap();
+                Worker::new(opt, ctx, term, live, lost, sent, jitter, srv_jitter, srv_lost, dur_exp).unwrap().start().unwrap();
             }));
         }
         for h in handles { h.join().unwrap(); }
@@ -553,10 +557,11 @@ impl WorkerContext {
 
 /// Per-stream uplink (client→server) send state — token bucket.
 struct UplinkState {
-
     bandwidth_limit: u64, // bytes/sec, 0 = unlimited
     tokens: f64,
     last_refill: Instant,
+    /// True once we have sent the FIN (stream close) on this uplink stream.
+    fin_sent: bool,
 }
 
 /// Per-connection bookkeeping for both downlink receive and uplink send.
@@ -609,6 +614,10 @@ struct Worker {
     #[allow(dead_code)] live_jitter: Arc<AtomicU64>,
     #[allow(dead_code)] server_jitter: Arc<AtomicU64>,
     #[allow(dead_code)] server_lost:   Arc<AtomicU64>,
+    /// Set when duration expires; tells WorkerHandler to FIN uplink streams.
+    duration_expired: Arc<AtomicBool>,
+    /// Deadline after which we close even if no server reply was received.
+    fin_deadline: Option<Instant>,
 }
 
 impl Worker {
@@ -622,6 +631,7 @@ impl Worker {
         live_jitter: Arc<AtomicU64>,
         server_jitter: Arc<AtomicU64>,
         server_lost:   Arc<AtomicU64>,
+        duration_expired: Arc<AtomicBool>,
     ) -> Result<Self> {
         let mut config = Config::new()?;
         config.enable_stateless_reset(!option.disable_stateless_reset);
@@ -687,6 +697,7 @@ impl Worker {
             live_jitter.clone(),
             server_jitter.clone(),
             server_lost.clone(),
+            duration_expired.clone(),
         );
 
         Ok(Worker {
@@ -708,6 +719,8 @@ impl Worker {
             live_jitter,
             server_jitter,
             server_lost,
+            duration_expired,
+            fin_deadline: None,
         })
     }
 
@@ -728,7 +741,7 @@ impl Worker {
         Ok(())
     }
 
-    fn should_exit(&self) -> bool {
+    fn should_exit(&mut self) -> bool {
         if self.terminated.load(Ordering::Relaxed) {
             info!("terminated by signal");
             return true;
@@ -743,6 +756,15 @@ impl Worker {
         if self.option.duration > 0
             && (Instant::now() - self.start_time).as_secs() >= self.option.duration
         {
+            if self.option.mode == TransferMode::Uplink {
+                // Signal WorkerHandler to FIN all uplink streams and wait for reply.
+                self.duration_expired.store(true, Ordering::Relaxed);
+                // Set a 2-second hard deadline in case server reply never arrives.
+                if self.fin_deadline.is_none() {
+                    self.fin_deadline = Some(Instant::now() + Duration::from_secs(2));
+                }
+                return false;
+            }
             return true;
         }
         false
@@ -766,6 +788,35 @@ impl Worker {
                 return Ok(true);
             }
             return Ok(false);
+        }
+
+        // Uplink: duration has expired — wait for server's 16-byte reply on all streams.
+        if self.option.mode == TransferMode::Uplink
+            && self.duration_expired.load(Ordering::Relaxed)
+        {
+            // Check if every open connection has received the server reply.
+            let all_replied = self.receivers.borrow().values()
+                .all(|r| r.server_reply_buf.len() >= 16);
+            // Also honour the hard deadline.
+            let deadline_passed = self.fin_deadline
+                .map(|d| Instant::now() >= d)
+                .unwrap_or(false);
+            if all_replied || deadline_passed {
+                self.endpoint.close(false);
+                let idxs: Vec<u64> = self.receivers.borrow().keys().cloned().collect();
+                for idx in idxs {
+                    if let Some(conn) = self.endpoint.conn_get_mut(idx) {
+                        _ = conn.close(true, 0x00, b"done");
+                    }
+                }
+                if self.end_time.is_none() {
+                    self.end_time = Some(Instant::now());
+                }
+                if self.receivers.borrow().is_empty() {
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
         }
 
         // Spawn new connections up to the limit.
@@ -855,6 +906,8 @@ struct WorkerHandler {
     /// Server-measured stats received via the uplink reply channel.
     server_jitter: Arc<AtomicU64>,
     server_lost:   Arc<AtomicU64>,
+    /// Signals that the test duration has expired; uplink streams should send FIN.
+    duration_expired: Arc<AtomicBool>,
 }
 
 impl WorkerHandler {
@@ -869,6 +922,7 @@ impl WorkerHandler {
         live_jitter: Arc<AtomicU64>,
         server_jitter: Arc<AtomicU64>,
         server_lost:   Arc<AtomicU64>,
+        duration_expired: Arc<AtomicBool>,
     ) -> Self {
         Self {
             option: option.clone(),
@@ -884,6 +938,7 @@ impl WorkerHandler {
             live_jitter,
             server_jitter,
             server_lost,
+            duration_expired,
         }
     }
 
@@ -918,8 +973,11 @@ impl WorkerHandler {
                             bandwidth_limit: self.option.bandwidth,
                             tokens: 0.0,
                             last_refill: Instant::now(),
+                            fin_sent: false,
                         });
                         _ = conn.stream_want_write(stream_id, true);
+                        // Enable reads so the server's 16-byte reply can arrive.
+                        _ = conn.stream_want_read(stream_id, true);
                     }
                     debug!("{} opened stream {} {:?}", conn.trace_id(), stream_id, self.option.mode);
                 }
@@ -1108,6 +1166,19 @@ impl TransportHandler for WorkerHandler {
             Some(s) => s,
             None => return,
         };
+        // Duration expired: send FIN to end the stream so the server sends back stats.
+        if self.duration_expired.load(Ordering::Relaxed) {
+            if !state.fin_sent {
+                state.fin_sent = true;
+                // Empty write with fin=true closes the stream toward the server.
+                match conn.stream_write(stream_id, Bytes::new(), true) {
+                    Ok(_) | Err(Error::Done) => {}
+                    Err(e) => error!("{} uplink FIN {}: {:?}", conn.trace_id(), stream_id, e),
+                }
+                _ = conn.stream_want_read(stream_id, true);
+            }
+            return;
+        }
         loop {
             // Token-bucket rate limiting.
             if state.bandwidth_limit > 0 {
