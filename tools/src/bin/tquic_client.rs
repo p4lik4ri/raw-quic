@@ -317,36 +317,62 @@ impl Client {
             println!();
             println!("[ rawquic ] Interval report ({direction})");
             let _ = std::io::stdout().flush();
-            println!(
-                "  {:<12}  {:>10}  {:>16}  {}",
-                "Interval", "Transfer", "Bitrate", "Total Datagrams"
-            );
+            match reporter_mode {
+                TransferMode::Downlink => println!(
+                    "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
+                    "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
+                ),
+                TransferMode::Uplink => println!(
+                    "  {:<12}  {:>10}  {:>16}  {}",
+                    "Interval", "Transfer", "Bitrate", "Total Datagrams"
+                ),
+            }
             let _ = std::io::stdout().flush();
             let mut last_bytes: u64 = 0;
             let mut last_sent:  u64 = 0;
+            let mut last_lost:  u64 = 0;
             let mut interval:   u64 = 0;
             loop {
                 thread::sleep(Duration::from_secs(1));
-                let done     = reporter_done.load(Ordering::Relaxed);
-                let current  = reporter_live.load(Ordering::Relaxed);
-                let cur_sent = reporter_sent.load(Ordering::Relaxed);
+                let done      = reporter_done.load(Ordering::Relaxed);
+                let current   = reporter_live.load(Ordering::Relaxed);
+                let cur_sent  = reporter_sent.load(Ordering::Relaxed);
+                let cur_lost  = reporter_lost.load(Ordering::Relaxed);
+                let jitter_ms = f64::from_bits(reporter_jitter.load(Ordering::Relaxed));
                 let delta  = current.saturating_sub(last_bytes);
                 let d_sent = cur_sent.saturating_sub(last_sent);
+                let d_lost = cur_lost.saturating_sub(last_lost);
                 last_bytes = current;
                 last_sent  = cur_sent;
+                last_lost  = cur_lost;
                 let t_start = interval as f64;
                 let t_end   = interval as f64 + 1.0;
                 interval   += 1;
                 let mb   = delta as f64 / 1e6;
                 let mbps = (delta as f64 * 8.0) / 1e6;
                 if delta > 0 {
-                    println!(
-                        "  {:<12}  {:>10}  {:>16}  {}",
-                        format!("{:.2}-{:.2} s", t_start, t_end),
-                        format!("{:.2} MB", mb),
-                        format!("{:.2} Mbits/sec", mbps),
-                        d_sent,
-                    );
+                    match reporter_mode {
+                        TransferMode::Downlink => {
+                            let loss_pct = if d_sent > 0 { d_lost as f64 / d_sent as f64 * 100.0 } else { 0.0 };
+                            println!(
+                                "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)",
+                                format!("{:.2}-{:.2} s", t_start, t_end),
+                                format!("{:.2} MB", mb),
+                                format!("{:.2} Mbits/sec", mbps),
+                                format!("{:.3} ms", jitter_ms),
+                                d_lost, d_sent, loss_pct,
+                            );
+                        }
+                        TransferMode::Uplink => {
+                            println!(
+                                "  {:<12}  {:>10}  {:>16}  {}",
+                                format!("{:.2}-{:.2} s", t_start, t_end),
+                                format!("{:.2} MB", mb),
+                                format!("{:.2} Mbits/sec", mbps),
+                                d_sent,
+                            );
+                        }
+                    }
                     let _ = std::io::stdout().flush();
                 }
                 if done { break; }
@@ -360,26 +386,45 @@ impl Client {
                 let total_secs = interval.max(1) as f64;
                 let total_mb   = current as f64 / 1e6;
                 let total_mbps = (current as f64 * 8.0) / 1e6 / total_secs;
-                let loss_pct   = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
-                // Uplink  → client is sender  (jitter n/a, show 0.000)
-                // Downlink → client is receiver (show measured jitter)
-                let (role, show_jitter) = match reporter_mode {
-                    TransferMode::Uplink   => ("sender",   0.0_f64),
-                    TransferMode::Downlink => ("receiver", jitter_ms),
-                };
                 println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
                 println!(
                     "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
                     "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
                 );
-                println!(
-                    "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.2}%)  {}",
-                    format!("0.00-{:.2} s", total_secs),
-                    format!("{:.2} MB", total_mb),
-                    format!("{:.2} Mbits/sec", total_mbps),
-                    format!("{:.3} ms", show_jitter),
-                    cur_lost, cur_sent, loss_pct, role,
-                );
+                match reporter_mode {
+                    TransferMode::Uplink => {
+                        let loss_pct = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
+                        println!(
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.2}%)  sender",
+                            format!("0.00-{:.2} s", total_secs),
+                            format!("{:.2} MB", total_mb),
+                            format!("{:.2} Mbits/sec", total_mbps),
+                            format!("{:.3} ms", 0.0_f64),
+                            cur_lost, cur_sent, loss_pct,
+                        );
+                    }
+                    TransferMode::Downlink => {
+                        // Sender row: estimate total sent = received + lost (QUIC-level)
+                        let sender_total  = cur_sent + cur_lost;
+                        let recv_loss_pct = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
+                        println!(
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)  sender",
+                            format!("0.00-{:.2} s", total_secs),
+                            format!("{:.2} MB", total_mb),
+                            format!("{:.2} Mbits/sec", total_mbps),
+                            format!("{:.3} ms", 0.0_f64),
+                            0u64, sender_total, 0.0_f64,
+                        );
+                        println!(
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
+                            format!("0.00-{:.2} s", total_secs),
+                            format!("{:.2} MB", total_mb),
+                            format!("{:.2} Mbits/sec", total_mbps),
+                            format!("{:.3} ms", jitter_ms),
+                            cur_lost, cur_sent, recv_loss_pct,
+                        );
+                    }
+                }
                 let _ = std::io::stdout().flush();
             }
         });
@@ -968,9 +1013,10 @@ impl TransportHandler for WorkerHandler {
                 Ok((n, fin)) => {
                     self.live_bytes.fetch_add(n as u64, Ordering::Relaxed);
                     // Update live stats for the interval reporter.
+                    // recv_count = datagrams received from server (meaningful for downlink receiver stats).
                     let stats = conn.stats();
                     self.live_lost.store(stats.lost_count, Ordering::Relaxed);
-                    self.live_sent.store(stats.sent_count, Ordering::Relaxed);
+                    self.live_sent.store(stats.recv_count, Ordering::Relaxed);
                     if let Some(recv) = self.receivers.borrow_mut().get_mut(&idx) {
                         recv.bytes_received += n as u64;
                         // RFC 3550 §A.8 interarrival jitter.
