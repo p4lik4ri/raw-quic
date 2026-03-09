@@ -317,10 +317,16 @@ impl Client {
             println!();
             println!("[ rawquic ] Interval report ({direction})");
             let _ = std::io::stdout().flush();
-            println!(
-                "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
-                "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
-            );
+            match reporter_mode {
+                TransferMode::Downlink => println!(
+                    "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
+                    "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
+                ),
+                TransferMode::Uplink => println!(
+                    "  {:<12}  {:>10}  {:>16}  {}",
+                    "Interval", "Transfer", "Bitrate", "Total Datagrams"
+                ),
+            }
             let _ = std::io::stdout().flush();
             let mut last_bytes: u64 = 0;
             let mut last_sent:  u64 = 0;
@@ -345,15 +351,28 @@ impl Client {
                 let mb   = delta as f64 / 1e6;
                 let mbps = (delta as f64 * 8.0) / 1e6;
                 if delta > 0 {
-                    let loss_pct = if d_sent > 0 { d_lost as f64 / d_sent as f64 * 100.0 } else { 0.0 };
-                    println!(
-                        "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)",
-                        format!("{:.2}-{:.2} s", t_start, t_end),
-                        format!("{:.2} MB", mb),
-                        format!("{:.2} Mbits/sec", mbps),
-                        format!("{:.3} ms", jitter_ms),
-                        d_lost, d_sent, loss_pct,
-                    );
+                    match reporter_mode {
+                        TransferMode::Downlink => {
+                            let loss_pct = if d_sent > 0 { d_lost as f64 / d_sent as f64 * 100.0 } else { 0.0 };
+                            println!(
+                                "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)",
+                                format!("{:.2}-{:.2} s", t_start, t_end),
+                                format!("{:.2} MB", mb),
+                                format!("{:.2} Mbits/sec", mbps),
+                                format!("{:.3} ms", jitter_ms),
+                                d_lost, d_sent, loss_pct,
+                            );
+                        }
+                        TransferMode::Uplink => {
+                            println!(
+                                "  {:<12}  {:>10}  {:>16}  {}",
+                                format!("{:.2}-{:.2} s", t_start, t_end),
+                                format!("{:.2} MB", mb),
+                                format!("{:.2} Mbits/sec", mbps),
+                                d_sent,
+                            );
+                        }
+                    }
                     let _ = std::io::stdout().flush();
                 }
                 if done { break; }
@@ -375,22 +394,12 @@ impl Client {
                 match reporter_mode {
                     TransferMode::Uplink => {
                         let loss_pct = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
-                        // sender row: from sender POV, 0 loss (QUIC handles retransmission transparently)
                         println!(
-                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)  sender",
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.2}%)  sender",
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
                             format!("{:.3} ms", 0.0_f64),
-                            0u64, cur_sent, 0.0_f64,
-                        );
-                        // receiver row: QUIC-reported network losses + jitter measured at receiver
-                        println!(
-                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
-                            format!("0.00-{:.2} s", total_secs),
-                            format!("{:.2} MB", total_mb),
-                            format!("{:.2} Mbits/sec", total_mbps),
-                            format!("{:.3} ms", jitter_ms),
                             cur_lost, cur_sent, loss_pct,
                         );
                     }
