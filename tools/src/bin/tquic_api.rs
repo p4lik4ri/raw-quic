@@ -48,9 +48,11 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Json, Router, middleware};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -157,6 +159,9 @@ pub struct ServerStartRequest {
     /// RoundRobin / MinRTT / Redundant
     pub multipath_algor: Option<String>,
 
+    /// Working directory for the child process (cert/key paths are resolved from here).
+    pub work_dir: Option<String>,
+
     /// Any additional raw CLI flags passed verbatim, e.g. ["--send-batch-size","16"]
     #[serde(default)]
     pub extra_args: Vec<String>,
@@ -190,8 +195,21 @@ pub struct ClientStartRequest {
 
     pub multipath_algor: Option<String>,
 
+    /// Working directory for the child process.
+    pub work_dir: Option<String>,
+
     #[serde(default)]
     pub extra_args: Vec<String>,
+}
+
+/// Log every request and its response status.
+async fn log_request(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri    = req.uri().clone();
+    log::info!("→  {method} {uri}");
+    let resp = next.run(req).await;
+    log::info!("←  {method} {uri}  {}", resp.status());
+    resp
 }
 
 /// Format a float like Python: keep the decimal for non-zero values; show bare `0` for zero.
@@ -262,15 +280,30 @@ async fn spawn_and_capture(
     mut cmd:      Command,
     output_buf:   Arc<Mutex<VecDeque<String>>>,
     result_store: Arc<Mutex<Vec<serde_json::Value>>>,
+    source:       &'static str,
 ) -> std::io::Result<Child> {
     use std::process::Stdio;
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    // Show the exact command about to be run.
+    {
+        let std_cmd = cmd.as_std();
+        let args: Vec<_> = std_cmd.get_args().collect();
+        log::info!("[{source}] run: {:?} {}",
+            std_cmd.get_program(),
+            args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "),
+        );
+        if let Some(cwd) = std_cmd.get_current_dir() {
+            log::info!("[{source}] cwd: {}", cwd.display());
+        }
+    }
+
     // Clear results from the previous run.
     result_store.lock().await.clear();
 
     let mut child = cmd.spawn()?;
+    log::info!("[{source}] started pid={:?}", child.id());
 
     // stdout → accumulate per-second samples + buffer
     if let Some(stdout) = child.stdout.take() {
@@ -279,22 +312,27 @@ async fn spawn_and_capture(
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                log::debug!("[{source}] stdout: {line}");
                 if let Some(sample) = parse_interval_line(&line) {
+                    log::info!("[{source}] sample: throughput={} jitter={} loss={}",
+                        sample["throughput"], sample["jitter"], sample["packetLoss"]);
                     res.lock().await.push(sample);
                 }
                 let mut lock = buf.lock().await;
                 if lock.len() >= OUTPUT_CAP { lock.pop_front(); }
                 lock.push_back(line);
             }
+            log::info!("[{source}] stdout stream ended");
         });
     }
 
-    // stderr → buffer only
+    // stderr → INFO so errors from child are always visible
     if let Some(stderr) = child.stderr.take() {
         let buf = Arc::clone(&output_buf);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                log::info!("[{source}] stderr: {line}");
                 let mut lock = buf.lock().await;
                 if lock.len() >= OUTPUT_CAP { lock.pop_front(); }
                 lock.push_back(line);
@@ -320,6 +358,7 @@ async fn server_start(
 
     let bin = state.bin_dir.join("tquic_server");
     let mut cmd = Command::new(&bin);
+    if let Some(dir) = &req.work_dir { cmd.current_dir(dir); }
     cmd.args(["-c", &req.cert, "-k", &req.key]);
     cmd.args(["--listen", &req.listen]);
     cmd.args(["--congestion-control-algor", &req.congestion_control]);
@@ -333,7 +372,7 @@ async fn server_start(
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
-    match spawn_and_capture(cmd, Arc::clone(&proc.output), Arc::clone(&state.last_server)).await {
+    match spawn_and_capture(cmd, Arc::clone(&proc.output), Arc::clone(&state.last_server), "server").await {
         Ok(child) => {
             let pid = child.id();
             proc.child = Some(child);
@@ -376,6 +415,7 @@ async fn client_start(
 
     let bin = state.bin_dir.join("tquic_client");
     let mut cmd = Command::new(&bin);
+    if let Some(dir) = &req.work_dir { cmd.current_dir(dir); }
     cmd.args(["--connect-to", &req.connect_to]);
     cmd.args(["--congestion-control-algor", &req.congestion_control]);
     cmd.args(["--log-level", &req.log_level]);
@@ -395,7 +435,7 @@ async fn client_start(
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
-    match spawn_and_capture(cmd, Arc::clone(&proc.output), Arc::clone(&state.last_client)).await {
+    match spawn_and_capture(cmd, Arc::clone(&proc.output), Arc::clone(&state.last_client), "client").await {
         Ok(child) => {
             let pid = child.id();
             proc.child = Some(child);
@@ -470,7 +510,7 @@ async fn server_last_json_result(
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Resolve binary directory: same dir as this exe, or TQUIC_BIN_DIR override.
     let bin_dir: PathBuf = env::var("TQUIC_BIN_DIR")
@@ -505,11 +545,12 @@ async fn main() {
         .route("/status",                 get(overall_status))
         .route("/LastJsonResult",          get(last_json_result))
         .route("/server/LastJsonResult",   get(server_last_json_result))
+        .layer(middleware::from_fn(log_request))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
-    eprintln!("tquic_api  listening on  http://{addr}");
-    eprintln!("           binaries from {}", bin_dir.display());
+    log::info!("tquic_api  listening on  http://{addr}");
+    log::info!("           binaries from {}", bin_dir.display());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
