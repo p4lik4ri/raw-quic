@@ -23,6 +23,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::create_dir_all;
+use std::io::Write;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
@@ -315,10 +316,12 @@ impl Client {
             };
             println!();
             println!("[ rawquic ] Interval report ({direction})");
+            let _ = std::io::stdout().flush();
             println!(
                 "  {:<12}  {:>10}  {:>16}  {}",
                 "Interval", "Transfer", "Bitrate", "Total Datagrams"
             );
+            let _ = std::io::stdout().flush();
             let mut last_bytes: u64 = 0;
             let mut last_sent:  u64 = 0;
             let mut interval:   u64 = 0;
@@ -344,6 +347,7 @@ impl Client {
                         format!("{:.2} Mbits/sec", mbps),
                         d_sent,
                     );
+                    let _ = std::io::stdout().flush();
                 }
                 if done { break; }
             }
@@ -376,6 +380,7 @@ impl Client {
                     format!("{:.3} ms", show_jitter),
                     cur_lost, cur_sent, loss_pct, role,
                 );
+                let _ = std::io::stdout().flush();
             }
         });
 

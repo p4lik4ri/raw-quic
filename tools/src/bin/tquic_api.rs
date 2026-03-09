@@ -14,7 +14,9 @@
 //!  POST /client/stop    — kill running tquic_client
 //!  GET  /client/status  — pid, running flag, last 1000 log lines
 //!
-//!  GET  /status         — both server + client status
+//!  GET  /status                    — both server + client status
+//!  GET  /LastJsonResult             — last parsed samples (JSON) for server + client
+//!  GET  /server/LastJsonResult      — last server samples, plain-text Python-style
 //!
 //! Example payloads
 //! ─────────────────────────────────────────────────────────────────────────────
@@ -125,9 +127,11 @@ impl ProcessState {
 }
 
 struct AppState {
-    server:  Mutex<ProcessState>,
-    client:  Mutex<ProcessState>,
-    bin_dir: PathBuf,
+    server:      Mutex<ProcessState>,
+    client:      Mutex<ProcessState>,
+    bin_dir:     PathBuf,
+    last_server: Arc<Mutex<Vec<serde_json::Value>>>,
+    last_client: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 // ─────────────────────────────── request payloads ─────────────────────────────
@@ -190,6 +194,16 @@ pub struct ClientStartRequest {
     pub extra_args: Vec<String>,
 }
 
+/// Format a float like Python: keep the decimal for non-zero values; show bare `0` for zero.
+fn fmt_float(v: f64) -> String {
+    if v == 0.0 {
+        "0".to_string()
+    } else {
+        // Rust {:?} gives minimal round-trip digits and always includes the '.' for floats
+        format!("{v:?}")
+    }
+}
+
 fn default_listen() -> String { "0.0.0.0:4433".into() }
 fn default_cc()     -> String { "cubic".into() }
 fn default_log()    -> String { "info".into() }
@@ -197,34 +211,85 @@ fn default_mode()   -> String { "downlink".into() }
 
 // ──────────────────────────────────── helpers ─────────────────────────────────
 
+/// Parse a per-second interval row into a `{timestamp, throughput, jitter, packetLoss}` sample.
+///
+/// Client row (7 tokens):  `0.00-1.00 s  18.90 MB  151.20 Mbits/sec  12345`
+/// Server row (10 tokens): `0.00-1.00 s  18.90 MB  151.20 Mbits/sec  0.000 ms  0/12345 (0%)`
+/// Summary rows (end with "sender"/"receiver") are rejected.
+fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
+    let trimmed = line.trim();
+    // Reject separator / header / summary lines
+    if trimmed.starts_with('-') || trimmed.starts_with('[') { return None; }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() < 7 { return None; }
+    // Structural guards: must look like "N.NN-N.NN s ... MB ... Mbits/sec ..."
+    if parts[1] != "s" || parts[3] != "MB" || parts[5] != "Mbits/sec" { return None; }
+    if !parts[0].contains('-') { return None; }
+    // Reject summary lines (last token is role)
+    let last = *parts.last().unwrap();
+    if last == "sender" || last == "receiver" { return None; }
+
+    let bitrate_mbps: f64 = parts[4].parse().ok()?;
+
+    let (jitter_ms, loss_pct) = if parts.len() >= 10 && parts[7] == "ms" {
+        // Server interval row: jitter at [6], lost/total at [8], (pct%) at [9]
+        let jitter: f64 = parts[6].parse().ok()?;
+        let pct_s = parts[9].trim_matches(|c: char| c == '(' || c == ')' || c == '%');
+        let pct: f64 = pct_s.parse().unwrap_or(0.0);
+        (jitter, pct)
+    } else {
+        // Client interval row: no jitter / loss data
+        (0.0_f64, 0.0_f64)
+    };
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    Some(serde_json::json!({
+        "timestamp":   ts,
+        "throughput":  bitrate_mbps,
+        "jitter":      jitter_ms,
+        "packetLoss":  loss_pct,
+    }))
+}
+
 /// Spawn `cmd`, pipe both stdout and stderr into `output_buf` (background tasks).
+/// Each per-second interval row is parsed and appended to `result_store`;
+/// the store is cleared on each new invocation so it always holds the latest run.
 async fn spawn_and_capture(
-    mut cmd:    Command,
-    output_buf: Arc<Mutex<VecDeque<String>>>,
+    mut cmd:      Command,
+    output_buf:   Arc<Mutex<VecDeque<String>>>,
+    result_store: Arc<Mutex<Vec<serde_json::Value>>>,
 ) -> std::io::Result<Child> {
     use std::process::Stdio;
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    // Clear results from the previous run.
+    result_store.lock().await.clear();
+
     let mut child = cmd.spawn()?;
 
-    let drain = |stream: Option<tokio::process::ChildStdout>, buf: Arc<Mutex<VecDeque<String>>>| {
-        if let Some(s) = stream {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(s).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let mut lock = buf.lock().await;
-                    if lock.len() >= OUTPUT_CAP { lock.pop_front(); }
-                    lock.push_back(line);
+    // stdout → accumulate per-second samples + buffer
+    if let Some(stdout) = child.stdout.take() {
+        let buf = Arc::clone(&output_buf);
+        let res = Arc::clone(&result_store);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(sample) = parse_interval_line(&line) {
+                    res.lock().await.push(sample);
                 }
-            });
-        }
-    };
+                let mut lock = buf.lock().await;
+                if lock.len() >= OUTPUT_CAP { lock.pop_front(); }
+                lock.push_back(line);
+            }
+        });
+    }
 
-    // stdout
-    drain(child.stdout.take(), Arc::clone(&output_buf));
-
-    // stderr — tokio uses a different type for ChildStderr; handle separately
+    // stderr → buffer only
     if let Some(stderr) = child.stderr.take() {
         let buf = Arc::clone(&output_buf);
         tokio::spawn(async move {
@@ -268,7 +333,7 @@ async fn server_start(
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
-    match spawn_and_capture(cmd, Arc::clone(&proc.output)).await {
+    match spawn_and_capture(cmd, Arc::clone(&proc.output), Arc::clone(&state.last_server)).await {
         Ok(child) => {
             let pid = child.id();
             proc.child = Some(child);
@@ -330,7 +395,7 @@ async fn client_start(
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
-    match spawn_and_capture(cmd, Arc::clone(&proc.output)).await {
+    match spawn_and_capture(cmd, Arc::clone(&proc.output), Arc::clone(&state.last_client)).await {
         Ok(child) => {
             let pid = child.id();
             proc.child = Some(child);
@@ -374,6 +439,33 @@ async fn overall_status(
     Json(OverallStatus { server, client })
 }
 
+async fn last_json_result(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let server = state.last_server.lock().await.clone();
+    let client = state.last_client.lock().await.clone();
+    Json(serde_json::json!({ "server": server, "client": client }))
+}
+
+async fn server_last_json_result(
+    State(state): State<Arc<AppState>>,
+) -> String {
+    let samples = state.last_server.lock().await.clone();
+    let items: Vec<String> = samples.iter().map(|s| {
+        let ts         = s["timestamp"].as_f64().unwrap_or(0.0);
+        let throughput = s["throughput"].as_f64().unwrap_or(0.0);
+        let jitter     = s["jitter"].as_f64().unwrap_or(0.0);
+        let loss       = s["packetLoss"].as_f64().unwrap_or(0.0);
+        format!(
+            "{{'timestamp': {ts:.6}, 'throughput': {}, 'jitter': {}, 'packetLoss': {}}}",
+            fmt_float(throughput),
+            fmt_float(jitter),
+            fmt_float(loss),
+        )
+    }).collect();
+    format!("Last Json Result: [{}]", items.join(", "))
+}
+
 // ──────────────────────────────────── main ────────────────────────────────────
 
 #[tokio::main]
@@ -396,9 +488,11 @@ async fn main() {
         .unwrap_or(8000);
 
     let state = Arc::new(AppState {
-        server:  Mutex::new(ProcessState::new()),
-        client:  Mutex::new(ProcessState::new()),
-        bin_dir: bin_dir.clone(),
+        server:      Mutex::new(ProcessState::new()),
+        client:      Mutex::new(ProcessState::new()),
+        bin_dir:     bin_dir.clone(),
+        last_server: Arc::new(Mutex::new(Vec::new())),
+        last_client: Arc::new(Mutex::new(Vec::new())),
     });
 
     let app = Router::new()
@@ -408,7 +502,9 @@ async fn main() {
         .route("/client/start",  post(client_start))
         .route("/client/stop",   post(client_stop))
         .route("/client/status", get(client_status))
-        .route("/status",        get(overall_status))
+        .route("/status",                 get(overall_status))
+        .route("/LastJsonResult",          get(last_json_result))
+        .route("/server/LastJsonResult",   get(server_last_json_result))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");

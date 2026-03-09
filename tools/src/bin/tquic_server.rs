@@ -24,6 +24,7 @@ use std::fs::create_dir_all;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::io::Write;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -820,10 +821,12 @@ fn main() -> Result<()> {
             // ── Per-session header ────────────────────────────────────────────
             println!();
             println!("[ rawquic ] Server interval report");
+            let _ = std::io::stdout().flush();
             println!(
                 "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
                 "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
             );
+            let _ = std::io::stdout().flush();
             let mut last_bytes: u64 = 0;
             let mut last_lost:  u64 = 0;
             let mut last_sent:  u64 = 0;
@@ -855,6 +858,7 @@ fn main() -> Result<()> {
                     format!("{:.3} ms", jitter_ms),
                     d_lost, d_sent, loss_pct,
                 );
+                let _ = std::io::stdout().flush();
                 if rt.load(Ordering::Relaxed) { break 'session; }
                 if done { break; }
             }
