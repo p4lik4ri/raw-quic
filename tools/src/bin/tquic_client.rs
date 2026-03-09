@@ -279,8 +279,10 @@ struct Client {
     live_jitter: Arc<AtomicU64>,
     /// Server-measured jitter received in the uplink stats reply (f64 bits).
     server_jitter: Arc<AtomicU64>,
-    /// Server-measured lost packet count received in the uplink stats reply.
+    /// Server-measured lost packet count (uplink reply / downlink trailer).
     server_lost: Arc<AtomicU64>,
+    /// Server-measured total sent packet count received in the downlink trailer.
+    server_sent: Arc<AtomicU64>,
     /// Set when test duration has expired; signals workers to FIN uplink streams.
     duration_expired: Arc<AtomicBool>,
     /// Set by main thread to stop the reporter thread.
@@ -303,6 +305,7 @@ impl Client {
             live_jitter:  Arc::new(AtomicU64::new(0)),
             server_jitter: Arc::new(AtomicU64::new(0)),
             server_lost:   Arc::new(AtomicU64::new(0)),
+            server_sent:   Arc::new(AtomicU64::new(0)),
             duration_expired: Arc::new(AtomicBool::new(false)),
             reporting_done: Arc::new(AtomicBool::new(false)),
         })
@@ -318,6 +321,7 @@ impl Client {
         let reporter_jitter  = Arc::clone(&self.live_jitter);
         let reporter_srv_jitter = Arc::clone(&self.server_jitter);
         let reporter_srv_lost   = Arc::clone(&self.server_lost);
+        let reporter_srv_sent   = Arc::clone(&self.server_sent);
         let reporter_done    = Arc::clone(&self.reporting_done);
         let reporter_mode    = self.option.mode;
         let reporter_handle = thread::spawn(move || {
@@ -427,8 +431,12 @@ impl Client {
                         );
                     }
                     TransferMode::Downlink => {
-                        // Sender row: estimate total sent = received + lost (QUIC-level)
-                        let sender_total  = cur_sent + cur_lost;
+                        // Sender row: use server-reported retrans + total sent from trailer.
+                        let srv_lost  = reporter_srv_lost.load(Ordering::Relaxed);
+                        let srv_total = reporter_srv_sent.load(Ordering::Relaxed);
+                        let sender_total = if srv_total > 0 { srv_total } else { cur_sent + cur_lost };
+                        let sender_lost  = srv_lost;
+                        let sender_loss_pct = if sender_total > 0 { sender_lost as f64 / sender_total as f64 * 100.0 } else { 0.0 };
                         let recv_loss_pct = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
                         println!(
                             "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)  sender",
@@ -436,7 +444,7 @@ impl Client {
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
                             format!("{:.3} ms", 0.0_f64),
-                            0u64, sender_total, 0.0_f64,
+                            sender_lost, sender_total, sender_loss_pct,
                         );
                         println!(
                             "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
@@ -464,9 +472,10 @@ impl Client {
             let jitter = Arc::clone(&self.live_jitter);
             let srv_jitter = Arc::clone(&self.server_jitter);
             let srv_lost   = Arc::clone(&self.server_lost);
+            let srv_sent   = Arc::clone(&self.server_sent);
             let dur_exp    = Arc::clone(&self.duration_expired);
             handles.push(thread::spawn(move || {
-                Worker::new(opt, ctx, term, live, lost, sent, jitter, srv_jitter, srv_lost, dur_exp).unwrap().start().unwrap();
+                Worker::new(opt, ctx, term, live, lost, sent, jitter, srv_jitter, srv_lost, srv_sent, dur_exp).unwrap().start().unwrap();
             }));
         }
         for h in handles { h.join().unwrap(); }
@@ -577,6 +586,10 @@ struct DataReceiver {
     last_recv_time: Option<Instant>,
     /// Accumulator for the 16-byte server stats reply on uplink streams.
     server_reply_buf: Vec<u8>,
+    /// Rolling tail buffer for the 16-byte downlink stats trailer.
+    /// Holds up to the last 16 bytes received; populated only in downlink mode.
+    downlink_trailer: [u8; 16],
+    downlink_trailer_len: usize,
 }
 
 impl DataReceiver {
@@ -590,6 +603,8 @@ impl DataReceiver {
             jitter_ms: 0.0,
             last_recv_time: None,
             server_reply_buf: Vec::new(),
+            downlink_trailer: [0u8; 16],
+            downlink_trailer_len: 0,
         }
     }
 }
@@ -614,6 +629,7 @@ struct Worker {
     #[allow(dead_code)] live_jitter: Arc<AtomicU64>,
     #[allow(dead_code)] server_jitter: Arc<AtomicU64>,
     #[allow(dead_code)] server_lost:   Arc<AtomicU64>,
+    #[allow(dead_code)] server_sent:   Arc<AtomicU64>,
     /// Set when duration expires; tells WorkerHandler to FIN uplink streams.
     duration_expired: Arc<AtomicBool>,
     /// Deadline after which we close even if no server reply was received.
@@ -631,6 +647,7 @@ impl Worker {
         live_jitter: Arc<AtomicU64>,
         server_jitter: Arc<AtomicU64>,
         server_lost:   Arc<AtomicU64>,
+        server_sent:   Arc<AtomicU64>,
         duration_expired: Arc<AtomicBool>,
     ) -> Result<Self> {
         let mut config = Config::new()?;
@@ -697,6 +714,7 @@ impl Worker {
             live_jitter.clone(),
             server_jitter.clone(),
             server_lost.clone(),
+            server_sent.clone(),
             duration_expired.clone(),
         );
 
@@ -719,6 +737,7 @@ impl Worker {
             live_jitter,
             server_jitter,
             server_lost,
+            server_sent,
             duration_expired,
             fin_deadline: None,
         })
@@ -906,6 +925,8 @@ struct WorkerHandler {
     /// Server-measured stats received via the uplink reply channel.
     server_jitter: Arc<AtomicU64>,
     server_lost:   Arc<AtomicU64>,
+    /// Server total-sent count from the downlink stats trailer.
+    server_sent:   Arc<AtomicU64>,
     /// Signals that the test duration has expired; uplink streams should send FIN.
     duration_expired: Arc<AtomicBool>,
 }
@@ -922,6 +943,7 @@ impl WorkerHandler {
         live_jitter: Arc<AtomicU64>,
         server_jitter: Arc<AtomicU64>,
         server_lost:   Arc<AtomicU64>,
+        server_sent:   Arc<AtomicU64>,
         duration_expired: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -938,6 +960,7 @@ impl WorkerHandler {
             live_jitter,
             server_jitter,
             server_lost,
+            server_sent,
             duration_expired,
         }
     }
@@ -1124,13 +1147,37 @@ impl TransportHandler for WorkerHandler {
                     }
                     let n = n; let fin = _fin;
                     // Downlink bulk receive path.
-                    self.live_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                    // Update live stats for the interval reporter.
-                    // recv_count = datagrams received from server (meaningful for downlink receiver stats).
-                    let stats = conn.stats();
-                    self.live_lost.store(stats.lost_count, Ordering::Relaxed);
-                    self.live_sent.store(stats.recv_count, Ordering::Relaxed);
+                    // Keep a rolling 16-byte tail so we can detect the stats trailer on FIN.
                     if let Some(recv) = self.receivers.borrow_mut().get_mut(&idx) {
+                        // Update the 16-byte tail window.
+                        let chunk = &self.recv_buf[..n];
+                        if n >= 16 {
+                            recv.downlink_trailer.copy_from_slice(&chunk[n - 16..]);
+                            recv.downlink_trailer_len = 16;
+                        } else {
+                            // Shift existing tail left and append new bytes.
+                            let existing = recv.downlink_trailer_len;
+                            let total = existing + n;
+                            if total >= 16 {
+                                let keep = 16 - n;
+                                recv.downlink_trailer.copy_within(existing - keep..existing, 0);
+                                recv.downlink_trailer[keep..16].copy_from_slice(chunk);
+                                recv.downlink_trailer_len = 16;
+                            } else {
+                                recv.downlink_trailer[existing..existing + n].copy_from_slice(chunk);
+                                recv.downlink_trailer_len = total;
+                            }
+                        }
+                        // If FIN arrived, the last 16 bytes are the stats trailer — decode and strip.
+                        if fin && recv.downlink_trailer_len == 16 {
+                            let lc = u64::from_le_bytes(recv.downlink_trailer[0..8].try_into().unwrap());
+                            let sc = u64::from_le_bytes(recv.downlink_trailer[8..16].try_into().unwrap());
+                            self.server_lost.store(lc, Ordering::Relaxed);
+                            self.server_sent.store(sc, Ordering::Relaxed);
+                            // Subtract the 16-byte trailer from the transfer count.
+                            recv.bytes_received = recv.bytes_received.saturating_sub(16);
+                            self.live_bytes.fetch_sub(16u64.min(self.live_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+                        }
                         recv.bytes_received += n as u64;
                         // RFC 3550 §A.8 interarrival jitter.
                         if let Some(last) = recv.last_recv_time {
@@ -1141,6 +1188,12 @@ impl TransportHandler for WorkerHandler {
                         // Publish current jitter as f64 bits.
                         self.live_jitter.store(recv.jitter_ms.to_bits(), Ordering::Relaxed);
                     }
+                    // Count bytes toward transfer (subtract trailer on FIN handled above).
+                    self.live_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    // Update live stats for the interval reporter.
+                    let stats = conn.stats();
+                    self.live_lost.store(stats.lost_count, Ordering::Relaxed);
+                    self.live_sent.store(stats.recv_count, Ordering::Relaxed);
                     debug!("{} stream {} +{} B fin={}", conn.trace_id(), stream_id, n, fin);
                 }
                 Err(e) => {

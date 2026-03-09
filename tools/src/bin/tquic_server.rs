@@ -220,6 +220,8 @@ struct StreamSendState {
     last_refill: Instant,
     /// True once we have written the 16-byte stats reply back to the client.
     reply_sent: bool,
+    /// True once we have written the 16-byte downlink stats trailer (lost+sent) + FIN.
+    trailer_sent: bool,
 }
 
 // ─────────────────────────── Per-connection handler ──────────────────────────
@@ -256,6 +258,7 @@ impl ConnectionHandler {
                 tokens: 0.0,
                 last_refill: Instant::now(),
                 reply_sent: false,
+                trailer_sent: false,
             },
         );
     }
@@ -312,7 +315,11 @@ impl ConnectionHandler {
 
     /// Push as many bytes as possible; applies token-bucket rate limiting when
     /// `bandwidth_limit > 0`.  Registers `stream_want_write` on backpressure.
-    fn pump(&mut self, conn: &mut Connection, stream_id: u64, buf: &[u8]) {
+    /// When the transfer is complete, appends a 16-byte stats trailer
+    /// `[lost_count: u64 LE][sent_count: u64 LE]` followed by FIN so the client
+    /// can display the server's retransmission count on the sender row.
+    fn pump(&mut self, conn: &mut Connection, stream_id: u64, buf: &[u8],
+            lost_count: u64, sent_count: u64) {
         let state = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => return,
@@ -343,9 +350,16 @@ impl ConnectionHandler {
             let to_send = if self.send_size > 0 {
                 let remaining = self.send_size.saturating_sub(state.bytes_sent);
                 if remaining == 0 {
-                    match conn.stream_write(stream_id, Bytes::new(), true) {
-                        Ok(_) | Err(Error::Done) => {}
-                        Err(e) => error!("{} stream FIN: {:?}", conn.trace_id(), e),
+                    // All data sent — write the 16-byte stats trailer + FIN once.
+                    if !state.trailer_sent {
+                        state.trailer_sent = true;
+                        let mut trailer = [0u8; 16];
+                        trailer[0..8].copy_from_slice(&lost_count.to_le_bytes());
+                        trailer[8..16].copy_from_slice(&sent_count.to_le_bytes());
+                        match conn.stream_write(stream_id, Bytes::copy_from_slice(&trailer), true) {
+                            Ok(_) | Err(Error::Done) => {}
+                            Err(e) => error!("{} stream trailer: {:?}", conn.trace_id(), e),
+                        }
                     }
                     state.finished = true;
                     return;
@@ -362,21 +376,16 @@ impl ConnectionHandler {
                 to_send
             };
 
-            let fin = self.send_size > 0 && (state.bytes_sent + to_send >= self.send_size);
-
+            // Never include FIN with data — trailer is sent separately.
             match conn.stream_write(
                 stream_id,
                 Bytes::copy_from_slice(&buf[..to_send]),
-                fin,
+                false,
             ) {
                 Ok(written) => {
                     state.bytes_sent += written;
                     if state.bandwidth_limit > 0 {
                         state.tokens -= written as f64;
-                    }
-                    if fin && written == to_send {
-                        state.finished = true;
-                        return;
                     }
                     if written < to_send {
                         _ = conn.stream_want_write(stream_id, true);
@@ -587,8 +596,10 @@ impl TransportHandler for ServerHandler {
             match mode {
                 TransferMode::Downlink => {
                     let send_buf = self.send_buf.clone();
+                    let lc = self.live_lost.load(Ordering::Relaxed);
+                    let sc = self.live_sent.load(Ordering::Relaxed);
                     if let Some(handler) = self.conns.get_mut(&idx) {
-                        handler.pump(conn, stream_id, &send_buf);
+                        handler.pump(conn, stream_id, &send_buf, lc, sc);
                     }
                 }
                 TransferMode::Uplink => {
@@ -647,7 +658,9 @@ impl TransportHandler for ServerHandler {
         }
         let send_buf = self.send_buf.clone();
         if let Some(handler) = self.conns.get_mut(&idx) {
-            handler.pump(conn, stream_id, &send_buf);
+            let lc = self.live_lost.load(Ordering::Relaxed);
+            let sc = self.live_sent.load(Ordering::Relaxed);
+            handler.pump(conn, stream_id, &send_buf, lc, sc);
             // Update live downlink stats for the interval reporter.
             let stats = conn.stats();
             let delta = stats.sent_bytes.saturating_sub(handler.prev_bytes_sent);
