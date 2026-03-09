@@ -112,9 +112,10 @@ pub async fn spawn_and_capture(
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                log::debug!("[{source}] stdout: {line}");
+                log::info!("[{source}] stdout: {line}");
                 if let Some(ref store) = res {
                     if let Some(sample) = parse_interval_line(&line) {
+                        log::debug!("[{source}] parsed sample: {sample}");
                         store.lock().await.push(sample);
                     }
                 }
