@@ -218,6 +218,8 @@ struct StreamSendState {
     tokens: f64,
     /// When the token bucket was last refilled.
     last_refill: Instant,
+    /// True once we have written the 16-byte stats reply back to the client.
+    reply_sent: bool,
 }
 
 // ─────────────────────────── Per-connection handler ──────────────────────────
@@ -253,6 +255,7 @@ impl ConnectionHandler {
                 bandwidth_limit: 0,
                 tokens: 0.0,
                 last_refill: Instant::now(),
+                reply_sent: false,
             },
         );
     }
@@ -393,22 +396,39 @@ impl ConnectionHandler {
     }
 
     /// Drain incoming data on an uplink stream (client → server). Data is discarded.
-    fn drain_uplink(&mut self, conn: &mut Connection, stream_id: u64) {
-        let should_drain = self.streams.get(&stream_id)
-            .map(|s| s.ready && s.mode == TransferMode::Uplink)
-            .unwrap_or(false);
-        if !should_drain {
-            return;
-        }
+    /// When the client's FIN arrives, writes a 16-byte stats reply
+    /// [jitter_ms_f64_bits: u64 LE][lost_count: u64 LE] back with FIN.
+    fn drain_uplink(
+        &mut self,
+        conn: &mut Connection,
+        stream_id: u64,
+        jitter_bits: u64,
+        lost_count: u64,
+    ) {
+        let state = match self.streams.get_mut(&stream_id) {
+            Some(s) if s.ready && s.mode == TransferMode::Uplink => s,
+            _ => return,
+        };
         let mut tmp = [0u8; 65536];
+        let mut got_fin = false;
         loop {
             match conn.stream_read(stream_id, &mut tmp) {
                 Ok((0, _)) | Err(Error::Done) => break,
-                Ok(_) => {}
+                Ok((_, fin)) => { if fin { got_fin = true; } }
                 Err(e) => {
                     error!("{} uplink drain {}: {:?}", conn.trace_id(), stream_id, e);
                     break;
                 }
+            }
+        }
+        if got_fin && !state.reply_sent {
+            state.reply_sent = true;
+            let mut reply = [0u8; 16];
+            reply[0..8].copy_from_slice(&jitter_bits.to_le_bytes());
+            reply[8..16].copy_from_slice(&lost_count.to_le_bytes());
+            match conn.stream_write(stream_id, Bytes::copy_from_slice(&reply), true) {
+                Ok(_) => {}
+                Err(e) => error!("{} uplink reply write {}: {:?}", conn.trace_id(), stream_id, e),
             }
         }
     }
@@ -573,14 +593,18 @@ impl TransportHandler for ServerHandler {
                 }
                 TransferMode::Uplink => {
                     self.is_uplink.store(true, Ordering::Relaxed);
+                    let jb = self.live_jitter.load(Ordering::Relaxed);
+                    let lc = self.live_lost.load(Ordering::Relaxed);
                     if let Some(handler) = self.conns.get_mut(&idx) {
-                        handler.drain_uplink(conn, stream_id);
+                        handler.drain_uplink(conn, stream_id, jb, lc);
                     }
                 }
             }
         } else {
+            let jb = self.live_jitter.load(Ordering::Relaxed);
+            let lc = self.live_lost.load(Ordering::Relaxed);
             if let Some(handler) = self.conns.get_mut(&idx) {
-                handler.drain_uplink(conn, stream_id);
+                handler.drain_uplink(conn, stream_id, jb, lc);
             }
         }
         // Update live uplink stats for the interval reporter.
@@ -822,10 +846,18 @@ fn main() -> Result<()> {
             println!();
             println!("[ rawquic ] Server interval report");
             let _ = std::io::stdout().flush();
-            println!(
-                "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
-                "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
-            );
+            let session_uplink = ru.load(Ordering::Relaxed);
+            if session_uplink {
+                println!(
+                    "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
+                    "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
+                );
+            } else {
+                println!(
+                    "  {:<12}  {:>10}  {:>16}  {}",
+                    "Interval", "Transfer", "Bitrate", "Total Datagrams"
+                );
+            }
             let _ = std::io::stdout().flush();
             let mut last_bytes: u64 = 0;
             let mut last_lost:  u64 = 0;
@@ -849,15 +881,25 @@ fn main() -> Result<()> {
                 interval    += 1;
                 let mb       = delta as f64 / 1e6;
                 let mbps     = (delta as f64 * 8.0) / 1e6;
-                let loss_pct = if d_sent > 0 { d_lost as f64 / d_sent as f64 * 100.0 } else { 0.0 };
-                println!(
-                    "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)",
-                    format!("{:.2}-{:.2} s", t_start, t_end),
-                    format!("{:.2} MB", mb),
-                    format!("{:.2} Mbits/sec", mbps),
-                    format!("{:.3} ms", jitter_ms),
-                    d_lost, d_sent, loss_pct,
-                );
+                if session_uplink {
+                    let loss_pct = if d_sent > 0 { d_lost as f64 / d_sent as f64 * 100.0 } else { 0.0 };
+                    println!(
+                        "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)",
+                        format!("{:.2}-{:.2} s", t_start, t_end),
+                        format!("{:.2} MB", mb),
+                        format!("{:.2} Mbits/sec", mbps),
+                        format!("{:.3} ms", jitter_ms),
+                        d_lost, d_sent, loss_pct,
+                    );
+                } else {
+                    println!(
+                        "  {:<12}  {:>10}  {:>16}  {}",
+                        format!("{:.2}-{:.2} s", t_start, t_end),
+                        format!("{:.2} MB", mb),
+                        format!("{:.2} Mbits/sec", mbps),
+                        d_sent,
+                    );
+                }
                 let _ = std::io::stdout().flush();
                 if rt.load(Ordering::Relaxed) { break 'session; }
                 if done { break; }

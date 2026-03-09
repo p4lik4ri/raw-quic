@@ -277,6 +277,10 @@ struct Client {
     live_sent: Arc<AtomicU64>,
     /// Current jitter stored as f64 bits.
     live_jitter: Arc<AtomicU64>,
+    /// Server-measured jitter received in the uplink stats reply (f64 bits).
+    server_jitter: Arc<AtomicU64>,
+    /// Server-measured lost packet count received in the uplink stats reply.
+    server_lost: Arc<AtomicU64>,
     /// Set by main thread to stop the reporter thread.
     reporting_done: Arc<AtomicBool>,
 }
@@ -295,6 +299,8 @@ impl Client {
             live_lost:    Arc::new(AtomicU64::new(0)),
             live_sent:    Arc::new(AtomicU64::new(0)),
             live_jitter:  Arc::new(AtomicU64::new(0)),
+            server_jitter: Arc::new(AtomicU64::new(0)),
+            server_lost:   Arc::new(AtomicU64::new(0)),
             reporting_done: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -307,6 +313,8 @@ impl Client {
         let reporter_lost    = Arc::clone(&self.live_lost);
         let reporter_sent    = Arc::clone(&self.live_sent);
         let reporter_jitter  = Arc::clone(&self.live_jitter);
+        let reporter_srv_jitter = Arc::clone(&self.server_jitter);
+        let reporter_srv_lost   = Arc::clone(&self.server_lost);
         let reporter_done    = Arc::clone(&self.reporting_done);
         let reporter_mode    = self.option.mode;
         let reporter_handle = thread::spawn(move || {
@@ -383,7 +391,7 @@ impl Client {
             let cur_sent  = reporter_sent.load(Ordering::Relaxed);
             let jitter_ms = f64::from_bits(reporter_jitter.load(Ordering::Relaxed));
             if current > 0 {
-                let total_secs = interval.max(1) as f64;
+                let total_secs = interval.saturating_sub(1).max(1) as f64;
                 let total_mb   = current as f64 / 1e6;
                 let total_mbps = (current as f64 * 8.0) / 1e6 / total_secs;
                 println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
@@ -393,14 +401,26 @@ impl Client {
                 );
                 match reporter_mode {
                     TransferMode::Uplink => {
-                        let loss_pct = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
+                        let srv_jitter_ms = f64::from_bits(reporter_srv_jitter.load(Ordering::Relaxed));
+                        let srv_lost      = reporter_srv_lost.load(Ordering::Relaxed);
+                        let loss_pct = if cur_sent > 0 { srv_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
+                        // Sender row: from the sender's perspective, 0 loss.
                         println!(
-                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.2}%)  sender",
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)  sender",
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
                             format!("{:.3} ms", 0.0_f64),
-                            cur_lost, cur_sent, loss_pct,
+                            0u64, cur_sent, 0.0_f64,
+                        );
+                        // Receiver row: server-measured jitter and loss.
+                        println!(
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
+                            format!("0.00-{:.2} s", total_secs),
+                            format!("{:.2} MB", total_mb),
+                            format!("{:.2} Mbits/sec", total_mbps),
+                            format!("{:.3} ms", srv_jitter_ms),
+                            srv_lost, cur_sent, loss_pct,
                         );
                     }
                     TransferMode::Downlink => {
@@ -439,8 +459,10 @@ impl Client {
             let lost   = Arc::clone(&self.live_lost);
             let sent   = Arc::clone(&self.live_sent);
             let jitter = Arc::clone(&self.live_jitter);
+            let srv_jitter = Arc::clone(&self.server_jitter);
+            let srv_lost   = Arc::clone(&self.server_lost);
             handles.push(thread::spawn(move || {
-                Worker::new(opt, ctx, term, live, lost, sent, jitter).unwrap().start().unwrap();
+                Worker::new(opt, ctx, term, live, lost, sent, jitter, srv_jitter, srv_lost).unwrap().start().unwrap();
             }));
         }
         for h in handles { h.join().unwrap(); }
@@ -548,6 +570,8 @@ struct DataReceiver {
     jitter_ms: f64,
     /// Timestamp of the last readable event, used for jitter calculation.
     last_recv_time: Option<Instant>,
+    /// Accumulator for the 16-byte server stats reply on uplink streams.
+    server_reply_buf: Vec<u8>,
 }
 
 impl DataReceiver {
@@ -560,6 +584,7 @@ impl DataReceiver {
             uplink: HashMap::new(),
             jitter_ms: 0.0,
             last_recv_time: None,
+            server_reply_buf: Vec::new(),
         }
     }
 }
@@ -582,6 +607,8 @@ struct Worker {
     #[allow(dead_code)] live_lost:   Arc<AtomicU64>,
     #[allow(dead_code)] live_sent:   Arc<AtomicU64>,
     #[allow(dead_code)] live_jitter: Arc<AtomicU64>,
+    #[allow(dead_code)] server_jitter: Arc<AtomicU64>,
+    #[allow(dead_code)] server_lost:   Arc<AtomicU64>,
 }
 
 impl Worker {
@@ -593,6 +620,8 @@ impl Worker {
         live_lost:   Arc<AtomicU64>,
         live_sent:   Arc<AtomicU64>,
         live_jitter: Arc<AtomicU64>,
+        server_jitter: Arc<AtomicU64>,
+        server_lost:   Arc<AtomicU64>,
     ) -> Result<Self> {
         let mut config = Config::new()?;
         config.enable_stateless_reset(!option.disable_stateless_reset);
@@ -656,6 +685,8 @@ impl Worker {
             live_lost.clone(),
             live_sent.clone(),
             live_jitter.clone(),
+            server_jitter.clone(),
+            server_lost.clone(),
         );
 
         Ok(Worker {
@@ -675,6 +706,8 @@ impl Worker {
             live_lost,
             live_sent,
             live_jitter,
+            server_jitter,
+            server_lost,
         })
     }
 
@@ -819,6 +852,9 @@ struct WorkerHandler {
     live_lost:   Arc<AtomicU64>,
     live_sent:   Arc<AtomicU64>,
     live_jitter: Arc<AtomicU64>,
+    /// Server-measured stats received via the uplink reply channel.
+    server_jitter: Arc<AtomicU64>,
+    server_lost:   Arc<AtomicU64>,
 }
 
 impl WorkerHandler {
@@ -831,6 +867,8 @@ impl WorkerHandler {
         live_lost:   Arc<AtomicU64>,
         live_sent:   Arc<AtomicU64>,
         live_jitter: Arc<AtomicU64>,
+        server_jitter: Arc<AtomicU64>,
+        server_lost:   Arc<AtomicU64>,
     ) -> Self {
         Self {
             option: option.clone(),
@@ -844,6 +882,8 @@ impl WorkerHandler {
             live_lost,
             live_sent,
             live_jitter,
+            server_jitter,
+            server_lost,
         }
     }
 
@@ -1010,7 +1050,22 @@ impl TransportHandler for WorkerHandler {
         loop {
             match conn.stream_read(stream_id, &mut self.recv_buf) {
                 Ok((0, _)) | Err(Error::Done) => break,
-                Ok((n, fin)) => {
+                Ok((n, _fin)) => {
+                    // Uplink: any inbound data on these streams is the server's 16-byte stats reply.
+                    if self.option.mode == TransferMode::Uplink {
+                        if let Some(recv) = self.receivers.borrow_mut().get_mut(&idx) {
+                            recv.server_reply_buf.extend_from_slice(&self.recv_buf[..n]);
+                            if recv.server_reply_buf.len() >= 16 {
+                                let jb = u64::from_le_bytes(recv.server_reply_buf[0..8].try_into().unwrap());
+                                let lc = u64::from_le_bytes(recv.server_reply_buf[8..16].try_into().unwrap());
+                                self.server_jitter.store(jb, Ordering::Relaxed);
+                                self.server_lost.store(lc, Ordering::Relaxed);
+                            }
+                        }
+                        continue; // don't count as live_bytes
+                    }
+                    let n = n; let fin = _fin;
+                    // Downlink bulk receive path.
                     self.live_bytes.fetch_add(n as u64, Ordering::Relaxed);
                     // Update live stats for the interval reporter.
                     // recv_count = datagrams received from server (meaningful for downlink receiver stats).
