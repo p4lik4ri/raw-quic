@@ -1,3 +1,10 @@
+//! Axum route handlers for every API endpoint.
+//!
+//! Each handler locks the relevant `ProcessState` (server or client), delegates
+//! to `spawn::spawn_and_capture` to start the child process, and returns a JSON
+//! response.  Stop handlers call `ProcessState::stop()`; status handlers return
+//! a `ProcessStatus` snapshot including the last 1 000 lines of combined output.
+
 use std::sync::Arc;
 
 use axum::Json;
@@ -33,6 +40,9 @@ pub async fn server_start(
         if let Some(algor) = &req.multipath_algor {
             cmd.args(["--multipath-algor", algor]);
         }
+    }
+    if let Some(keylog) = &req.keylog_file {
+        cmd.args(["--keylog-file", keylog]);
     }
     for a in &req.extra_args { cmd.arg(a); }
 

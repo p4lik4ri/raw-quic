@@ -1427,3 +1427,132 @@ fn main() -> Result<()> {
     client.start();
     Ok(())
 }
+
+// ─────────────────────────────────── tests ───────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_bandwidth_cli ───────────────────────────────────────────────────
+
+    #[test]
+    fn bw_zero_string() {
+        assert_eq!(parse_bandwidth_cli("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn bw_plain_bits_to_bytes() {
+        // 8 bits/s → 1 byte/s
+        assert_eq!(parse_bandwidth_cli("8").unwrap(), 1);
+    }
+
+    #[test]
+    fn bw_kilo_suffix() {
+        // 8K bits/s = 8000 bits/s = 1000 bytes/s
+        assert_eq!(parse_bandwidth_cli("8K").unwrap(), 1_000);
+    }
+
+    #[test]
+    fn bw_kilo_lowercase() {
+        assert_eq!(parse_bandwidth_cli("8k").unwrap(), 1_000);
+    }
+
+    #[test]
+    fn bw_mega_suffix() {
+        // 500M bits/s → 62 500 000 bytes/s
+        assert_eq!(parse_bandwidth_cli("500M").unwrap(), 62_500_000);
+    }
+
+    #[test]
+    fn bw_mega_lowercase() {
+        assert_eq!(parse_bandwidth_cli("500m").unwrap(), 62_500_000);
+    }
+
+    #[test]
+    fn bw_giga_suffix() {
+        // 1G bits/s → 125 000 000 bytes/s
+        assert_eq!(parse_bandwidth_cli("1G").unwrap(), 125_000_000);
+    }
+
+    #[test]
+    fn bw_giga_lowercase() {
+        assert_eq!(parse_bandwidth_cli("1g").unwrap(), 125_000_000);
+    }
+
+    #[test]
+    fn bw_fractional_giga() {
+        // 2G bits/s → 250 000 000 bytes/s
+        assert_eq!(parse_bandwidth_cli("2G").unwrap(), 250_000_000);
+    }
+
+    #[test]
+    fn bw_whitespace_trimmed() {
+        assert_eq!(parse_bandwidth_cli("  500M  ").unwrap(), 62_500_000);
+    }
+
+    #[test]
+    fn bw_invalid_string() {
+        assert!(parse_bandwidth_cli("abc").is_err());
+    }
+
+    #[test]
+    fn bw_invalid_suffix() {
+        assert!(parse_bandwidth_cli("100X").is_err());
+    }
+
+    // ── Uplink stats reply decode (client side) ───────────────────────────────
+    // The client reads `[jitter_bits: u64 LE][lost_count: u64 LE]` from the server.
+
+    #[test]
+    fn uplink_reply_decode_roundtrip() {
+        let jitter: f64 = 0.456;
+        let lost: u64   = 13;
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&jitter.to_bits().to_le_bytes());
+        buf[8..16].copy_from_slice(&lost.to_le_bytes());
+
+        let jb = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let lc = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+
+        assert_eq!(f64::from_bits(jb), jitter);
+        assert_eq!(lc, lost);
+    }
+
+    // ── Downlink stats reply decode (client side) ─────────────────────────────
+    // The client reads `[lost_count: u64 LE][sent_count: u64 LE]` from the server.
+
+    #[test]
+    fn downlink_reply_decode_roundtrip() {
+        let lost: u64 = 5;
+        let sent: u64 = 70_000;
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&lost.to_le_bytes());
+        buf[8..16].copy_from_slice(&sent.to_le_bytes());
+
+        let lc = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let sc = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+
+        assert_eq!(lc, lost);
+        assert_eq!(sc, sent);
+    }
+
+    #[test]
+    fn downlink_reply_field_order() {
+        // Verify lost is first, sent is second — not swapped.
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+        buf[8..16].copy_from_slice(&2u64.to_le_bytes());
+        let lost = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let sent = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        assert_eq!(lost, 1);
+        assert_eq!(sent, 2);
+    }
+
+    // ── TransferMode ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn transfer_mode_default_is_downlink() {
+        assert_eq!(TransferMode::default(), TransferMode::Downlink);
+    }
+}

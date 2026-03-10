@@ -1,3 +1,8 @@
+//! Axum middleware for the tquic_api server.
+//!
+//! Currently provides a single `log_request` layer that emits an INFO log line
+//! for every incoming request (method + URI) and its response status code.
+
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;

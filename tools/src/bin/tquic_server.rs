@@ -202,6 +202,57 @@ enum TransferMode {
     Uplink,   // Client → Server
 }
 
+// ─────────────────────── Trigger / stats-reply codec (pure) ──────────────────
+
+/// Result of decoding a complete client trigger message.
+#[derive(Debug, PartialEq)]
+enum TriggerDecision {
+    /// Client sent 0xFF + FIN: requesting server-side stats after a downlink run.
+    StatsRequest,
+    /// Normal transfer trigger: carries the desired direction and bandwidth cap.
+    Transfer { mode: TransferMode, bandwidth: u64 },
+}
+
+/// Decode the accumulated trigger bytes `buf` given whether the stream FIN
+/// has been seen.  Returns `None` when more bytes are still needed.
+fn decode_trigger_buf(buf: &[u8], fin: bool) -> Option<TriggerDecision> {
+    // Stats request: single byte 0xFF + FIN
+    if buf.first() == Some(&0xFF) && fin {
+        return Some(TriggerDecision::StatsRequest);
+    }
+    let have_header = buf.len() >= 9;
+    if have_header || fin {
+        if have_header {
+            let mode = if buf[0] == 1 { TransferMode::Uplink } else { TransferMode::Downlink };
+            let arr: [u8; 8] = buf[1..9].try_into().unwrap();
+            Some(TriggerDecision::Transfer { mode, bandwidth: u64::from_le_bytes(arr) })
+        } else {
+            // FIN arrived with fewer than 9 bytes: treat as downlink, unlimited.
+            Some(TriggerDecision::Transfer { mode: TransferMode::Downlink, bandwidth: 0 })
+        }
+    } else {
+        None
+    }
+}
+
+/// Build the 16-byte reply sent back on an uplink stream after FIN:
+/// `[jitter_ms as f64 bits: u64 LE][lost_count: u64 LE]`.
+fn encode_uplink_stats_reply(jitter_bits: u64, lost_count: u64) -> [u8; 16] {
+    let mut reply = [0u8; 16];
+    reply[0..8].copy_from_slice(&jitter_bits.to_le_bytes());
+    reply[8..16].copy_from_slice(&lost_count.to_le_bytes());
+    reply
+}
+
+/// Build the 16-byte reply sent back on a downlink stats-request stream:
+/// `[lost_count: u64 LE][sent_count: u64 LE]`.
+fn encode_downlink_stats_reply(lost_count: u64, sent_count: u64) -> [u8; 16] {
+    let mut reply = [0u8; 16];
+    reply[0..8].copy_from_slice(&lost_count.to_le_bytes());
+    reply[8..16].copy_from_slice(&sent_count.to_le_bytes());
+    reply
+}
+
 // ─────────────────────────── Per-stream send state ───────────────────────────
 
 struct StreamSendState {
@@ -281,29 +332,18 @@ impl ConnectionHandler {
                     if n > 0 {
                         state.trigger_buf.extend_from_slice(&tmp[..n]);
                     }
-                    // Stats request: single byte 0xFF + FIN
-                    if state.trigger_buf.first() == Some(&0xFF) && fin {
-                        state.is_stats_request = true;
-                        state.ready = true;
-                        return true;
-                    }
-                    let have_header = state.trigger_buf.len() >= 9;
-                    if have_header || fin {
-                        let (mode, bw) = if have_header {
-                            let m = if state.trigger_buf[0] == 1 {
-                                TransferMode::Uplink
-                            } else {
-                                TransferMode::Downlink
-                            };
-                            let arr: [u8; 8] = state.trigger_buf[1..9].try_into().unwrap();
-                            (m, u64::from_le_bytes(arr))
-                        } else {
-                            (TransferMode::Downlink, 0) // FIN with no data
-                        };
-                        state.mode = mode;
-                        state.bandwidth_limit = bw;
-                        state.tokens = 0.0;
-                        state.last_refill = Instant::now();
+                    if let Some(decision) = decode_trigger_buf(&state.trigger_buf, fin) {
+                        match decision {
+                            TriggerDecision::StatsRequest => {
+                                state.is_stats_request = true;
+                            }
+                            TriggerDecision::Transfer { mode, bandwidth } => {
+                                state.mode = mode;
+                                state.bandwidth_limit = bandwidth;
+                                state.tokens = 0.0;
+                                state.last_refill = Instant::now();
+                            }
+                        }
                         state.ready = true;
                         return true;
                     }
@@ -428,9 +468,7 @@ impl ConnectionHandler {
         }
         if got_fin && !state.reply_sent {
             state.reply_sent = true;
-            let mut reply = [0u8; 16];
-            reply[0..8].copy_from_slice(&jitter_bits.to_le_bytes());
-            reply[8..16].copy_from_slice(&lost_count.to_le_bytes());
+            let reply = encode_uplink_stats_reply(jitter_bits, lost_count);
             match conn.stream_write(stream_id, Bytes::copy_from_slice(&reply), true) {
                 Ok(_) => {}
                 Err(e) => error!("{} uplink reply write {}: {:?}", conn.trace_id(), stream_id, e),
@@ -592,9 +630,7 @@ impl TransportHandler for ServerHandler {
             if is_stats_req {
                 // Client requested stats after downlink duration: reply with [lost:u64][sent:u64]+FIN.
                 let stats = conn.stats();
-                let mut reply = [0u8; 16];
-                reply[0..8].copy_from_slice(&stats.lost_count.to_le_bytes());
-                reply[8..16].copy_from_slice(&stats.sent_count.to_le_bytes());
+                let reply = encode_downlink_stats_reply(stats.lost_count, stats.sent_count);
                 let _ = conn.stream_write(stream_id, Bytes::copy_from_slice(&reply), true);
                 return;
             }
@@ -978,4 +1014,152 @@ fn main() -> Result<()> {
         server.endpoint.on_timeout(Instant::now());
     }
     Ok(())
+}
+
+// ─────────────────────────────────── tests ───────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── decode_trigger_buf ────────────────────────────────────────────────────
+
+    #[test]
+    fn trigger_stats_request_exact() {
+        // 0xFF + FIN → StatsRequest
+        assert_eq!(
+            decode_trigger_buf(&[0xFF], true),
+            Some(TriggerDecision::StatsRequest)
+        );
+    }
+
+    #[test]
+    fn trigger_stats_request_needs_fin() {
+        // 0xFF without FIN → not ready yet
+        assert_eq!(decode_trigger_buf(&[0xFF], false), None);
+    }
+
+    #[test]
+    fn trigger_downlink_unlimited() {
+        // mode=0 (downlink), bandwidth=0
+        let mut buf = [0u8; 9];
+        buf[0] = 0;
+        buf[1..9].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(
+            decode_trigger_buf(&buf, false),
+            Some(TriggerDecision::Transfer { mode: TransferMode::Downlink, bandwidth: 0 })
+        );
+    }
+
+    #[test]
+    fn trigger_downlink_with_bandwidth() {
+        let bw: u64 = 62_500_000; // 500 Mbit/s in bytes/s
+        let mut buf = [0u8; 9];
+        buf[0] = 0;
+        buf[1..9].copy_from_slice(&bw.to_le_bytes());
+        assert_eq!(
+            decode_trigger_buf(&buf, false),
+            Some(TriggerDecision::Transfer { mode: TransferMode::Downlink, bandwidth: bw })
+        );
+    }
+
+    #[test]
+    fn trigger_uplink_with_bandwidth() {
+        let bw: u64 = 125_000_000; // 1 Gbit/s in bytes/s
+        let mut buf = [0u8; 9];
+        buf[0] = 1; // Uplink
+        buf[1..9].copy_from_slice(&bw.to_le_bytes());
+        assert_eq!(
+            decode_trigger_buf(&buf, false),
+            Some(TriggerDecision::Transfer { mode: TransferMode::Uplink, bandwidth: bw })
+        );
+    }
+
+    #[test]
+    fn trigger_fin_no_data_defaults_to_downlink() {
+        // FIN with empty buf → Downlink, 0
+        assert_eq!(
+            decode_trigger_buf(&[], true),
+            Some(TriggerDecision::Transfer { mode: TransferMode::Downlink, bandwidth: 0 })
+        );
+    }
+
+    #[test]
+    fn trigger_partial_no_decision() {
+        // Only 4 bytes, no FIN → still waiting
+        let buf = [0x00, 0x01, 0x02, 0x03];
+        assert_eq!(decode_trigger_buf(&buf, false), None);
+    }
+
+    #[test]
+    fn trigger_extra_bytes_ignored() {
+        // 12-byte buffer: first 9 bytes are parsed, rest ignored
+        let bw: u64 = 1_000;
+        let mut buf = [0xAAu8; 12];
+        buf[0] = 0; // Downlink
+        buf[1..9].copy_from_slice(&bw.to_le_bytes());
+        assert_eq!(
+            decode_trigger_buf(&buf, false),
+            Some(TriggerDecision::Transfer { mode: TransferMode::Downlink, bandwidth: bw })
+        );
+    }
+
+    // ── encode_uplink_stats_reply ─────────────────────────────────────────────
+
+    #[test]
+    fn uplink_reply_roundtrip() {
+        let jitter_bits = (1.234_f64).to_bits();
+        let lost_count: u64 = 42;
+        let reply = encode_uplink_stats_reply(jitter_bits, lost_count);
+
+        let decoded_jitter = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+        let decoded_lost   = u64::from_le_bytes(reply[8..16].try_into().unwrap());
+
+        assert_eq!(decoded_jitter, jitter_bits);
+        assert_eq!(decoded_lost,   lost_count);
+        assert_eq!(f64::from_bits(decoded_jitter), 1.234_f64);
+    }
+
+    #[test]
+    fn uplink_reply_zero_values() {
+        let reply = encode_uplink_stats_reply(0, 0);
+        assert_eq!(reply, [0u8; 16]);
+    }
+
+    #[test]
+    fn uplink_reply_field_order() {
+        // jitter is in bytes [0..8], lost_count is in bytes [8..16] — not swapped.
+        let reply = encode_uplink_stats_reply(1, 2);
+        assert_eq!(u64::from_le_bytes(reply[0..8].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(reply[8..16].try_into().unwrap()), 2);
+    }
+
+    // ── encode_downlink_stats_reply ───────────────────────────────────────────
+
+    #[test]
+    fn downlink_reply_roundtrip() {
+        let lost_count: u64 = 7;
+        let sent_count: u64 = 100_000;
+        let reply = encode_downlink_stats_reply(lost_count, sent_count);
+
+        let decoded_lost = u64::from_le_bytes(reply[0..8].try_into().unwrap());
+        let decoded_sent = u64::from_le_bytes(reply[8..16].try_into().unwrap());
+
+        assert_eq!(decoded_lost, lost_count);
+        assert_eq!(decoded_sent, sent_count);
+    }
+
+    #[test]
+    fn downlink_reply_zero_values() {
+        let reply = encode_downlink_stats_reply(0, 0);
+        assert_eq!(reply, [0u8; 16]);
+    }
+
+    #[test]
+    fn downlink_reply_field_order() {
+        // lost is in bytes [0..8], sent is in bytes [8..16] — not swapped.
+        let reply = encode_downlink_stats_reply(1, 2);
+        assert_eq!(u64::from_le_bytes(reply[0..8].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(reply[8..16].try_into().unwrap()), 2);
+    }
 }

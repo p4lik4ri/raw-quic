@@ -1,3 +1,11 @@
+//! Shared application state and per-process state management.
+//!
+//! `AppState` holds a `Mutex<ProcessState>` for the server and one for the
+//! client, the resolved binary directory, and the ring buffer of the latest
+//! client interval samples.  `ProcessState` wraps the `Child` handle and its
+//! output ring buffer, and exposes helpers to check liveness, take a status
+//! snapshot, and kill the process.
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -81,7 +81,6 @@ async fn main() {
     let addr = format!("0.0.0.0:{port}");
     log::info!("tquic_api  listening on  http://{addr}");
     log::info!("           binaries from {}", bin_dir.display());
-
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

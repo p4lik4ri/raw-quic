@@ -1,3 +1,9 @@
+//! Request and response data models for the tquic_api HTTP control plane.
+//!
+//! Defines the JSON-deserialisable payloads accepted by the `/server/start` and
+//! `/client/start` endpoints (`ServerStartRequest`, `ClientStartRequest`), as
+//! well as the `OverallStatus` response that aggregates server + client state.
+
 use serde::{Deserialize, Serialize};
 
 use crate::state::ProcessStatus;
@@ -27,6 +33,9 @@ pub struct ServerStartRequest {
 
     /// Working directory for the child process (cert/key paths resolved from here).
     pub work_dir: Option<String>,
+
+    /// Path to write TLS key material for decryption (passed to --keylog-file).
+    pub keylog_file: Option<String>,
 
     /// Extra raw CLI flags forwarded verbatim, e.g. ["--send-batch-size","16"].
     #[serde(default)]

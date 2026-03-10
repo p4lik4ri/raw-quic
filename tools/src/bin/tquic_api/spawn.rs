@@ -1,3 +1,12 @@
+//! Child-process spawning and output capture utilities.
+//!
+//! `spawn_and_capture` launches a `tokio::process::Command`, merges its stdout
+//! and stderr into a shared ring buffer (`OUTPUT_CAP` lines), and optionally
+//! parses every per-second interval line with `parse_interval_line` to build
+//! live throughput / jitter / packet-loss samples for the `/LastJsonResult`
+//! endpoint.  `fmt_float` provides Python-compatible float formatting used when
+//! serialising those samples.
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -142,4 +151,100 @@ pub async fn spawn_and_capture(
     }
 
     Ok(child)
+}
+
+// ─────────────────────────────────── tests ───────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: extract only the deterministic fields from a parsed sample.
+    fn fields(v: &serde_json::Value) -> (f64, f64, f64) {
+        (
+            v["throughput"].as_f64().unwrap(),
+            v["jitter"].as_f64().unwrap(),
+            v["packetLoss"].as_f64().unwrap(),
+        )
+    }
+
+    // ── Valid receiver row (downlink): has jitter + loss columns ─────────────
+
+    #[test]
+    fn parse_receiver_row() {
+        let line = "  0.00-1.00 s    59.60 MB  500.00 Mbits/sec       0.009 ms  0/52106 (0%)";
+        let v = parse_interval_line(line).expect("should parse");
+        let (tp, jitter, loss) = fields(&v);
+        assert!((tp - 500.0).abs() < 1e-6);
+        assert!((jitter - 0.009).abs() < 1e-9);
+        assert_eq!(loss, 0.0);
+    }
+
+    #[test]
+    fn parse_receiver_row_with_loss() {
+        let line = "  1.00-2.00 s   100.48 MB  803.84 Mbits/sec       0.038 ms  4266/68274 (6%)";
+        let v = parse_interval_line(line).expect("should parse");
+        let (tp, jitter, loss) = fields(&v);
+        assert!((tp - 803.84).abs() < 1e-4);
+        assert!((jitter - 0.038).abs() < 1e-9);
+        assert_eq!(loss, 6.0);
+    }
+
+    // ── Valid sender row (uplink): no jitter / loss columns ──────────────────
+
+    #[test]
+    fn parse_sender_row() {
+        let line = "  0.00-1.00 s   113.62 MB  908.94 Mbits/sec  77252";
+        let v = parse_interval_line(line).expect("should parse");
+        let (tp, jitter, loss) = fields(&v);
+        assert!((tp - 908.94).abs() < 1e-4);
+        assert_eq!(jitter, 0.0);
+        assert_eq!(loss,   0.0);
+    }
+
+    // ── Summary rows must be rejected ────────────────────────────────────────
+
+    #[test]
+    fn skip_summary_sender() {
+        let line = "  0.00-10.00 s  1022.13 MB  817.70 Mbits/sec       0.000 ms  2765/694460 (0%)  sender";
+        assert!(parse_interval_line(line).is_none());
+    }
+
+    #[test]
+    fn skip_summary_receiver() {
+        let line = "  0.00-41.00 s   993.91 MB  193.93 Mbits/sec       0.184 ms  48003/675353 (7%)  receiver";
+        assert!(parse_interval_line(line).is_none());
+    }
+
+    // ── Structural rejections ─────────────────────────────────────────────────
+
+    #[test]
+    fn skip_separator_line() {
+        assert!(parse_interval_line("- - - - - - - - - - - - - - -").is_none());
+    }
+
+    #[test]
+    fn skip_header_line() {
+        let line = "  Interval        Transfer           Bitrate      Jitter  Lost/Total Datagrams";
+        assert!(parse_interval_line(line).is_none());
+    }
+
+    #[test]
+    fn skip_too_short() {
+        assert!(parse_interval_line("0.00-1.00 s 1.0").is_none());
+    }
+
+    #[test]
+    fn skip_empty_line() {
+        assert!(parse_interval_line("").is_none());
+    }
+
+    // ── Timestamp is present and positive ────────────────────────────────────
+
+    #[test]
+    fn timestamp_is_positive() {
+        let line = "  0.00-1.00 s    59.60 MB  500.00 Mbits/sec  52051";
+        let v = parse_interval_line(line).expect("should parse");
+        assert!(v["timestamp"].as_f64().unwrap() > 0.0);
+    }
 }
