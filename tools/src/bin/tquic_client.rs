@@ -334,7 +334,7 @@ impl Client {
             let _ = std::io::stdout().flush();
             match reporter_mode {
                 TransferMode::Downlink => println!(
-                    "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
+                    "  {:<12}  {:>10}  {:>16}  {:>13}  {}",
                     "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
                 ),
                 TransferMode::Uplink => println!(
@@ -398,7 +398,7 @@ impl Client {
             let cur_sent  = reporter_sent.load(Ordering::Relaxed);
             let jitter_ms = f64::from_bits(reporter_jitter.load(Ordering::Relaxed));
             if current > 0 {
-                let total_secs = interval.saturating_sub(1).max(1) as f64;
+                let total_secs = interval.max(1) as f64;
                 let total_mb   = current as f64 / 1e6;
                 let total_mbps = (current as f64 * 8.0) / 1e6 / total_secs;
                 println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
@@ -1117,7 +1117,15 @@ impl TransportHandler for WorkerHandler {
             }
         }
 
-        self.open_trigger_streams(conn);
+        // Guard against double-open when trigger streams were already sent via 0-RTT early data.
+        let idx = conn.index().unwrap();
+        let already_opened = self.receivers.borrow()
+            .get(&idx)
+            .map(|r| r.streams_opened > 0)
+            .unwrap_or(false);
+        if !already_opened {
+            self.open_trigger_streams(conn);
+        }
     }
 
     fn on_conn_closed(&mut self, conn: &mut Connection) {
