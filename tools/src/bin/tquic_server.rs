@@ -416,7 +416,9 @@ impl ConnectionHandler {
         let mut got_fin = false;
         loop {
             match conn.stream_read(stream_id, &mut tmp) {
-                Ok((0, _)) | Err(Error::Done) => break,
+                // FIN-only frame (0 bytes + fin): must check fin before discarding.
+                Ok((0, true)) => { got_fin = true; break; }
+                Ok((0, false)) | Err(Error::Done) => break,
                 Ok((_, fin)) => { if fin { got_fin = true; } }
                 Err(e) => {
                     error!("{} uplink drain {}: {:?}", conn.trace_id(), stream_id, e);

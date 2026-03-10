@@ -69,7 +69,7 @@ async fn main() {
         .route("/server/start",           post(server_start))
         .route("/server/stop",            post(server_stop))
         .route("/server/status",          get(server_status))
-        .route("/server/LastJsonResult",  get(server_last_json_result))
+        .route("/server/LastJsonResult",  get(server_last_json_result)) //Not need maybe remove it
         .route("/client/start",           post(client_start))
         .route("/client/stop",            post(client_stop))
         .route("/client/status",          get(client_status))

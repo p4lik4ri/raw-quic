@@ -889,8 +889,12 @@ impl Worker {
         }
 
         // Spawn new connections up to the limit.
+        // Do not spawn new connections once the test duration has expired;
+        // that would restart the measurement and prevent clean shutdown.
         let mut ctx = self.worker_ctx.borrow_mut();
-        while ctx.concurrent_conns < self.option.max_concurrent_conns {
+        while ctx.concurrent_conns < self.option.max_concurrent_conns
+            && !self.duration_expired.load(Ordering::Relaxed)
+        {
             let sni = self.option.server_name.as_deref();
             match self.endpoint.connect(
                 self.sock.local_addr(),
@@ -1270,13 +1274,18 @@ impl TransportHandler for WorkerHandler {
         // Duration expired: send FIN to end the stream so the server sends back stats.
         if self.duration_expired.load(Ordering::Relaxed) {
             if !state.fin_sent {
-                state.fin_sent = true;
-                // Empty write with fin=true closes the stream toward the server.
+                // Only mark sent if the write actually succeeds; on Err::Done the
+                // stream's send buffer is momentarily full — re-arm and retry.
                 match conn.stream_write(stream_id, Bytes::new(), true) {
-                    Ok(_) | Err(Error::Done) => {}
+                    Ok(_) => {
+                        state.fin_sent = true;
+                        _ = conn.stream_want_read(stream_id, true);
+                    }
+                    Err(Error::Done) => {
+                        _ = conn.stream_want_write(stream_id, true);
+                    }
                     Err(e) => error!("{} uplink FIN {}: {:?}", conn.trace_id(), stream_id, e),
                 }
-                _ = conn.stream_want_read(stream_id, true);
             }
             return;
         }

@@ -44,7 +44,7 @@ pub async fn server_start(
             let pid = child.id();
             proc.child = Some(child);
             proc.pid   = pid;
-            Json(serde_json::json!({ "ok": true, "pid": pid }))
+            Json(serde_json::json!({ "ok": "running", "pid": pid }))
         }
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
     }
