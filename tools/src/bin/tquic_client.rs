@@ -289,6 +289,9 @@ struct Client {
     reporting_done: Arc<AtomicBool>,
     /// Actual test duration in f64 bits, set just before signaling reporting_done.
     actual_duration_bits: Arc<AtomicU64>,
+    /// Exact QUIC-layer bytes sent (uplink) / received (downlink), set before signaling done.
+    /// Used by the reporter summary rows so they match print_stats.
+    final_bytes: Arc<AtomicU64>,
 }
 
 impl Client {
@@ -311,6 +314,7 @@ impl Client {
             duration_expired: Arc::new(AtomicBool::new(false)),
             reporting_done: Arc::new(AtomicBool::new(false)),
             actual_duration_bits: Arc::new(AtomicU64::new(0)),
+            final_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -327,6 +331,7 @@ impl Client {
         let reporter_srv_sent   = Arc::clone(&self.server_sent);
         let reporter_done     = Arc::clone(&self.reporting_done);
         let reporter_duration = Arc::clone(&self.actual_duration_bits);
+        let reporter_final_bytes = Arc::clone(&self.final_bytes);
         let reporter_mode    = self.option.mode;
         let reporter_handle = thread::spawn(move || {
             let direction = match reporter_mode {
@@ -401,13 +406,19 @@ impl Client {
             let cur_lost  = reporter_lost.load(Ordering::Relaxed);
             let cur_sent  = reporter_sent.load(Ordering::Relaxed);
             let jitter_ms = f64::from_bits(reporter_jitter.load(Ordering::Relaxed));
+            // For the summary rows use the exact QUIC bytes if available (set before
+            // reporting_done), so the summary matches print_stats exactly.
+            let summary_bytes = {
+                let fb = reporter_final_bytes.load(Ordering::Relaxed);
+                if fb > 0 { fb } else { current }
+            };
             if current > 0 {
                 let total_secs = {
                     let d = f64::from_bits(reporter_duration.load(Ordering::Relaxed));
                     if d > 0.0 { d } else { interval.max(1) as f64 }
                 };
-                let total_mb   = current as f64 / 1e6;
-                let total_mbps = (current as f64 * 8.0) / 1e6 / total_secs;
+                let total_mb   = summary_bytes as f64 / 1e6;
+                let total_mbps = (summary_bytes as f64 * 8.0) / 1e6 / total_secs;
                 println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
                 println!(
                     "  {:<12}  {:>10}  {:>16}  {:>10}  {}",
@@ -488,11 +499,18 @@ impl Client {
 
         // Compute actual test duration and share it with the reporter thread
         // so the final summary uses the real elapsed time, not interval count.
-        let actual_secs = {
+        // Also share the exact QUIC-layer byte total for consistent summary rows.
+        {
             let ctx = self.context.lock().unwrap();
-            (ctx.end_time.unwrap_or_else(Instant::now) - self.start_time).as_secs_f64()
-        };
-        self.actual_duration_bits.store(actual_secs.to_bits(), Ordering::Relaxed);
+            let actual_secs = (ctx.end_time.unwrap_or_else(Instant::now) - self.start_time)
+                .as_secs_f64();
+            self.actual_duration_bits.store(actual_secs.to_bits(), Ordering::Relaxed);
+            let final_bytes = match ctx.mode {
+                TransferMode::Uplink   => ctx.conn_stats.sent_bytes,
+                TransferMode::Downlink => ctx.bytes_received,
+            };
+            self.final_bytes.store(final_bytes, Ordering::Relaxed);
+        }
         // Signal reporter to stop, wait for it to flush the last interval.
         self.reporting_done.store(true, Ordering::Relaxed);
         reporter_handle.join().unwrap();
@@ -596,9 +614,6 @@ struct UplinkState {
 struct DataReceiver {
     bytes_received: u64,
     bytes_sent: u64,
-    /// Snapshot of conn.stats().sent_bytes from the previous writable update
-    /// (uplink only), used to compute QUIC-layer byte deltas for live_bytes.
-    prev_quic_sent_bytes: u64,
     streams_opened: u64,
     streams_finished: u64,
     uplink: HashMap<u64, UplinkState>,
@@ -621,7 +636,6 @@ impl DataReceiver {
         Self {
             bytes_received: 0,
             bytes_sent: 0,
-            prev_quic_sent_bytes: 0,
             streams_opened: 0,
             streams_finished: 0,
             uplink: HashMap::new(),
@@ -1337,13 +1351,10 @@ impl TransportHandler for WorkerHandler {
             ) {
                 Ok(written) => {
                     recv.bytes_sent += written as u64;
-                    // Use QUIC-layer sent_bytes delta so that live_bytes matches
-                    // what the server actually receives (consistent with iperf3).
+                    // Increment live_bytes by app bytes written; per-interval rows
+                    // show accurate per-second throughput from the sender's view.
+                    self.live_bytes.fetch_add(written as u64, Ordering::Relaxed);
                     let stats = conn.stats();
-                    let quic_delta = stats.sent_bytes
-                        .saturating_sub(recv.prev_quic_sent_bytes);
-                    recv.prev_quic_sent_bytes = stats.sent_bytes;
-                    self.live_bytes.fetch_add(quic_delta, Ordering::Relaxed);
                     self.live_lost.store(stats.lost_count, Ordering::Relaxed);
                     self.live_sent.store(stats.sent_count, Ordering::Relaxed);
                     if state.bandwidth_limit > 0 {
