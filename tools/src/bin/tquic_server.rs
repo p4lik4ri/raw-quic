@@ -955,7 +955,7 @@ fn main() -> Result<()> {
                 if session_uplink {
                     let loss_pct = if d_sent > 0 { d_lost as f64 / d_sent as f64 * 100.0 } else { 0.0 };
                     println!(
-                        "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)",
+                        "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.2}%)",
                         format!("{:.2}-{:.2} s", t_start, t_end),
                         format!("{:.2} MB", mb),
                         format!("{:.2} Mbits/sec", mbps),
@@ -1003,7 +1003,7 @@ fn main() -> Result<()> {
                     String::new()
                 };
                 println!(
-                    "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)  {}",
+                    "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.2}%)  {}",
                     format!("0.00-{:.2} s", total_secs),
                     format!("{:.2} MB", total_mb),
                     format!("{:.2} Mbits/sec", total_mbps),

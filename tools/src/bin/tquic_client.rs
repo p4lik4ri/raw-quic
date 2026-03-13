@@ -382,7 +382,7 @@ impl Client {
                         TransferMode::Downlink => {
                             let loss_pct = if d_sent > 0 { d_lost as f64 / d_sent as f64 * 100.0 } else { 0.0 };
                             println!(
-                                "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)",
+                                "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.2}%)",
                                 format!("{:.2}-{:.2} s", t_start, t_end),
                                 format!("{:.2} MB", mb),
                                 format!("{:.2} Mbits/sec", mbps),
@@ -496,7 +496,9 @@ impl Client {
             self.actual_duration_bits.store(actual_secs.to_bits(), Ordering::Relaxed);
             let final_bytes = match ctx.mode {
                 TransferMode::Uplink   => ctx.conn_stats.sent_bytes,
-                TransferMode::Downlink => ctx.bytes_received,
+                // Use QUIC-layer recv_bytes for downlink so Transfer == Bytes recv
+                // in print_stats (same reasoning as uplink using sent_bytes).
+                TransferMode::Downlink => ctx.conn_stats.recv_bytes,
             };
             self.final_bytes.store(final_bytes, Ordering::Relaxed);
         }
@@ -512,9 +514,8 @@ impl Client {
         let duration = ctx.end_time.unwrap_or_else(Instant::now) - self.start_time;
         let secs = duration.as_secs_f64().max(1e-9);
         let (direction, bytes) = match ctx.mode {
-            TransferMode::Downlink => ("server → client", ctx.bytes_received),
-            // Use QUIC-layer sent bytes for uplink so it matches what the server
-            // received and prints — consistent with iperf3 UDP payload counting.
+            // Use QUIC-layer counters so Transfer always equals Bytes recv/sent.
+            TransferMode::Downlink => ("server → client", ctx.conn_stats.recv_bytes),
             TransferMode::Uplink   => ("client → server", ctx.conn_stats.sent_bytes),
         };
         let gbps = (bytes as f64 * 8.0) / 1e9 / secs;
