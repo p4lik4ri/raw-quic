@@ -112,6 +112,10 @@ pub async fn client_start(
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
+    // Clear server samples too — the server process stays running across tests,
+    // so its background parse task keeps appending. Reset here so last_server
+    // only holds the current test's intervals (for jitter overlay in uplink mode).
+    state.last_server.lock().await.clear();
     // Remember the mode so /LastJsonResult can pick the right sample store.
     state.last_mode_uplink.store(
         req.mode == "uplink",
