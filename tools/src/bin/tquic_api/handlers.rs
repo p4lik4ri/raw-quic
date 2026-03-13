@@ -112,21 +112,30 @@ pub async fn client_start(
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
-    // Clear server samples too — the server process stays running across tests,
-    // so its background parse task keeps appending. Reset here so last_server
-    // only holds the current test's intervals (for jitter overlay in uplink mode).
+    // Clear local server samples for same-host setup.
     state.last_server.lock().await.clear();
-    // Remember the mode so /LastJsonResult can pick the right sample store.
-    state.last_mode_uplink.store(
-        req.mode == "uplink",
-        std::sync::atomic::Ordering::Relaxed,
-    );
     // Derive the remote server API URL from the connect_to host.
     // connect_to is "host:port" — we reuse the host with the default API port 8000.
     let derived_server_api_url = req.connect_to
         .rsplit_once(':')
         .map(|(host, _)| format!("http://{}:8000", host));
-    *state.server_api_url.lock().await = derived_server_api_url;
+    *state.server_api_url.lock().await = derived_server_api_url.clone();
+    // Also clear the remote server's accumulated interval samples so that
+    // /server/intervals only holds this test's data (not prior runs).
+    if let Some(ref base_url) = derived_server_api_url {
+        let clear_url = format!("{base_url}/server/clear");
+        // Fire-and-forget — don't block client startup on the remote call.
+        tokio::spawn(async move {
+            if let Err(e) = reqwest::Client::new().post(&clear_url).send().await {
+                log::warn!("[client_start] could not clear remote server intervals: {e}");
+            }
+        });
+    }
+    // Remember the mode so /LastJsonResult can pick the right sample store.
+    state.last_mode_uplink.store(
+        req.mode == "uplink",
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // Parse interval lines from client stdout into last_client (last session only).
     match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_client)), "client").await {
         Ok(child) => {
@@ -172,6 +181,16 @@ pub async fn client_intervals(
 ) -> Json<serde_json::Value> {
     let samples = state.last_client.lock().await.clone();
     Json(serde_json::json!({ "client": samples }))
+}
+
+/// `POST /server/clear` — discard accumulated server interval samples.
+/// Called automatically by the remote client API at the start of each test
+/// so that /server/intervals only holds the current session's data.
+pub async fn server_clear(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    state.last_server.lock().await.clear();
+    Json(serde_json::json!({ "ok": true }))
 }
 
 /// `GET /server/intervals` — raw per-second samples parsed from the last server session.

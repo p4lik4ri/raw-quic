@@ -35,7 +35,7 @@ use tokio::sync::Mutex;
 
 use handlers::{
     client_start, client_status, client_stop, client_intervals,
-    last_json_result, overall_status, server_intervals,
+    last_json_result, overall_status, server_clear, server_intervals,
     server_last_json_result, server_start, server_status, server_stop,
 };
 use state::{AppState, ProcessState};
@@ -72,6 +72,7 @@ async fn main() {
     let app = Router::new()
         .route("/server/start",           post(server_start))
         .route("/server/stop",            post(server_stop))
+        .route("/server/clear",           post(server_clear))
         .route("/server/status",          get(server_status))
         .route("/server/intervals",       get(server_intervals))
         .route("/server/LastJsonResult",  get(server_last_json_result))
