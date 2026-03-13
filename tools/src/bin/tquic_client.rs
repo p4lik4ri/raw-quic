@@ -506,7 +506,9 @@ impl Client {
         let secs = duration.as_secs_f64().max(1e-9);
         let (direction, bytes) = match ctx.mode {
             TransferMode::Downlink => ("server → client", ctx.bytes_received),
-            TransferMode::Uplink   => ("client → server", ctx.bytes_sent),
+            // Use QUIC-layer sent bytes for uplink so it matches what the server
+            // received and prints — consistent with iperf3 UDP payload counting.
+            TransferMode::Uplink   => ("client → server", ctx.conn_stats.sent_bytes),
         };
         let gbps = (bytes as f64 * 8.0) / 1e9 / secs;
         let mbps = (bytes as f64 * 8.0) / 1e6 / secs;
@@ -594,6 +596,9 @@ struct UplinkState {
 struct DataReceiver {
     bytes_received: u64,
     bytes_sent: u64,
+    /// Snapshot of conn.stats().sent_bytes from the previous writable update
+    /// (uplink only), used to compute QUIC-layer byte deltas for live_bytes.
+    prev_quic_sent_bytes: u64,
     streams_opened: u64,
     streams_finished: u64,
     uplink: HashMap<u64, UplinkState>,
@@ -616,6 +621,7 @@ impl DataReceiver {
         Self {
             bytes_received: 0,
             bytes_sent: 0,
+            prev_quic_sent_bytes: 0,
             streams_opened: 0,
             streams_finished: 0,
             uplink: HashMap::new(),
@@ -1331,9 +1337,13 @@ impl TransportHandler for WorkerHandler {
             ) {
                 Ok(written) => {
                     recv.bytes_sent += written as u64;
-                    self.live_bytes.fetch_add(written as u64, Ordering::Relaxed);
-                    // Update live packet stats for the interval reporter (uplink).
+                    // Use QUIC-layer sent_bytes delta so that live_bytes matches
+                    // what the server actually receives (consistent with iperf3).
                     let stats = conn.stats();
+                    let quic_delta = stats.sent_bytes
+                        .saturating_sub(recv.prev_quic_sent_bytes);
+                    recv.prev_quic_sent_bytes = stats.sent_bytes;
+                    self.live_bytes.fetch_add(quic_delta, Ordering::Relaxed);
                     self.live_lost.store(stats.lost_count, Ordering::Relaxed);
                     self.live_sent.store(stats.sent_count, Ordering::Relaxed);
                     if state.bandwidth_limit > 0 {

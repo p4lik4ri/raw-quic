@@ -495,6 +495,10 @@ struct ServerHandler {
     is_uplink: Arc<AtomicBool>,
     /// Signals the reporter thread to stop (set on connection close).
     rep_done: Arc<AtomicBool>,
+    /// Actual session duration in f64 bits (computed on conn close).
+    actual_duration_bits: Arc<AtomicU64>,
+    /// Time of the first connection establishment in this session.
+    session_start: Option<Instant>,
 }
 
 impl ServerHandler {
@@ -506,6 +510,7 @@ impl ServerHandler {
         live_jitter: Arc<AtomicU64>,
         is_uplink:   Arc<AtomicBool>,
         rep_done:    Arc<AtomicBool>,
+        actual_duration_bits: Arc<AtomicU64>,
     ) -> Result<Self> {
         let keylog = match &option.keylog_file {
             Some(f) => Some(
@@ -529,6 +534,8 @@ impl ServerHandler {
             live_jitter,
             is_uplink,
             rep_done,
+            actual_duration_bits,
+            session_start: None,
         })
     }
 
@@ -575,6 +582,9 @@ impl TransportHandler for ServerHandler {
     fn on_conn_established(&mut self, conn: &mut Connection) {
         debug!("{} connection established", conn.trace_id());
         self.ensure_conn_handler(conn);
+        if self.session_start.is_none() {
+            self.session_start = Some(Instant::now());
+        }
     }
 
     fn on_conn_closed(&mut self, conn: &mut Connection) {
@@ -586,6 +596,11 @@ impl TransportHandler for ServerHandler {
             s.sent_count, s.sent_bytes,
             s.lost_count, s.lost_bytes,
         );
+        // Record actual session duration so the reporter shows real elapsed time.
+        if let Some(start) = self.session_start.take() {
+            let secs = Instant::now().duration_since(start).as_secs_f64();
+            self.actual_duration_bits.store(secs.to_bits(), Ordering::Relaxed);
+        }
         self.conns.remove(&conn.index().unwrap());
         // Stop the interval reporter as soon as the transfer finishes.
         self.rep_done.store(true, Ordering::Relaxed);
@@ -744,6 +759,7 @@ impl Server {
         live_jitter: Arc<AtomicU64>,
         is_uplink:   Arc<AtomicBool>,
         rep_done:    Arc<AtomicBool>,
+        actual_duration_bits: Arc<AtomicU64>,
     ) -> Result<Self> {
         let mut config = Config::new()?;
         config.set_recv_udp_payload_size(option.recv_udp_payload_size);
@@ -790,7 +806,7 @@ impl Server {
         config.set_tls_config(tls_config);
 
         let poll = mio::Poll::new()?;
-        let handler = ServerHandler::new(option, live_bytes, live_lost, live_sent, live_jitter, is_uplink, rep_done)?;
+        let handler = ServerHandler::new(option, live_bytes, live_lost, live_sent, live_jitter, is_uplink, rep_done, actual_duration_bits)?;
         let sock = Rc::new(QuicSocket::new(&option.listen, poll.registry())?);
 
         Ok(Server {
@@ -859,6 +875,7 @@ fn main() -> Result<()> {
     let live_jitter  = Arc::new(AtomicU64::new(0));
     let is_uplink    = Arc::new(AtomicBool::new(false));
     let rep_done     = Arc::new(AtomicBool::new(false));
+    let actual_duration_bits = Arc::new(AtomicU64::new(0));
     let terminated   = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&terminated))?;
 
@@ -867,6 +884,7 @@ fn main() -> Result<()> {
         Arc::clone(&live_bytes), Arc::clone(&live_lost),
         Arc::clone(&live_sent),  Arc::clone(&live_jitter),
         Arc::clone(&is_uplink),  Arc::clone(&rep_done),
+        Arc::clone(&actual_duration_bits),
     )?;
 
     info!(
@@ -884,6 +902,7 @@ fn main() -> Result<()> {
     let rj = Arc::clone(&live_jitter);
     let ru = Arc::clone(&is_uplink);
     let rd = Arc::clone(&rep_done);
+    let rdb = Arc::clone(&actual_duration_bits);
     let rt = Arc::clone(&terminated);
     let reporter = thread::spawn(move || {
         'session: loop {
@@ -964,7 +983,10 @@ fn main() -> Result<()> {
             let jitter_ms = f64::from_bits(rj.load(Ordering::Relaxed));
             if current > 0 {
                 let uplink     = ru.load(Ordering::Relaxed);
-                let total_secs = interval.max(1) as f64;
+                let total_secs = {
+                    let d = f64::from_bits(rdb.load(Ordering::Relaxed));
+                    if d > 0.0 { d } else { interval.max(1) as f64 }
+                };
                 let total_mb   = current as f64 / 1e6;
                 let total_mbps = (current as f64 * 8.0) / 1e6 / total_secs;
                 let loss_pct   = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
@@ -991,6 +1013,7 @@ fn main() -> Result<()> {
             rj.store(0u64, Ordering::Relaxed);
             ru.store(false, Ordering::Relaxed);
             rd.store(false, Ordering::Relaxed);
+            rdb.store(0u64, Ordering::Relaxed);
         }
     });
 
