@@ -327,8 +327,6 @@ impl Client {
         let reporter_sent    = Arc::clone(&self.live_sent);
         let reporter_jitter  = Arc::clone(&self.live_jitter);
         let reporter_srv_jitter = Arc::clone(&self.server_jitter);
-        let reporter_srv_lost   = Arc::clone(&self.server_lost);
-        let reporter_srv_sent   = Arc::clone(&self.server_sent);
         let reporter_done     = Arc::clone(&self.reporting_done);
         let reporter_duration = Arc::clone(&self.actual_duration_bits);
         let reporter_final_bytes = Arc::clone(&self.final_bytes);
@@ -452,21 +450,8 @@ impl Client {
                         );
                     }
                     TransferMode::Downlink => {
-                        // Sender row: use server-reported retrans + total sent from trailer.
-                        let srv_lost  = reporter_srv_lost.load(Ordering::Relaxed);
-                        let srv_total = reporter_srv_sent.load(Ordering::Relaxed);
-                        let sender_total = if srv_total > 0 { srv_total } else { cur_sent + cur_lost };
-                        let sender_lost  = srv_lost;
-                        let sender_loss_pct = if sender_total > 0 { sender_lost as f64 / sender_total as f64 * 100.0 } else { 0.0 };
+                        // In downlink the client IS the receiver; no sender row.
                         let recv_loss_pct = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
-                        println!(
-                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)  sender",
-                            format!("0.00-{:.2} s", total_secs),
-                            format!("{:.2} MB", total_mb),
-                            format!("{:.2} Mbits/sec", total_mbps),
-                            "",
-                            sender_lost, sender_total, sender_loss_pct,
-                        );
                         println!(
                             "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
                             format!("0.00-{:.2} s", total_secs),

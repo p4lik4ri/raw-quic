@@ -256,7 +256,12 @@ pub async fn last_json_result(
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
                 {
-                    sample["jitter"] = serde_json::json!(jitter);
+                    // Only overlay when the server actually measured jitter (i.e. server
+                    // is the receiver = uplink mode).  In downlink the server is the sender
+                    // and its jitter is 0.0; overwriting would erase the client's real jitter.
+                    if *jitter > 0.0 {
+                        sample["jitter"] = serde_json::json!(jitter);
+                    }
                 }
             }
         }
