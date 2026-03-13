@@ -464,7 +464,7 @@ impl Client {
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
-                            format!("{:.3} ms", 0.0_f64),
+                            "",
                             sender_lost, sender_total, sender_loss_pct,
                         );
                         println!(

@@ -195,7 +195,7 @@ pub async fn server_intervals(
 /// Matching is done by `interval_end` (relative seconds within the test,
 /// e.g. 1.0, 2.0 …) which is clock-agnostic and works across machines.
 ///
-/// Shape: `{ "client": [ { "timestamp", "interval_end", "throughput", "jitter", "packetLoss" }, … ] }`
+/// Shape: `{ "client": [ { "timestamp", "throughput", "jitter", "packetLoss" }, … ] }`
 pub async fn last_json_result(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
@@ -259,6 +259,13 @@ pub async fn last_json_result(
                     sample["jitter"] = serde_json::json!(jitter);
                 }
             }
+        }
+    }
+
+    // Remove the internal interval_end key before returning.
+    for sample in samples.iter_mut() {
+        if let Some(obj) = sample.as_object_mut() {
+            obj.remove("interval_end");
         }
     }
 
