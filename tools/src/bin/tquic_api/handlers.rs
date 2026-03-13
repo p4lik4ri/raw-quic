@@ -121,6 +121,8 @@ pub async fn client_start(
         req.mode == "uplink",
         std::sync::atomic::Ordering::Relaxed,
     );
+    // Store remote server API URL (may be None — that's fine).
+    *state.server_api_url.lock().await = req.server_api_url.clone();
     // Parse interval lines from client stdout into last_client (last session only).
     match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_client)), "client").await {
         Ok(child) => {
@@ -180,48 +182,77 @@ pub async fn server_intervals(
 
 /// `GET /LastJsonResult` — per-second samples for the last session.
 ///
-/// For **downlink** the client is the receiver so client samples already carry
-/// jitter; returned as-is.
+/// Client samples always form the base (throughput, packetLoss, timestamps).
+/// Server samples carry jitter (server is receiver in uplink mode).  The
+/// overlay source is chosen in this priority order:
+///   1. Local `last_server` store (same-host setup)
+///   2. Remote `{server_api_url}/server/intervals` (different-host setup)
 ///
-/// For **uplink** the server is the receiver.  Client samples carry throughput
-/// and packet-loss; server samples carry jitter.  The two stores are merged by
-/// nearest-timestamp (±1.5 s window) so minor clock skew between the two
-/// reporters never causes an out-of-bounds mis-alignment.
+/// Matching is done by `interval_end` (relative seconds within the test,
+/// e.g. 1.0, 2.0 …) which is clock-agnostic and works across machines.
 ///
-/// Shape: `{ "client": [ { "timestamp", "throughput", "jitter", "packetLoss" }, … ] }`
+/// Shape: `{ "client": [ { "timestamp", "interval_end", "throughput", "jitter", "packetLoss" }, … ] }`
 pub async fn last_json_result(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let mut samples = state.last_client.lock().await.clone();
 
-    let uplink = state.last_mode_uplink.load(std::sync::atomic::Ordering::Relaxed);
-    if uplink && !samples.is_empty() {
-        let srv = state.last_server.lock().await.clone();
+    if !samples.is_empty() {
+        // 1. Try local store.
+        let local_srv = state.last_server.lock().await.clone();
+
+        // 2. If local store is empty, try fetching from remote server API.
+        let srv: Vec<serde_json::Value> = if !local_srv.is_empty() {
+            local_srv
+        } else {
+            let url_opt = state.server_api_url.lock().await.clone();
+            if let Some(base_url) = url_opt {
+                let fetch_url = format!("{base_url}/server/intervals");
+                match reqwest::get(&fetch_url).await {
+                    Ok(resp) => {
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(v) => v["server"].as_array()
+                                .cloned()
+                                .unwrap_or_default(),
+                            Err(e) => {
+                                log::warn!("[last_json_result] parse remote intervals: {e}");
+                                vec![]
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("[last_json_result] fetch {fetch_url}: {e}");
+                        vec![]
+                    }
+                }
+            } else {
+                vec![]
+            }
+        };
+
+        // Overlay server jitter onto client samples, matching by interval_end
+        // (relative seconds from test start).  This is immune to clock skew
+        // between machines because both sides count from their own t=0.
         if !srv.is_empty() {
-            // Build a lookup: for each server sample store (ts, jitter).
-            let srv_ts: Vec<(f64, f64)> = srv.iter().filter_map(|s| {
-                let ts     = s["timestamp"].as_f64()?;
+            let srv_idx: Vec<(f64, f64)> = srv.iter().filter_map(|s| {
+                let ie     = s["interval_end"].as_f64()?;
                 let jitter = s["jitter"].as_f64().unwrap_or(0.0);
-                Some((ts, jitter))
+                Some((ie, jitter))
             }).collect();
 
             for sample in samples.iter_mut() {
-                let client_ts = match sample["timestamp"].as_f64() {
+                let client_ie = match sample["interval_end"].as_f64() {
                     Some(t) => t,
                     None    => continue,
                 };
-                // Find the server sample whose timestamp is closest to this
-                // client sample (within a 1.5 s window).
-                let best = srv_ts.iter()
+                if let Some((_, jitter)) = srv_idx.iter()
                     .min_by(|(a, _), (b, _)| {
-                        let da = (a - client_ts).abs();
-                        let db = (b - client_ts).abs();
-                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                if let Some((srv_t, jitter)) = best {
-                    if (srv_t - client_ts).abs() <= 1.5 {
-                        sample["jitter"] = serde_json::json!(jitter);
-                    }
+                        (a - client_ie).abs()
+                            .partial_cmp(&(b - client_ie).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                {
+                    sample["jitter"] = serde_json::json!(jitter);
                 }
             }
         }

@@ -66,6 +66,7 @@ async fn main() {
         last_client: Arc::new(Mutex::new(Vec::new())),
         last_server: Arc::new(Mutex::new(Vec::new())),
         last_mode_uplink: Arc::new(AtomicBool::new(false)),
+        server_api_url: Arc::new(Mutex::new(None)),
     });
 
     let app = Router::new()

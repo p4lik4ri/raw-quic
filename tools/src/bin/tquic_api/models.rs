@@ -75,6 +75,13 @@ pub struct ClientStartRequest {
     /// Working directory for the child process.
     pub work_dir: Option<String>,
 
+    /// URL of the remote tquic_api instance running on the server machine,
+    /// e.g. "http://192.168.1.5:8000".  When set, /LastJsonResult will fetch
+    /// /server/intervals from that URL to overlay real jitter values onto the
+    /// client samples (necessary in uplink mode when the two APIs run on
+    /// different hosts and cannot share in-process state).
+    pub server_api_url: Option<String>,
+
     #[serde(default)]
     pub extra_args: Vec<String>,
 }

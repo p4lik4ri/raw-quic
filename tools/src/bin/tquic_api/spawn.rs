@@ -64,16 +64,26 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         (0.0_f64, 0.0_f64)
     };
 
+    // Parse the interval-end second from "N.NN-M.MM" so both client and
+    // server samples can be matched by relative test time regardless of
+    // wall-clock differences between machines.
+    let interval_end: f64 = parts[0]
+        .splitn(2, '-')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
 
     Some(serde_json::json!({
-        "timestamp":  ts,
-        "throughput": bitrate_mbps,
-        "jitter":     jitter_ms,
-        "packetLoss": loss_pct,
+        "timestamp":    ts,
+        "interval_end": interval_end,
+        "throughput":   bitrate_mbps,
+        "jitter":       jitter_ms,
+        "packetLoss":   loss_pct,
     }))
 }
 

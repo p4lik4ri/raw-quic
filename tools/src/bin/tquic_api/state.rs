@@ -96,4 +96,9 @@ pub struct AppState {
     /// True when the last client/start request used mode="uplink".
     /// Used by /LastJsonResult to pick the right sample store.
     pub last_mode_uplink: Arc<AtomicBool>,
+    /// Optional URL of the remote tquic_api on the server machine
+    /// (e.g. "http://192.168.1.5:8000").  Set by /client/start when the
+    /// caller supplies server_api_url.  /LastJsonResult will fetch
+    /// /server/intervals from this URL when last_server is empty.
+    pub server_api_url: Arc<Mutex<Option<String>>>,
 }
