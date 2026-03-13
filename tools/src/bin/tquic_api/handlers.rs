@@ -121,8 +121,12 @@ pub async fn client_start(
         req.mode == "uplink",
         std::sync::atomic::Ordering::Relaxed,
     );
-    // Store remote server API URL (may be None — that's fine).
-    *state.server_api_url.lock().await = req.server_api_url.clone();
+    // Derive the remote server API URL from the connect_to host.
+    // connect_to is "host:port" — we reuse the host with the default API port 8000.
+    let derived_server_api_url = req.connect_to
+        .rsplit_once(':')
+        .map(|(host, _)| format!("http://{}:8000", host));
+    *state.server_api_url.lock().await = derived_server_api_url;
     // Parse interval lines from client stdout into last_client (last session only).
     match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_client)), "client").await {
         Ok(child) => {
