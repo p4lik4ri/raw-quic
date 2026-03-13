@@ -157,18 +157,31 @@ pub async fn overall_status(
 }
 
 /// Returns the per-second samples from the last session as JSON.
-/// In uplink mode, samples come from the server (receiver, has real jitter).
-/// In downlink mode, samples come from the client (receiver, has real jitter).
+/// Always uses client samples as the base (non-empty for both modes).
+/// For uplink, overlays server-measured jitter by interval index when available
+/// (requires the server to have been (re)started via /server/start this session).
 /// Shape: `{ "client": [ { "timestamp", "throughput", "jitter", "packetLoss" }, … ] }`
 pub async fn last_json_result(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
+    let mut samples = state.last_client.lock().await.clone();
+
+    // Uplink: client has no jitter (it's the sender). Overlay server-side jitter
+    // values when they exist — fall back to 0.0 gracefully if the server store
+    // is empty (e.g. the server was already running before /server/start was called).
     let uplink = state.last_mode_uplink.load(std::sync::atomic::Ordering::Relaxed);
-    let samples = if uplink {
-        state.last_server.lock().await.clone()
-    } else {
-        state.last_client.lock().await.clone()
-    };
+    if uplink && !samples.is_empty() {
+        let srv = state.last_server.lock().await;
+        if !srv.is_empty() {
+            for (i, sample) in samples.iter_mut().enumerate() {
+                let srv_jitter = srv.get(i)
+                    .and_then(|s| s["jitter"].as_f64())
+                    .unwrap_or(0.0);
+                sample["jitter"] = serde_json::json!(srv_jitter);
+            }
+        }
+    }
+
     Json(serde_json::json!({ "client": samples }))
 }
 
