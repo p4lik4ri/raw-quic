@@ -287,6 +287,8 @@ struct Client {
     duration_expired: Arc<AtomicBool>,
     /// Set by main thread to stop the reporter thread.
     reporting_done: Arc<AtomicBool>,
+    /// Actual test duration in f64 bits, set just before signaling reporting_done.
+    actual_duration_bits: Arc<AtomicU64>,
 }
 
 impl Client {
@@ -308,6 +310,7 @@ impl Client {
             server_sent:   Arc::new(AtomicU64::new(0)),
             duration_expired: Arc::new(AtomicBool::new(false)),
             reporting_done: Arc::new(AtomicBool::new(false)),
+            actual_duration_bits: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -322,7 +325,8 @@ impl Client {
         let reporter_srv_jitter = Arc::clone(&self.server_jitter);
         let reporter_srv_lost   = Arc::clone(&self.server_lost);
         let reporter_srv_sent   = Arc::clone(&self.server_sent);
-        let reporter_done    = Arc::clone(&self.reporting_done);
+        let reporter_done     = Arc::clone(&self.reporting_done);
+        let reporter_duration = Arc::clone(&self.actual_duration_bits);
         let reporter_mode    = self.option.mode;
         let reporter_handle = thread::spawn(move || {
             let direction = match reporter_mode {
@@ -398,7 +402,10 @@ impl Client {
             let cur_sent  = reporter_sent.load(Ordering::Relaxed);
             let jitter_ms = f64::from_bits(reporter_jitter.load(Ordering::Relaxed));
             if current > 0 {
-                let total_secs = interval.max(1) as f64;
+                let total_secs = {
+                    let d = f64::from_bits(reporter_duration.load(Ordering::Relaxed));
+                    if d > 0.0 { d } else { interval.max(1) as f64 }
+                };
                 let total_mb   = current as f64 / 1e6;
                 let total_mbps = (current as f64 * 8.0) / 1e6 / total_secs;
                 println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
@@ -409,25 +416,24 @@ impl Client {
                 match reporter_mode {
                     TransferMode::Uplink => {
                         let srv_jitter_ms = f64::from_bits(reporter_srv_jitter.load(Ordering::Relaxed));
-                        let srv_lost      = reporter_srv_lost.load(Ordering::Relaxed);
-                        let loss_pct = if cur_sent > 0 { srv_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
-                        // Sender row: from the sender's perspective, 0 loss.
+                        let loss_pct = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
+                        // Sender row: leave jitter blank (sender cannot measure it).
                         println!(
-                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.0}%)  sender",
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  sender",
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
-                            format!("{:.3} ms", 0.0_f64),
-                            0u64, cur_sent, 0.0_f64,
+                            "",
+                            cur_lost, cur_sent, loss_pct,
                         );
-                        // Receiver row: server-measured jitter and loss.
+                        // Receiver row: server-measured jitter; client loss count for consistency.
                         println!(
                             "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
                             format!("{:.3} ms", srv_jitter_ms),
-                            srv_lost, cur_sent, loss_pct,
+                            cur_lost, cur_sent, loss_pct,
                         );
                     }
                     TransferMode::Downlink => {
@@ -480,6 +486,13 @@ impl Client {
         }
         for h in handles { h.join().unwrap(); }
 
+        // Compute actual test duration and share it with the reporter thread
+        // so the final summary uses the real elapsed time, not interval count.
+        let actual_secs = {
+            let ctx = self.context.lock().unwrap();
+            (ctx.end_time.unwrap_or_else(Instant::now) - self.start_time).as_secs_f64()
+        };
+        self.actual_duration_bits.store(actual_secs.to_bits(), Ordering::Relaxed);
         // Signal reporter to stop, wait for it to flush the last interval.
         self.reporting_done.store(true, Ordering::Relaxed);
         reporter_handle.join().unwrap();
@@ -511,9 +524,13 @@ impl Client {
         let sent  = ctx.conn_stats.sent_count;
         let lost  = ctx.conn_stats.lost_count;
         let loss_pct = if sent > 0 { lost as f64 / sent as f64 * 100.0 } else { 0.0 };
+        let jitter_ms = match ctx.mode {
+            TransferMode::Downlink => ctx.jitter_ms,
+            TransferMode::Uplink   => f64::from_bits(self.server_jitter.load(Ordering::Relaxed)),
+        };
         println!(
             "  Jitter    : {:.3} ms",
-            ctx.jitter_ms,
+            jitter_ms,
         );
         println!(
             "  Pkts  recv/sent/lost : {}/{}/{}  ({:.2}% loss)",
