@@ -160,28 +160,69 @@ pub async fn overall_status(
     Json(OverallStatus { server, client })
 }
 
-/// Returns the per-second samples from the last session as JSON.
-/// Always uses client samples as the base (non-empty for both modes).
-/// For uplink, overlays server-measured jitter by interval index when available
-/// (requires the server to have been (re)started via /server/start this session).
+/// `GET /client/intervals` — raw per-second samples parsed from the last client session.
+pub async fn client_intervals(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let samples = state.last_client.lock().await.clone();
+    Json(serde_json::json!({ "client": samples }))
+}
+
+/// `GET /server/intervals` — raw per-second samples parsed from the last server session.
+/// In uplink mode the server is the receiver so these rows carry real jitter values.
+/// Cleared at the start of each new `/client/start` call.
+pub async fn server_intervals(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let samples = state.last_server.lock().await.clone();
+    Json(serde_json::json!({ "server": samples }))
+}
+
+/// `GET /LastJsonResult` — per-second samples for the last session.
+///
+/// For **downlink** the client is the receiver so client samples already carry
+/// jitter; returned as-is.
+///
+/// For **uplink** the server is the receiver.  Client samples carry throughput
+/// and packet-loss; server samples carry jitter.  The two stores are merged by
+/// nearest-timestamp (±1.5 s window) so minor clock skew between the two
+/// reporters never causes an out-of-bounds mis-alignment.
+///
 /// Shape: `{ "client": [ { "timestamp", "throughput", "jitter", "packetLoss" }, … ] }`
 pub async fn last_json_result(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let mut samples = state.last_client.lock().await.clone();
 
-    // Uplink: client has no jitter (it's the sender). Overlay server-side jitter
-    // values when they exist — fall back to 0.0 gracefully if the server store
-    // is empty (e.g. the server was already running before /server/start was called).
     let uplink = state.last_mode_uplink.load(std::sync::atomic::Ordering::Relaxed);
     if uplink && !samples.is_empty() {
-        let srv = state.last_server.lock().await;
+        let srv = state.last_server.lock().await.clone();
         if !srv.is_empty() {
-            for (i, sample) in samples.iter_mut().enumerate() {
-                let srv_jitter = srv.get(i)
-                    .and_then(|s| s["jitter"].as_f64())
-                    .unwrap_or(0.0);
-                sample["jitter"] = serde_json::json!(srv_jitter);
+            // Build a lookup: for each server sample store (ts, jitter).
+            let srv_ts: Vec<(f64, f64)> = srv.iter().filter_map(|s| {
+                let ts     = s["timestamp"].as_f64()?;
+                let jitter = s["jitter"].as_f64().unwrap_or(0.0);
+                Some((ts, jitter))
+            }).collect();
+
+            for sample in samples.iter_mut() {
+                let client_ts = match sample["timestamp"].as_f64() {
+                    Some(t) => t,
+                    None    => continue,
+                };
+                // Find the server sample whose timestamp is closest to this
+                // client sample (within a 1.5 s window).
+                let best = srv_ts.iter()
+                    .min_by(|(a, _), (b, _)| {
+                        let da = (a - client_ts).abs();
+                        let db = (b - client_ts).abs();
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                if let Some((srv_t, jitter)) = best {
+                    if (srv_t - client_ts).abs() <= 1.5 {
+                        sample["jitter"] = serde_json::json!(jitter);
+                    }
+                }
             }
         }
     }

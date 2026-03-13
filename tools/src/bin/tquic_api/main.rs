@@ -34,8 +34,8 @@ use axum::routing::{get, post};
 use tokio::sync::Mutex;
 
 use handlers::{
-    client_start, client_status, client_stop,
-    last_json_result, overall_status,
+    client_start, client_status, client_stop, client_intervals,
+    last_json_result, overall_status, server_intervals,
     server_last_json_result, server_start, server_status, server_stop,
 };
 use state::{AppState, ProcessState};
@@ -72,10 +72,12 @@ async fn main() {
         .route("/server/start",           post(server_start))
         .route("/server/stop",            post(server_stop))
         .route("/server/status",          get(server_status))
-        .route("/server/LastJsonResult",  get(server_last_json_result)) //Not need maybe remove it
+        .route("/server/intervals",       get(server_intervals))
+        .route("/server/LastJsonResult",  get(server_last_json_result))
         .route("/client/start",           post(client_start))
         .route("/client/stop",            post(client_stop))
         .route("/client/status",          get(client_status))
+        .route("/client/intervals",       get(client_intervals))
         .route("/status",                 get(overall_status))
         .route("/LastJsonResult",         get(last_json_result))
         .layer(axum::middleware::from_fn(middleware::log_request))
