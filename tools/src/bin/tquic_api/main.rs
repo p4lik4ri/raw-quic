@@ -26,6 +26,7 @@ mod state;
 
 use std::env;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use axum::Router;
@@ -63,6 +64,8 @@ async fn main() {
         client:      Mutex::new(ProcessState::new()),
         bin_dir:     bin_dir.clone(),
         last_client: Arc::new(Mutex::new(Vec::new())),
+        last_server: Arc::new(Mutex::new(Vec::new())),
+        last_mode_uplink: Arc::new(AtomicBool::new(false)),
     });
 
     let app = Router::new()

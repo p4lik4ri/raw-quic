@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -89,4 +90,10 @@ pub struct AppState {
     /// Per-second interval samples from the most recent client session.
     /// Cleared automatically on each new /client/start call.
     pub last_client: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// Per-second interval samples from the most recent server session.
+    /// Cleared automatically on each new /server/start call.
+    pub last_server: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// True when the last client/start request used mode="uplink".
+    /// Used by /LastJsonResult to pick the right sample store.
+    pub last_mode_uplink: Arc<AtomicBool>,
 }

@@ -374,6 +374,11 @@ impl Client {
                 interval   += 1;
                 let mb   = delta as f64 / 1e6;
                 let mbps = (delta as f64 * 8.0) / 1e6;
+                // Break *before* printing if the test has ended, so the stray
+                // partial interval (caused by a write that landed between the
+                // t=Ns reporter snapshot and duration_expired firing) is suppressed.
+                // The summary rows below still cover the correct totals.
+                if done { break; }
                 if delta > 0 {
                     match reporter_mode {
                         TransferMode::Downlink => {
@@ -399,7 +404,6 @@ impl Client {
                     }
                     let _ = std::io::stdout().flush();
                 }
-                if done { break; }
             }
             // ─── Separator + two-line summary (like iperf3) ───────────────────
             let current   = reporter_live.load(Ordering::Relaxed);

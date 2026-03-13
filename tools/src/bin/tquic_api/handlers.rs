@@ -47,9 +47,9 @@ pub async fn server_start(
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
-    // Server stdout is captured for /server/status but not parsed for metrics —
-    // all interval metrics come from the client side.
-    match spawn_and_capture(cmd, Arc::clone(&proc.output), None, "server").await {
+    // Parse server stdout into last_server: the server is the receiver in
+    // uplink mode, so its interval rows contain real jitter values.
+    match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_server)), "server").await {
         Ok(child) => {
             let pid = child.id();
             proc.child = Some(child);
@@ -112,6 +112,11 @@ pub async fn client_start(
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
+    // Remember the mode so /LastJsonResult can pick the right sample store.
+    state.last_mode_uplink.store(
+        req.mode == "uplink",
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // Parse interval lines from client stdout into last_client (last session only).
     match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_client)), "client").await {
         Ok(child) => {
@@ -151,12 +156,19 @@ pub async fn overall_status(
     Json(OverallStatus { server, client })
 }
 
-/// Returns the client-side per-second samples from the last session as JSON.
+/// Returns the per-second samples from the last session as JSON.
+/// In uplink mode, samples come from the server (receiver, has real jitter).
+/// In downlink mode, samples come from the client (receiver, has real jitter).
 /// Shape: `{ "client": [ { "timestamp", "throughput", "jitter", "packetLoss" }, … ] }`
 pub async fn last_json_result(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let samples = state.last_client.lock().await.clone();
+    let uplink = state.last_mode_uplink.load(std::sync::atomic::Ordering::Relaxed);
+    let samples = if uplink {
+        state.last_server.lock().await.clone()
+    } else {
+        state.last_client.lock().await.clone()
+    };
     Json(serde_json::json!({ "client": samples }))
 }
 
