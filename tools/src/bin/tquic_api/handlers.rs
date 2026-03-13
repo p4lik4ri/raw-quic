@@ -186,11 +186,10 @@ pub async fn server_intervals(
 
 /// `GET /LastJsonResult` — per-second samples for the last session.
 ///
-/// Client samples always form the base (throughput, packetLoss, timestamps).
-/// Server samples carry jitter (server is receiver in uplink mode).  The
-/// overlay source is chosen in this priority order:
-///   1. Local `last_server` store (same-host setup)
-///   2. Remote `{server_api_url}/server/intervals` (different-host setup)
+/// The authoritative "receiver" side is chosen by mode:
+///   - **Downlink** (server→client): client is receiver → use `last_client`
+///   - **Uplink**   (client→server): server is receiver → use `last_server`
+///                                   (fetched locally or from remote API)
 ///
 /// Matching is done by `interval_end` (relative seconds within the test,
 /// e.g. 1.0, 2.0 …) which is clock-agnostic and works across machines.
@@ -199,73 +198,36 @@ pub async fn server_intervals(
 pub async fn last_json_result(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let mut samples = state.last_client.lock().await.clone();
+    let uplink = state.last_mode_uplink.load(std::sync::atomic::Ordering::Relaxed);
 
-    if !samples.is_empty() {
-        // 1. Try local store.
-        let local_srv = state.last_server.lock().await.clone();
-
-        // 2. If local store is empty, try fetching from remote server API.
-        let srv: Vec<serde_json::Value> = if !local_srv.is_empty() {
-            local_srv
-        } else {
-            let url_opt = state.server_api_url.lock().await.clone();
-            if let Some(base_url) = url_opt {
-                let fetch_url = format!("{base_url}/server/intervals");
-                match reqwest::get(&fetch_url).await {
-                    Ok(resp) => {
-                        match resp.json::<serde_json::Value>().await {
-                            Ok(v) => v["server"].as_array()
-                                .cloned()
-                                .unwrap_or_default(),
-                            Err(e) => {
-                                log::warn!("[last_json_result] parse remote intervals: {e}");
-                                vec![]
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("[last_json_result] fetch {fetch_url}: {e}");
-                        vec![]
-                    }
-                }
-            } else {
-                vec![]
-            }
-        };
-
-        // Overlay server jitter onto client samples, matching by interval_end
-        // (relative seconds from test start).  This is immune to clock skew
-        // between machines because both sides count from their own t=0.
-        if !srv.is_empty() {
-            let srv_idx: Vec<(f64, f64)> = srv.iter().filter_map(|s| {
-                let ie     = s["interval_end"].as_f64()?;
-                let jitter = s["jitter"].as_f64().unwrap_or(0.0);
-                Some((ie, jitter))
-            }).collect();
-
-            for sample in samples.iter_mut() {
-                let client_ie = match sample["interval_end"].as_f64() {
-                    Some(t) => t,
-                    None    => continue,
-                };
-                if let Some((_, jitter)) = srv_idx.iter()
-                    .min_by(|(a, _), (b, _)| {
-                        (a - client_ie).abs()
-                            .partial_cmp(&(b - client_ie).abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                {
-                    // Only overlay when the server actually measured jitter (i.e. server
-                    // is the receiver = uplink mode).  In downlink the server is the sender
-                    // and its jitter is 0.0; overwriting would erase the client's real jitter.
-                    if *jitter > 0.0 {
-                        sample["jitter"] = serde_json::json!(jitter);
-                    }
-                }
+    // Helper: fetch server intervals from local store or remote API.
+    async fn get_server_samples(state: &Arc<AppState>) -> Vec<serde_json::Value> {
+        let local = state.last_server.lock().await.clone();
+        if !local.is_empty() {
+            return local;
+        }
+        let url_opt = state.server_api_url.lock().await.clone();
+        if let Some(base_url) = url_opt {
+            let fetch_url = format!("{base_url}/server/intervals");
+            match reqwest::get(&fetch_url).await {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(v) => return v["server"].as_array().cloned().unwrap_or_default(),
+                    Err(e) => log::warn!("[last_json_result] parse remote intervals: {e}"),
+                },
+                Err(e) => log::warn!("[last_json_result] fetch {fetch_url}: {e}"),
             }
         }
+        vec![]
     }
+
+    let mut samples: Vec<serde_json::Value> = if uplink {
+        // In uplink the server is the receiver: it has the real throughput,
+        // jitter and packetLoss.  Use server intervals directly.
+        get_server_samples(&state).await
+    } else {
+        // In downlink the client is the receiver.
+        state.last_client.lock().await.clone()
+    };
 
     // Remove the internal interval_end key before returning.
     for sample in samples.iter_mut() {
