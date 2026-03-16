@@ -35,15 +35,29 @@ pub async fn server_start(
     cmd.args(["--listen", &req.listen]);
     cmd.args(["--congestion-control-algor", &req.congestion_control]);
     cmd.args(["--log-level", &req.log_level]);
+    if let Some(v) = req.initial_congestion_window { cmd.args(["--initial-congestion-window", &v.to_string()]); }
+    if let Some(v) = req.min_congestion_window     { cmd.args(["--min-congestion-window",     &v.to_string()]); }
+    if let Some(v) = req.send_udp_payload_size     { cmd.args(["--send-udp-payload-size",     &v.to_string()]); }
+    if let Some(v) = req.recv_udp_payload_size     { cmd.args(["--recv-udp-payload-size",     &v.to_string()]); }
+    if let Some(v) = req.handshake_timeout         { cmd.args(["--handshake-timeout",         &v.to_string()]); }
+    if let Some(v) = req.idle_timeout              { cmd.args(["--idle-timeout",              &v.to_string()]); }
+    if let Some(v) = req.initial_rtt               { cmd.args(["--initial-rtt",               &v.to_string()]); }
+    if let Some(v) = req.pto_linear_factor         { cmd.args(["--pto-linear-factor",         &v.to_string()]); }
+    if let Some(v) = req.max_pto                   { cmd.args(["--max-pto",                   &v.to_string()]); }
+    if let Some(v) = req.anti_amplification_factor { cmd.args(["--anti-amplification-factor", &v.to_string()]); }
+    if let Some(v) = req.send_batch_size           { cmd.args(["--send-batch-size",           &v.to_string()]); }
+    if let Some(v) = req.zerortt_buffer_size       { cmd.args(["--zerortt-buffer-size",       &v.to_string()]); }
     if req.enable_multipath {
         cmd.arg("--enable-multipath");
         if let Some(algor) = &req.multipath_algor {
             cmd.args(["--multipath-algor", algor]);
         }
     }
-    if let Some(keylog) = &req.keylog_file {
-        cmd.args(["--keylog-file", keylog]);
-    }
+    if req.enable_retry       { cmd.arg("--enable-retry"); }
+    if req.disable_encryption { cmd.arg("--disable-encryption"); }
+    if let Some(keylog) = &req.keylog_file { cmd.args(["--keylog-file", keylog]); }
+    if let Some(lf)    = &req.log_file    { cmd.args(["--log-file",    lf]); }
+    if let Some(qd)    = &req.qlog_dir    { cmd.args(["--qlog-dir",    qd]); }
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
@@ -103,12 +117,29 @@ pub async fn client_start(
     if let Some(d)  = req.duration          { cmd.args(["--duration",         &d.to_string()]); }
     if let Some(s)  = req.streams_per_conn  { cmd.args(["--streams-per-conn", &s.to_string()]); }
     if let Some(bw) = &req.bandwidth        { cmd.args(["--bandwidth",         bw]); }
+    if let Some(v) = req.threads                  { cmd.args(["--threads",                  &v.to_string()]); }
+    if let Some(v) = req.max_concurrent_conns     { cmd.args(["--max-concurrent-conns",     &v.to_string()]); }
+    if let Some(v) = req.max_concurrent_requests  { cmd.args(["--max-concurrent-requests",  &v.to_string()]); }
+    if let Some(v) = req.initial_congestion_window { cmd.args(["--initial-congestion-window", &v.to_string()]); }
+    if let Some(v) = req.min_congestion_window     { cmd.args(["--min-congestion-window",     &v.to_string()]); }
+    if let Some(v) = req.send_udp_payload_size     { cmd.args(["--send-udp-payload-size",     &v.to_string()]); }
+    if let Some(v) = req.recv_udp_payload_size     { cmd.args(["--recv-udp-payload-size",     &v.to_string()]); }
+    if let Some(v) = req.handshake_timeout         { cmd.args(["--handshake-timeout",         &v.to_string()]); }
+    if let Some(v) = req.idle_timeout              { cmd.args(["--idle-timeout",              &v.to_string()]); }
+    if let Some(v) = req.initial_rtt               { cmd.args(["--initial-rtt",               &v.to_string()]); }
+    if let Some(v) = req.pto_linear_factor         { cmd.args(["--pto-linear-factor",         &v.to_string()]); }
+    if let Some(v) = req.max_pto                   { cmd.args(["--max-pto",                   &v.to_string()]); }
+    if let Some(v) = req.send_batch_size           { cmd.args(["--send-batch-size",           &v.to_string()]); }
     if req.enable_multipath {
         cmd.arg("--enable-multipath");
         if let Some(algor) = &req.multipath_algor {
             cmd.args(["--multipath-algor", algor]);
         }
     }
+    if req.disable_encryption { cmd.arg("--disable-encryption"); }
+    if let Some(keylog) = &req.keylog_file { cmd.args(["--keylog-file", keylog]); }
+    if let Some(lf)    = &req.log_file    { cmd.args(["--log-file",    lf]); }
+    if let Some(qd)    = &req.qlog_dir    { cmd.args(["--qlog-dir",    qd]); }
     for a in &req.extra_args { cmd.arg(a); }
 
     proc.output.lock().await.clear();
