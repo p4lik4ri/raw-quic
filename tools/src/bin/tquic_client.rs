@@ -1189,6 +1189,26 @@ impl TransportHandler for WorkerHandler {
         }
         ctx.conn_finish += 1;
 
+        // Per-path breakdown (multipath).
+        let paths: Vec<_> = conn.paths_iter().collect();
+        if paths.len() > 1 {
+            info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
+            for (i, four_tuple) in paths.iter().enumerate() {
+                if let Ok(ps) = conn.get_path_stats(four_tuple.local, four_tuple.remote) {
+                    info!(
+                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  srtt={} µs",
+                        i,
+                        four_tuple.local,
+                        four_tuple.remote,
+                        ps.recv_bytes, ps.recv_count,
+                        ps.sent_bytes, ps.sent_count,
+                        ps.lost_bytes,
+                        ps.srtt,
+                    );
+                }
+            }
+        }
+
         let local_app_close = conn.local_error().map(|e| e.is_app).unwrap_or(false);
         let peer_app_close = conn.peer_error().map(|e| e.is_app).unwrap_or(false);
 
