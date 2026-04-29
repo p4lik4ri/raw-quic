@@ -355,7 +355,7 @@ impl Client {
                 ),
                 TransferMode::Uplink => println!(
                     "  {:<12}  {:>10}  {:>16}  {}",
-                    "Interval", "Transfer", "Bitrate", "Total Datagrams"
+                    "Interval", "Transfer", "Bitrate", "Lost/Total Datagrams"
                 ),
             }
             let _ = std::io::stdout().flush();
@@ -400,12 +400,13 @@ impl Client {
                             );
                         }
                         TransferMode::Uplink => {
+                            let loss_pct = if d_sent > 0 { d_lost as f64 / d_sent as f64 * 100.0 } else { 0.0 };
                             println!(
-                                "  {:<12}  {:>10}  {:>16}  {}",
+                                "  {:<12}  {:>10}  {:>16}  {}/{} ({:.2}%)",
                                 format!("{:.2}-{:.2} s", t_start, t_end),
                                 format!("{:.2} MB", mb),
                                 format!("{:.2} Mbits/sec", mbps),
-                                d_sent,
+                                d_lost, d_sent, loss_pct,
                             );
                         }
                     }
@@ -448,14 +449,22 @@ impl Client {
                             "",
                             cur_lost, cur_sent, loss_pct,
                         );
-                        // Receiver row: server-measured jitter; client loss count for consistency.
+                        // Receiver row: server-measured jitter + actual receiver loss
+                        // (datagrams sent by client minus datagrams received by server).
+                        let srv_recv = reporter_srv_sent.load(Ordering::Relaxed);
+                        let (recv_lost, recv_total) = if srv_recv > 0 {
+                            (cur_sent.saturating_sub(srv_recv), cur_sent)
+                        } else {
+                            (cur_lost, cur_sent)
+                        };
+                        let recv_loss_pct = if recv_total > 0 { recv_lost as f64 / recv_total as f64 * 100.0 } else { 0.0 };
                         println!(
                             "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
                             format!("{:.3} ms", srv_jitter_ms),
-                            cur_lost, cur_sent, loss_pct,
+                            recv_lost, recv_total, recv_loss_pct,
                         );
                     }
                     TransferMode::Downlink => {
@@ -557,7 +566,13 @@ impl Client {
                 let ss = self.server_sent.load(Ordering::Relaxed);
                 if ss > 0 { (ss, sl) } else { (ctx.conn_stats.sent_count, ctx.conn_stats.lost_count) }
             }
-            TransferMode::Uplink => (ctx.conn_stats.sent_count, ctx.conn_stats.lost_count),
+            TransferMode::Uplink => {
+                // server_sent holds server's recv_count for uplink (from stats reply).
+                let srv_recv = self.server_sent.load(Ordering::Relaxed);
+                let sent = ctx.conn_stats.sent_count;
+                let lost = if srv_recv > 0 { sent.saturating_sub(srv_recv) } else { ctx.conn_stats.lost_count };
+                (sent, lost)
+            }
         };
         let loss_pct = if sent > 0 { lost as f64 / sent as f64 * 100.0 } else { 0.0 };
         let jitter_ms = match ctx.mode {
@@ -1363,9 +1378,10 @@ impl TransportHandler for WorkerHandler {
                             recv.server_reply_buf.extend_from_slice(&self.recv_buf[..n]);
                             if recv.server_reply_buf.len() >= 16 {
                                 let jb = u64::from_le_bytes(recv.server_reply_buf[0..8].try_into().unwrap());
-                                let lc = u64::from_le_bytes(recv.server_reply_buf[8..16].try_into().unwrap());
+                                // rc = server's received packet count (used to compute receiver loss).
+                                let rc = u64::from_le_bytes(recv.server_reply_buf[8..16].try_into().unwrap());
                                 self.server_jitter.store(jb, Ordering::Relaxed);
-                                self.server_lost.store(lc, Ordering::Relaxed);
+                                self.server_sent.store(rc, Ordering::Relaxed);
                             }
                         }
                         continue; // don't count as live_bytes

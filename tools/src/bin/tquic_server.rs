@@ -243,11 +243,13 @@ fn decode_trigger_buf(buf: &[u8], fin: bool) -> Option<TriggerDecision> {
 }
 
 /// Build the 16-byte reply sent back on an uplink stream after FIN:
-/// `[jitter_ms as f64 bits: u64 LE][lost_count: u64 LE]`.
-fn encode_uplink_stats_reply(jitter_bits: u64, lost_count: u64) -> [u8; 16] {
+/// `[jitter_ms as f64 bits: u64 LE][server_recv_count: u64 LE]`.
+/// The second field is the server's received packet count so the client can
+/// compute receiver loss as (client_sent_count − server_recv_count).
+fn encode_uplink_stats_reply(jitter_bits: u64, recv_count: u64) -> [u8; 16] {
     let mut reply = [0u8; 16];
     reply[0..8].copy_from_slice(&jitter_bits.to_le_bytes());
-    reply[8..16].copy_from_slice(&lost_count.to_le_bytes());
+    reply[8..16].copy_from_slice(&recv_count.to_le_bytes());
     reply
 }
 
@@ -512,7 +514,7 @@ impl ConnectionHandler {
         conn: &mut Connection,
         stream_id: u64,
         live_jitter: &Arc<AtomicU64>,
-        lost_count: u64,
+        recv_count: u64,
     ) {
         let state = match self.streams.get_mut(&stream_id) {
             Some(s) if s.ready && s.mode == TransferMode::Uplink => s,
@@ -572,7 +574,7 @@ impl ConnectionHandler {
         if got_fin && !state.reply_sent {
             state.reply_sent = true;
             let jitter_bits = live_jitter.load(Ordering::Relaxed);
-            let reply = encode_uplink_stats_reply(jitter_bits, lost_count);
+            let reply = encode_uplink_stats_reply(jitter_bits, recv_count);
             match conn.stream_write(stream_id, Bytes::copy_from_slice(&reply), true) {
                 Ok(_) => {}
                 Err(e) => error!("{} uplink reply write {}: {:?}", conn.trace_id(), stream_id, e),
@@ -765,16 +767,17 @@ impl TransportHandler for ServerHandler {
                 }
                 TransferMode::Uplink => {
                     self.is_uplink.store(true, Ordering::Relaxed);
-                    let lc = self.live_lost.load(Ordering::Relaxed);
+                    // live_sent on the server tracks conn.stats().recv_count for uplink.
+                    let rc = self.live_sent.load(Ordering::Relaxed);
                     if let Some(handler) = self.conns.get_mut(&idx) {
-                        handler.drain_uplink(conn, stream_id, &self.live_jitter, lc);
+                        handler.drain_uplink(conn, stream_id, &self.live_jitter, rc);
                     }
                 }
             }
         } else {
-            let lc = self.live_lost.load(Ordering::Relaxed);
+            let rc = self.live_sent.load(Ordering::Relaxed);
             if let Some(handler) = self.conns.get_mut(&idx) {
-                handler.drain_uplink(conn, stream_id, &self.live_jitter, lc);
+                handler.drain_uplink(conn, stream_id, &self.live_jitter, rc);
             }
         }
         // Update live uplink stats for the interval reporter.
