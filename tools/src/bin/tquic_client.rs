@@ -605,6 +605,12 @@ struct UplinkState {
     last_refill: Instant,
     /// True once we have sent the FIN (stream close) on this uplink stream.
     fin_sent: bool,
+    /// When this uplink stream started; used to stamp per-datagram send timestamps.
+    client_start: Instant,
+    /// Staging buffer for the current outgoing datagram (DATAGRAM_STRIDE bytes).
+    dg_buf: Vec<u8>,
+    /// How many bytes of dg_buf have already been written (0 = new datagram needed).
+    dg_buf_pos: usize,
 }
 
 /// Per-connection bookkeeping for both downlink receive and uplink send.
@@ -1028,7 +1034,8 @@ struct WorkerHandler {
     remote: SocketAddr,
     local_addresses: Vec<SocketAddr>,
     recv_buf: Vec<u8>,
-    /// Zero-filled send buffer used for uplink bulk transfers.
+    #[allow(dead_code)]
+    /// Zero-filled send buffer (kept for future use; uplink now uses per-stream dg_buf).
     send_buf: Vec<u8>,
     /// Shared live-byte counter for the interval reporter.
     live_bytes:  Arc<AtomicU64>,
@@ -1116,6 +1123,9 @@ impl WorkerHandler {
                             tokens: 0.0,
                             last_refill: Instant::now(),
                             fin_sent: false,
+                            client_start: Instant::now(),
+                            dg_buf: vec![0u8; DATAGRAM_STRIDE],
+                            dg_buf_pos: DATAGRAM_STRIDE, // sentinel: no partial datagram pending
                         });
                         _ = conn.stream_want_write(stream_id, true);
                         // Enable reads so the server's 16-byte reply can arrive.
@@ -1426,51 +1436,71 @@ impl TransportHandler for WorkerHandler {
             return;
         }
         loop {
-            // Token-bucket rate limiting.
+            // ── Flush any partially-written datagram from a previous QUIC backpressure stall ──
+            if state.dg_buf_pos < DATAGRAM_STRIDE {
+                let datagram_size = DATAGRAM_STRIDE;
+                while state.dg_buf_pos < datagram_size {
+                    let slice = &state.dg_buf[state.dg_buf_pos..datagram_size];
+                    match conn.stream_write(stream_id, Bytes::copy_from_slice(slice), false) {
+                        Ok(written) => {
+                            recv.bytes_sent += written as u64;
+                            self.live_bytes.fetch_add(written as u64, Ordering::Relaxed);
+                            if state.bandwidth_limit > 0 { state.tokens -= written as f64; }
+                            state.dg_buf_pos += written;
+                            let stats = conn.stats();
+                            self.live_lost.store(stats.lost_count, Ordering::Relaxed);
+                            self.live_sent.store(stats.sent_count, Ordering::Relaxed);
+                            if state.dg_buf_pos < datagram_size {
+                                _ = conn.stream_want_write(stream_id, true);
+                                return;
+                            }
+                        }
+                        Err(Error::Done) => { _ = conn.stream_want_write(stream_id, true); return; }
+                        Err(e) => { error!("{} uplink stream {} write: {:?}", conn.trace_id(), stream_id, e); return; }
+                    }
+                }
+            }
+
+            // ── Token-bucket rate limiting ─────────────────────────────────────────────────
+            // Require a full datagram's worth of tokens so we never split a datagram.
             if state.bandwidth_limit > 0 {
                 let now = Instant::now();
                 let elapsed = now.duration_since(state.last_refill).as_secs_f64();
                 state.tokens = (state.tokens + elapsed * state.bandwidth_limit as f64)
                     .min(state.bandwidth_limit as f64);
                 state.last_refill = now;
-                if state.tokens < 1.0 {
+                if state.tokens < DATAGRAM_STRIDE as f64 {
                     _ = conn.stream_want_write(stream_id, true);
                     return;
                 }
             }
-            let to_send = if state.bandwidth_limit > 0 {
-                self.send_buf.len().min(state.tokens as usize).max(1)
-            } else {
-                self.send_buf.len()
-            };
-            match conn.stream_write(
-                stream_id,
-                Bytes::copy_from_slice(&self.send_buf[..to_send]),
-                false,
-            ) {
-                Ok(written) => {
-                    recv.bytes_sent += written as u64;
-                    // Increment live_bytes by app bytes written; per-interval rows
-                    // show accurate per-second throughput from the sender's view.
-                    self.live_bytes.fetch_add(written as u64, Ordering::Relaxed);
-                    let stats = conn.stats();
-                    self.live_lost.store(stats.lost_count, Ordering::Relaxed);
-                    self.live_sent.store(stats.sent_count, Ordering::Relaxed);
-                    if state.bandwidth_limit > 0 {
-                        state.tokens -= written as f64;
+
+            // ── Build next datagram with embedded send timestamp ───────────────────────────
+            let ts_us = state.client_start.elapsed().as_micros() as u64;
+            state.dg_buf[0..8].copy_from_slice(&ts_us.to_le_bytes());
+            // remaining bytes stay as zeros (already zeroed at init / previous use)
+            state.dg_buf_pos = 0;
+            let datagram_size = DATAGRAM_STRIDE;
+
+            // ── Write the datagram (may require multiple calls on backpressure) ────────────
+            while state.dg_buf_pos < datagram_size {
+                let slice = &state.dg_buf[state.dg_buf_pos..datagram_size];
+                match conn.stream_write(stream_id, Bytes::copy_from_slice(slice), false) {
+                    Ok(written) => {
+                        recv.bytes_sent += written as u64;
+                        self.live_bytes.fetch_add(written as u64, Ordering::Relaxed);
+                        if state.bandwidth_limit > 0 { state.tokens -= written as f64; }
+                        state.dg_buf_pos += written;
+                        let stats = conn.stats();
+                        self.live_lost.store(stats.lost_count, Ordering::Relaxed);
+                        self.live_sent.store(stats.sent_count, Ordering::Relaxed);
+                        if state.dg_buf_pos < datagram_size {
+                            _ = conn.stream_want_write(stream_id, true);
+                            return;
+                        }
                     }
-                    if written < to_send {
-                        _ = conn.stream_want_write(stream_id, true);
-                        return;
-                    }
-                }
-                Err(Error::Done) => {
-                    _ = conn.stream_want_write(stream_id, true);
-                    return;
-                }
-                Err(e) => {
-                    error!("{} uplink stream {} write: {:?}", conn.trace_id(), stream_id, e);
-                    return;
+                    Err(Error::Done) => { _ = conn.stream_want_write(stream_id, true); return; }
+                    Err(e) => { error!("{} uplink stream {} write: {:?}", conn.trace_id(), stream_id, e); return; }
                 }
             }
         }

@@ -31,6 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use clap::Parser;
@@ -298,11 +300,16 @@ struct ConnectionHandler {
     prev_bytes_sent: u64,
     /// Snapshot of conn.stats().recv_bytes for uplink tracking.
     prev_bytes_recv: u64,
-    /// Last time on_stream_readable fired (for server-side jitter in uplink).
-    last_recv_time: Option<Instant>,
-    /// Previous inter-arrival interval in ms (for deviation calculation).
-    prev_interval_ms: f64,
-    /// RFC 3550-style running jitter (mean deviation of inter-arrival intervals).
+    // ─ Uplink jitter — per-datagram timestamp parser (mirrors client downlink) ─
+    /// Position within the current DATAGRAM_STRIDE block on the receive side.
+    dg_pos: usize,
+    /// Accumulates the 8-byte send-timestamp header of the datagram being parsed.
+    ts_partial_buf: [u8; 8],
+    /// Send timestamp (µs) of the most recently completed datagram header.
+    last_send_us: Option<u64>,
+    /// Wall-clock receive time (µs since UNIX epoch) of that datagram.
+    last_recv_us: Option<u64>,
+    /// RFC 3550 running jitter from per-datagram one-way delay variation.
     jitter_ms: f64,
 }
 
@@ -495,14 +502,16 @@ impl ConnectionHandler {
         }
     }
 
-    /// Drain incoming data on an uplink stream (client → server). Data is discarded.
-    /// When the client's FIN arrives, writes a 16-byte stats reply
-    /// [jitter_ms_f64_bits: u64 LE][lost_count: u64 LE] back with FIN.
+    /// Drain incoming data on an uplink stream (client → server).
+    /// Parses the DATAGRAM_STRIDE-aligned send timestamps embedded by the client
+    /// and computes RFC 3550 jitter from one-way delay variation (same method as
+    /// the client uses for downlink).  Publishes the result to `live_jitter`.
+    /// When the client's FIN arrives, writes a 16-byte stats reply back with FIN.
     fn drain_uplink(
         &mut self,
         conn: &mut Connection,
         stream_id: u64,
-        jitter_bits: u64,
+        live_jitter: &Arc<AtomicU64>,
         lost_count: u64,
     ) {
         let state = match self.streams.get_mut(&stream_id) {
@@ -513,10 +522,47 @@ impl ConnectionHandler {
         let mut got_fin = false;
         loop {
             match conn.stream_read(stream_id, &mut tmp) {
-                // FIN-only frame (0 bytes + fin): must check fin before discarding.
                 Ok((0, true)) => { got_fin = true; break; }
                 Ok((0, false)) | Err(Error::Done) => break,
-                Ok((_, fin)) => { if fin { got_fin = true; } }
+                Ok((n, fin)) => {
+                    if fin { got_fin = true; }
+                    // Parse per-datagram timestamps and update jitter.
+                    let recv_us = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64;
+                    let mut i = 0;
+                    while i < n {
+                        if self.dg_pos < 8 {
+                            let hdr_remain = 8 - self.dg_pos;
+                            let to_copy = hdr_remain.min(n - i);
+                            self.ts_partial_buf[self.dg_pos..self.dg_pos + to_copy]
+                                .copy_from_slice(&tmp[i..i + to_copy]);
+                            self.dg_pos += to_copy;
+                            i          += to_copy;
+                            if self.dg_pos == 8 {
+                                let send_us = u64::from_le_bytes(self.ts_partial_buf);
+                                if let (Some(ps), Some(pr)) = (self.last_send_us, self.last_recv_us) {
+                                    let rd = recv_us as i64 - pr as i64;
+                                    let sd = send_us as i64 - ps as i64;
+                                    let diff_ms = (rd - sd).unsigned_abs() as f64 / 1000.0;
+                                    self.jitter_ms += (diff_ms - self.jitter_ms) / 16.0;
+                                    live_jitter.store(self.jitter_ms.to_bits(), Ordering::Relaxed);
+                                }
+                                self.last_send_us = Some(send_us);
+                                self.last_recv_us = Some(recv_us);
+                            }
+                        } else {
+                            let payload_remain = DATAGRAM_STRIDE - self.dg_pos;
+                            let to_skip = payload_remain.min(n - i);
+                            self.dg_pos += to_skip;
+                            i           += to_skip;
+                            if self.dg_pos >= DATAGRAM_STRIDE {
+                                self.dg_pos = 0;
+                            }
+                        }
+                    }
+                }
                 Err(e) => {
                     error!("{} uplink drain {}: {:?}", conn.trace_id(), stream_id, e);
                     break;
@@ -525,6 +571,7 @@ impl ConnectionHandler {
         }
         if got_fin && !state.reply_sent {
             state.reply_sent = true;
+            let jitter_bits = live_jitter.load(Ordering::Relaxed);
             let reply = encode_uplink_stats_reply(jitter_bits, lost_count);
             match conn.stream_write(stream_id, Bytes::copy_from_slice(&reply), true) {
                 Ok(_) => {}
@@ -718,40 +765,27 @@ impl TransportHandler for ServerHandler {
                 }
                 TransferMode::Uplink => {
                     self.is_uplink.store(true, Ordering::Relaxed);
-                    let jb = self.live_jitter.load(Ordering::Relaxed);
                     let lc = self.live_lost.load(Ordering::Relaxed);
                     if let Some(handler) = self.conns.get_mut(&idx) {
-                        handler.drain_uplink(conn, stream_id, jb, lc);
+                        handler.drain_uplink(conn, stream_id, &self.live_jitter, lc);
                     }
                 }
             }
         } else {
-            let jb = self.live_jitter.load(Ordering::Relaxed);
             let lc = self.live_lost.load(Ordering::Relaxed);
             if let Some(handler) = self.conns.get_mut(&idx) {
-                handler.drain_uplink(conn, stream_id, jb, lc);
+                handler.drain_uplink(conn, stream_id, &self.live_jitter, lc);
             }
         }
         // Update live uplink stats for the interval reporter.
         if self.is_uplink.load(Ordering::Relaxed) {
             if let Some(handler) = self.conns.get_mut(&idx) {
                 let stats = conn.stats();
-                let now   = Instant::now();
                 let delta = stats.recv_bytes.saturating_sub(handler.prev_bytes_recv);
                 if delta > 0 {
                     handler.prev_bytes_recv = stats.recv_bytes;
                     self.live_bytes.fetch_add(delta, Ordering::Relaxed);
-                    if let Some(last) = handler.last_recv_time {
-                        let actual_ms = now.duration_since(last).as_secs_f64() * 1000.0;
-                        // Jitter = mean deviation of inter-arrival intervals (RFC 3550 §A.8 style)
-                        if handler.prev_interval_ms > 0.0 {
-                            let deviation = (actual_ms - handler.prev_interval_ms).abs();
-                            handler.jitter_ms += (deviation - handler.jitter_ms) / 16.0;
-                            self.live_jitter.store(handler.jitter_ms.to_bits(), Ordering::Relaxed);
-                        }
-                        handler.prev_interval_ms = actual_ms;
-                    }
-                    handler.last_recv_time = Some(now);
+                    // Jitter is now updated inside drain_uplink via per-datagram timestamps.
                 }
                 // For uplink server: "sent" = total datagrams received by server.
                 self.live_sent.store(stats.recv_count, Ordering::Relaxed);
