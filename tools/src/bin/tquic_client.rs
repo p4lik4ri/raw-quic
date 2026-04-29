@@ -299,6 +299,12 @@ struct Client {
     /// Exact QUIC-layer bytes sent (uplink) / received (downlink), set before signaling done.
     /// Used by the reporter summary rows so they match print_stats.
     final_bytes: Arc<AtomicU64>,
+    /// Elapsed seconds (f64 bits) snapped at the moment duration expired (not at conn close).
+    expiry_time: Arc<AtomicU64>,
+    /// Cumulative sent packet count snapped at duration-expiry across all connections.
+    expiry_sent: Arc<AtomicU64>,
+    /// Cumulative lost packet count snapped at duration-expiry across all connections.
+    expiry_lost: Arc<AtomicU64>,
 }
 
 impl Client {
@@ -322,6 +328,9 @@ impl Client {
             reporting_done: Arc::new(AtomicBool::new(false)),
             actual_duration_bits: Arc::new(AtomicU64::new(0)),
             final_bytes: Arc::new(AtomicU64::new(0)),
+            expiry_time: Arc::new(AtomicU64::new(0)),
+            expiry_sent: Arc::new(AtomicU64::new(0)),
+            expiry_lost: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -339,6 +348,8 @@ impl Client {
         let reporter_done     = Arc::clone(&self.reporting_done);
         let reporter_duration = Arc::clone(&self.actual_duration_bits);
         let reporter_final_bytes = Arc::clone(&self.final_bytes);
+        let reporter_expiry_sent = Arc::clone(&self.expiry_sent);
+        let reporter_expiry_lost = Arc::clone(&self.expiry_lost);
         let reporter_mode    = self.option.mode;
         let reporter_handle = thread::spawn(move || {
             let direction = match reporter_mode {
@@ -439,7 +450,12 @@ impl Client {
                 match reporter_mode {
                     TransferMode::Uplink => {
                         let srv_jitter_ms = f64::from_bits(reporter_srv_jitter.load(Ordering::Relaxed));
-                        let loss_pct = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
+                        // Use expiry-snapped counters so sender row reflects the test window,
+                        // not the satellite-latency tail after duration expired.
+                        let snap_sent = reporter_expiry_sent.load(Ordering::Relaxed);
+                        let snap_lost = reporter_expiry_lost.load(Ordering::Relaxed);
+                        let (s_sent, s_lost) = if snap_sent > 0 { (snap_sent, snap_lost) } else { (cur_sent, cur_lost) };
+                        let loss_pct = if s_sent > 0 { s_lost as f64 / s_sent as f64 * 100.0 } else { 0.0 };
                         // Sender row: leave jitter blank (sender cannot measure it).
                         println!(
                             "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  sender",
@@ -447,13 +463,13 @@ impl Client {
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
                             "",
-                            cur_lost, cur_sent, loss_pct,
+                            s_lost, s_sent, loss_pct,
                         );
                         // Receiver row: server-measured jitter + actual receiver loss
                         // (datagrams sent by client minus datagrams received by server).
                         let srv_recv = reporter_srv_sent.load(Ordering::Relaxed);
                         let (recv_lost, recv_total) = if srv_recv > 0 {
-                            (cur_sent.saturating_sub(srv_recv), cur_sent)
+                            (s_sent.saturating_sub(srv_recv), s_sent)
                         } else {
                             (cur_lost, cur_sent)
                         };
@@ -507,8 +523,11 @@ impl Client {
             let srv_lost   = Arc::clone(&self.server_lost);
             let srv_sent   = Arc::clone(&self.server_sent);
             let dur_exp    = Arc::clone(&self.duration_expired);
+            let exp_time   = Arc::clone(&self.expiry_time);
+            let exp_sent   = Arc::clone(&self.expiry_sent);
+            let exp_lost   = Arc::clone(&self.expiry_lost);
             handles.push(thread::spawn(move || {
-                Worker::new(opt, ctx, term, live, lost, sent, jitter, srv_jitter, srv_lost, srv_sent, dur_exp).unwrap().start().unwrap();
+                Worker::new(opt, ctx, term, live, lost, sent, jitter, srv_jitter, srv_lost, srv_sent, dur_exp, exp_time, exp_sent, exp_lost).unwrap().start().unwrap();
             }));
         }
         for h in handles { h.join().unwrap(); }
@@ -518,8 +537,14 @@ impl Client {
         // Also share the exact QUIC-layer byte total for consistent summary rows.
         {
             let ctx = self.context.lock().unwrap();
-            let actual_secs = (ctx.end_time.unwrap_or_else(Instant::now) - self.start_time)
-                .as_secs_f64();
+            // Use the expiry-time snapshot if available (preferred: duration = test window),
+            // fall back to connection-close time only if expiry was never set (e.g. SIGINT).
+            let actual_secs = {
+                let et = f64::from_bits(self.expiry_time.load(Ordering::Relaxed));
+                if et > 0.0 { et } else {
+                    (ctx.end_time.unwrap_or_else(Instant::now) - self.start_time).as_secs_f64()
+                }
+            };
             self.actual_duration_bits.store(actual_secs.to_bits(), Ordering::Relaxed);
             let final_bytes = match ctx.mode {
                 TransferMode::Uplink   => ctx.conn_stats.sent_bytes,
@@ -538,8 +563,14 @@ impl Client {
 
     fn print_stats(&self) {
         let ctx = self.context.lock().unwrap();
-        let duration = ctx.end_time.unwrap_or_else(Instant::now) - self.start_time;
-        let secs = duration.as_secs_f64().max(1e-9);
+        // Use expiry-time snapshot for duration so it reflects the test window,
+        // not the time to receive the server reply over a satellite link.
+        let secs = {
+            let et = f64::from_bits(self.expiry_time.load(Ordering::Relaxed));
+            if et > 0.0 { et } else {
+                (ctx.end_time.unwrap_or_else(Instant::now) - self.start_time).as_secs_f64()
+            }
+        }.max(1e-9);
         let (direction, bytes) = match ctx.mode {
             // Use QUIC-layer counters so Transfer always equals Bytes recv/sent.
             TransferMode::Downlink => ("server → client", ctx.conn_stats.recv_bytes),
@@ -558,8 +589,9 @@ impl Client {
             ctx.conn_total, ctx.conn_finish_success, ctx.conn_finish_failed,
         );
         let recv  = ctx.conn_stats.recv_count;
-        // For downlink, use the server-reported loss (sender-side QUIC transport).
-        // For uplink, use the client's own sent/lost counters.
+        // For downlink, use server-reported loss (sender-side QUIC transport).
+        // For uplink, use expiry-snapped counters so the satellite-latency tail
+        // (retransmissions in-flight after duration expired) is excluded.
         let (sent, lost) = match ctx.mode {
             TransferMode::Downlink => {
                 let sl = self.server_lost.load(Ordering::Relaxed);
@@ -567,11 +599,16 @@ impl Client {
                 if ss > 0 { (ss, sl) } else { (ctx.conn_stats.sent_count, ctx.conn_stats.lost_count) }
             }
             TransferMode::Uplink => {
-                // server_sent holds server's recv_count for uplink (from stats reply).
-                let srv_recv = self.server_sent.load(Ordering::Relaxed);
-                let sent = ctx.conn_stats.sent_count;
-                let lost = if srv_recv > 0 { sent.saturating_sub(srv_recv) } else { ctx.conn_stats.lost_count };
-                (sent, lost)
+                let snap_sent = self.expiry_sent.load(Ordering::Relaxed);
+                let snap_lost = self.expiry_lost.load(Ordering::Relaxed);
+                if snap_sent > 0 {
+                    // server_sent holds server's recv_count for uplink (from stats reply).
+                    let srv_recv = self.server_sent.load(Ordering::Relaxed);
+                    let lost = if srv_recv > 0 { snap_sent.saturating_sub(srv_recv) } else { snap_lost };
+                    (snap_sent, lost)
+                } else {
+                    (ctx.conn_stats.sent_count, ctx.conn_stats.lost_count)
+                }
             }
         };
         let loss_pct = if sent > 0 { lost as f64 / sent as f64 * 100.0 } else { 0.0 };
@@ -720,6 +757,12 @@ struct Worker {
     duration_expired: Arc<AtomicBool>,
     /// Deadline after which we close even if no server reply was received.
     fin_deadline: Option<Instant>,
+    /// Elapsed seconds (f64 bits) snapped at the moment duration expired.
+    expiry_time: Arc<AtomicU64>,
+    /// Cumulative sent packets snapped at duration-expiry.
+    expiry_sent: Arc<AtomicU64>,
+    /// Cumulative lost packets snapped at duration-expiry.
+    expiry_lost: Arc<AtomicU64>,
     /// Written right before each endpoint.recv() call so WorkerHandler callbacks
     /// can read the OS-level packet receive time (µs since UNIX epoch).
     #[allow(dead_code)] current_pkt_recv_us: Arc<AtomicU64>,
@@ -738,6 +781,9 @@ impl Worker {
         server_lost:   Arc<AtomicU64>,
         server_sent:   Arc<AtomicU64>,
         duration_expired: Arc<AtomicBool>,
+        expiry_time: Arc<AtomicU64>,
+        expiry_sent: Arc<AtomicU64>,
+        expiry_lost: Arc<AtomicU64>,
     ) -> Result<Self> {
         let mut config = Config::new()?;
         config.enable_stateless_reset(!option.disable_stateless_reset);
@@ -834,6 +880,9 @@ impl Worker {
             server_sent,
             duration_expired,
             fin_deadline: None,
+            expiry_time,
+            expiry_sent,
+            expiry_lost,
             current_pkt_recv_us,
         })
     }
@@ -873,7 +922,14 @@ impl Worker {
             // Both uplink and downlink: signal expiry and wait for server stats reply.
             self.duration_expired.store(true, Ordering::Relaxed);
             if self.fin_deadline.is_none() {
-                self.fin_deadline = Some(Instant::now() + Duration::from_secs(2));
+                // Snap duration and packet counters NOW (before satellite latency tail).
+                let elapsed = (Instant::now() - self.start_time).as_secs_f64();
+                self.expiry_time.store(elapsed.to_bits(), Ordering::Relaxed);
+                let ctx = self.worker_ctx.borrow();
+                self.expiry_sent.fetch_add(ctx.conn_stats.sent_count, Ordering::Relaxed);
+                self.expiry_lost.fetch_add(ctx.conn_stats.lost_count, Ordering::Relaxed);
+                drop(ctx);
+                self.fin_deadline = Some(Instant::now() + Duration::from_secs(60));
             }
             return false;
         }
