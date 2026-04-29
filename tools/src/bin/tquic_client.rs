@@ -38,6 +38,8 @@ use std::time::Duration;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use clap::Parser;
@@ -224,6 +226,11 @@ pub struct ClientOpt {
 }
 
 const MAX_BUF_SIZE: usize = 65536;
+
+/// Size of one jitter-measurement datagram in the stream:
+/// 8-byte send-timestamp (µs since server start) followed by (DATAGRAM_STRIDE − 8) bytes of payload.
+/// Must match DATAGRAM_STRIDE in tquic_server.rs.
+const DATAGRAM_STRIDE: usize = 1400;
 
 /// Transfer direction — which side pumps bulk data.
 #[derive(Debug, Clone, Copy, PartialEq, Default, clap::ValueEnum)]
@@ -607,12 +614,16 @@ struct DataReceiver {
     streams_opened: u64,
     streams_finished: u64,
     uplink: HashMap<u64, UplinkState>,
-    /// RFC 3550 running interarrival jitter (ms).
+    /// RFC 3550 running jitter (ms), computed from per-datagram send/recv timestamps.
     jitter_ms: f64,
-    /// Timestamp of the last readable event, used for jitter calculation.
-    last_recv_time: Option<Instant>,
-    /// Previous interarrival interval (ms), used for RFC 3550 jitter (|d_i - d_{i-1}|).
-    prev_interval_ms: f64,
+    /// Position within the current DATAGRAM_STRIDE block (wraps 0..DATAGRAM_STRIDE).
+    dg_pos: usize,
+    /// Accumulates the 8-byte send-timestamp header for the datagram being parsed.
+    ts_partial_buf: [u8; 8],
+    /// Send timestamp (µs since server start) of the most recently completed datagram header.
+    last_send_us: Option<u64>,
+    /// Wall-clock receive time (µs since UNIX epoch) of the corresponding datagram.
+    last_recv_us: Option<u64>,
     /// Accumulator for the 16-byte server stats reply (uplink) or stats-request reply (downlink).
     server_reply_buf: Vec<u8>,
     /// True once a downlink stats request has been sent on this connection.
@@ -632,8 +643,10 @@ impl DataReceiver {
             streams_finished: 0,
             uplink: HashMap::new(),
             jitter_ms: 0.0,
-            last_recv_time: None,
-            prev_interval_ms: 0.0,
+            dg_pos: 0,
+            ts_partial_buf: [0u8; 8],
+            last_send_us: None,
+            last_recv_us: None,
             server_reply_buf: Vec::new(),
             stats_req_sent: false,
             stats_req_stream: None,
@@ -667,6 +680,9 @@ struct Worker {
     duration_expired: Arc<AtomicBool>,
     /// Deadline after which we close even if no server reply was received.
     fin_deadline: Option<Instant>,
+    /// Written right before each endpoint.recv() call so WorkerHandler callbacks
+    /// can read the OS-level packet receive time (µs since UNIX epoch).
+    #[allow(dead_code)] current_pkt_recv_us: Arc<AtomicU64>,
 }
 
 impl Worker {
@@ -719,6 +735,10 @@ impl Worker {
         let worker_ctx = Rc::new(RefCell::new(WorkerContext::with_option(&option)));
         let receivers = Rc::new(RefCell::new(FxHashMap::default()));
 
+        // Shared per-packet receive-time channel: Worker writes before endpoint.recv(),
+        // WorkerHandler reads inside on_stream_readable callbacks.
+        let current_pkt_recv_us = Arc::new(AtomicU64::new(0));
+
         let remote = option.connect_to;
         let local = if !option.local_addresses.is_empty() {
             SocketAddr::new(option.local_addresses[0], 0)
@@ -749,6 +769,7 @@ impl Worker {
             server_lost.clone(),
             server_sent.clone(),
             duration_expired.clone(),
+            current_pkt_recv_us.clone(),
         );
 
         Ok(Worker {
@@ -773,6 +794,7 @@ impl Worker {
             server_sent,
             duration_expired,
             fin_deadline: None,
+            current_pkt_recv_us,
         })
     }
 
@@ -956,6 +978,13 @@ impl Worker {
                     }
                     Err(e) => return Err(format!("socket recv: {:?}", e).into()),
                 };
+            // Record the OS-level packet receive time before handing the packet
+            // to the QUIC engine, so on_stream_readable callbacks can read it.
+            let pkt_recv_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+            self.current_pkt_recv_us.store(pkt_recv_us, Ordering::Relaxed);
             let pkt_info = PacketInfo { src: remote, dst: local, time: Instant::now() };
             if let Err(e) = self.endpoint.recv(&mut self.recv_buf[..len], &pkt_info) {
                 error!("endpoint recv: {:?}", e);
@@ -1013,6 +1042,10 @@ struct WorkerHandler {
     server_sent:   Arc<AtomicU64>,
     /// Signals that the test duration has expired; uplink streams should send FIN.
     duration_expired: Arc<AtomicBool>,
+    /// Per-packet receive timestamp (µs since UNIX epoch) written by process_read_event
+    /// immediately before calling endpoint.recv(), so on_stream_readable can read
+    /// the accurate OS-level arrival time for the current QUIC packet.
+    current_pkt_recv_us: Arc<AtomicU64>,
 }
 
 impl WorkerHandler {
@@ -1029,6 +1062,7 @@ impl WorkerHandler {
         server_lost:   Arc<AtomicU64>,
         server_sent:   Arc<AtomicU64>,
         duration_expired: Arc<AtomicBool>,
+        current_pkt_recv_us: Arc<AtomicU64>,
     ) -> Self {
         Self {
             option: option.clone(),
@@ -1046,6 +1080,7 @@ impl WorkerHandler {
             server_lost,
             server_sent,
             duration_expired,
+            current_pkt_recv_us,
         }
     }
 
@@ -1095,6 +1130,56 @@ impl WorkerHandler {
                 Err(e) => {
                     error!("{} trigger stream {}: {:?}", conn.trace_id(), stream_id, e);
                 }
+            }
+        }
+    }
+}
+
+// ─────────────────────────── Jitter helper ───────────────────────────────────
+
+/// Process `n` newly received stream bytes starting at `recv.dg_pos` within
+/// the current DATAGRAM_STRIDE block.  For each completed 8-byte send-timestamp
+/// header, compute one RFC 3550 jitter sample:
+///
+///   delta_transit = (recv_us_i − recv_us_{i−1}) − (send_us_i − send_us_{i−1})
+///   jitter += (|delta_transit| − jitter) / 16          [EWMA, α = 1/16]
+///
+/// This is identical to the method iperf3 UDP uses: clock offset between server
+/// and client cancels in the difference-of-differences, so no time sync is needed.
+/// `recv_us` must be a monotonically increasing µs counter (e.g., UNIX µs).
+fn process_jitter_timestamps(recv: &mut DataReceiver, data: &[u8], recv_us: u64) {
+    let mut i = 0;
+    let n = data.len();
+    while i < n {
+        if recv.dg_pos < 8 {
+            // Still consuming the 8-byte timestamp header.
+            let header_remain = 8 - recv.dg_pos;
+            let to_copy = header_remain.min(n - i);
+            recv.ts_partial_buf[recv.dg_pos..recv.dg_pos + to_copy]
+                .copy_from_slice(&data[i..i + to_copy]);
+            recv.dg_pos  += to_copy;
+            i            += to_copy;
+            if recv.dg_pos == 8 {
+                // Header complete – extract send timestamp and update jitter EWMA.
+                let send_us = u64::from_le_bytes(recv.ts_partial_buf);
+                if let (Some(prev_send), Some(prev_recv)) = (recv.last_send_us, recv.last_recv_us) {
+                    let recv_delta = recv_us as i64 - prev_recv as i64;
+                    let send_delta = send_us as i64 - prev_send as i64;
+                    let delta_transit_us = recv_delta - send_delta;
+                    let diff_ms = delta_transit_us.unsigned_abs() as f64 / 1000.0;
+                    recv.jitter_ms += (diff_ms - recv.jitter_ms) / 16.0;
+                }
+                recv.last_send_us = Some(send_us);
+                recv.last_recv_us = Some(recv_us);
+            }
+        } else {
+            // Payload region – skip to the end of this datagram.
+            let payload_remain = DATAGRAM_STRIDE - recv.dg_pos;
+            let to_skip = payload_remain.min(n - i);
+            recv.dg_pos += to_skip;
+            i           += to_skip;
+            if recv.dg_pos >= DATAGRAM_STRIDE {
+                recv.dg_pos = 0; // start of next datagram header
             }
         }
     }
@@ -1239,7 +1324,6 @@ impl TransportHandler for WorkerHandler {
 
     fn on_stream_readable(&mut self, conn: &mut Connection, stream_id: u64) {
         let idx = conn.index().unwrap();
-        let now = Instant::now();
         loop {
             match conn.stream_read(stream_id, &mut self.recv_buf) {
                 Ok((0, _)) | Err(Error::Done) => break,
@@ -1257,7 +1341,7 @@ impl TransportHandler for WorkerHandler {
                         }
                         continue; // don't count as live_bytes
                     }
-                    let n = n; let fin = _fin;
+                    let fin = _fin;
                     // Downlink receive path.
                     // Check if this is the stats-request reply stream.
                     let is_stats_stream = self.receivers.borrow()
@@ -1279,27 +1363,17 @@ impl TransportHandler for WorkerHandler {
                         continue; // don't count as live_bytes
                     }
                     // Normal downlink bulk data.
+                    // Read the per-packet OS receive time stamped by process_read_event
+                    // immediately before endpoint.recv() for this QUIC packet.
+                    let pkt_recv_us = self.current_pkt_recv_us.load(Ordering::Relaxed);
                     if let Some(recv) = self.receivers.borrow_mut().get_mut(&idx) {
                         recv.bytes_received += n as u64;
-                        // RFC 3550 §A.8 interarrival jitter: EWMA of |d_i - d_{i-1}|.
-                        //
-                        // `now` is captured once per on_stream_readable call, so every
-                        // stream_read() within the same event shares the same timestamp.
-                        // Only the FIRST read in each event has d > 0 (a real inter-event
-                        // gap); all subsequent reads in the tight loop give d = 0 and must
-                        // be skipped, otherwise jitter is poisoned by O(packets_per_event)
-                        // spurious |0 - prev_d| samples that push it toward prev_d.
-                        if let Some(last) = recv.last_recv_time {
-                            let d = now.duration_since(last).as_secs_f64() * 1000.0; // ms
-                            if d > 0.0 {
-                                // One update per readable event: |current_gap - previous_gap|.
-                                let diff = (d - recv.prev_interval_ms).abs();
-                                recv.jitter_ms += (diff - recv.jitter_ms) / 16.0;
-                                recv.prev_interval_ms = d;
-                            }
-                        }
-                        recv.last_recv_time = Some(now);
-                        // Publish current jitter as f64 bits.
+                        // RFC 3550 jitter from per-datagram send timestamps embedded by
+                        // the server.  process_jitter_timestamps walks the stream bytes,
+                        // extracts the 8-byte header at every DATAGRAM_STRIDE boundary,
+                        // and updates recv.jitter_ms as EWMA(|delta_transit|).
+                        process_jitter_timestamps(recv, &self.recv_buf[..n], pkt_recv_us);
+                        // Publish current jitter as f64 bits for the interval reporter.
                         self.live_jitter.store(recv.jitter_ms.to_bits(), Ordering::Relaxed);
                     }
                     // Count bytes toward transfer.

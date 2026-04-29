@@ -56,6 +56,11 @@ use tquic_tools::Result;
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+/// Size of one jitter-measurement datagram in the stream:
+/// 8-byte send-timestamp header followed by (DATAGRAM_STRIDE − 8) bytes of zeros.
+/// Must match the constant in tquic_client.rs.
+const DATAGRAM_STRIDE: usize = 1400;
+
 // ─────────────────────────────── CLI options ─────────────────────────────────
 
 #[derive(Parser, Debug)]
@@ -361,7 +366,12 @@ impl ConnectionHandler {
 
     /// Push as many bytes as possible; applies token-bucket rate limiting when
     /// `bandwidth_limit > 0`.  Registers `stream_want_write` on backpressure.
-    fn pump(&mut self, conn: &mut Connection, stream_id: u64, buf: &[u8]) {
+    ///
+    /// Each write is exactly DATAGRAM_STRIDE bytes (or fewer for the tail when
+    /// `send_size` is finite).  The first 8 bytes carry a send timestamp
+    /// (µs since `start_time`) so the client can compute RFC 3550 jitter from
+    /// one-way delay variation — the same method iperf3 UDP uses.
+    fn pump(&mut self, conn: &mut Connection, stream_id: u64, start_time: Instant) {
         let state = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => return,
@@ -370,6 +380,9 @@ impl ConnectionHandler {
         if state.finished || !state.ready {
             return;
         }
+
+        // Stack-allocated datagram buffer: 8-byte timestamp + zeros.
+        let mut datagram = [0u8; DATAGRAM_STRIDE];
 
         loop {
             // ── Token-bucket rate limiting ────────────────────────────────────
@@ -399,9 +412,9 @@ impl ConnectionHandler {
                     state.finished = true;
                     return;
                 }
-                remaining.min(buf.len())
+                remaining.min(DATAGRAM_STRIDE)
             } else {
-                buf.len()
+                DATAGRAM_STRIDE
             };
 
             // Honour token budget.
@@ -411,9 +424,13 @@ impl ConnectionHandler {
                 to_send
             };
 
+            // Stamp the send timestamp into bytes 0-7 of this datagram.
+            let ts_us = start_time.elapsed().as_micros() as u64;
+            datagram[0..8].copy_from_slice(&ts_us.to_le_bytes());
+
             match conn.stream_write(
                 stream_id,
-                Bytes::copy_from_slice(&buf[..to_send]),
+                Bytes::copy_from_slice(&datagram[..to_send]),
                 false,
             ) {
                 Ok(written) => {
@@ -481,9 +498,9 @@ impl ConnectionHandler {
 
 struct ServerHandler {
     conns: FxHashMap<u64, ConnectionHandler>,
-    /// Zero-filled send buffer.
-    send_buf: Vec<u8>,
     send_size: usize,
+    /// When the server started; used to stamp per-datagram send timestamps.
+    server_start: Instant,
     keylog: Option<File>,
     qlog_dir: Option<String>,
     /// Shared live counters for the interval reporter thread.
@@ -524,8 +541,8 @@ impl ServerHandler {
 
         Ok(Self {
             conns: FxHashMap::default(),
-            send_buf: vec![0u8; option.chunk_size],
             send_size: option.send_size,
+            server_start: Instant::now(),
             keylog,
             qlog_dir: option.qlog_dir.clone(),
             live_bytes,
@@ -655,9 +672,8 @@ impl TransportHandler for ServerHandler {
                 .unwrap_or(TransferMode::Downlink);
             match mode {
                 TransferMode::Downlink => {
-                    let send_buf = self.send_buf.clone();
                     if let Some(handler) = self.conns.get_mut(&idx) {
-                        handler.pump(conn, stream_id, &send_buf);
+                        handler.pump(conn, stream_id, self.server_start);
                     }
                 }
                 TransferMode::Uplink => {
@@ -714,9 +730,8 @@ impl TransportHandler for ServerHandler {
         if is_uplink_stream {
             return;
         }
-        let send_buf = self.send_buf.clone();
         if let Some(handler) = self.conns.get_mut(&idx) {
-            handler.pump(conn, stream_id, &send_buf);
+            handler.pump(conn, stream_id, self.server_start);
             // Update live downlink stats for the interval reporter.
             let stats = conn.stats();
             let delta = stats.sent_bytes.saturating_sub(handler.prev_bytes_sent);
