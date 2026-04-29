@@ -278,6 +278,13 @@ struct StreamSendState {
     reply_sent: bool,
     /// True if this stream is a stats-request stream (client sent 0xFF).
     is_stats_request: bool,
+    /// Staging buffer for the current datagram (DATAGRAM_STRIDE bytes).
+    /// We always build a full datagram before the first stream_write so that
+    /// QUIC flow-control backpressure never produces a partial write at a
+    /// datagram boundary.
+    dg_buf: Vec<u8>,
+    /// How many bytes of dg_buf have already been written to the stream.
+    dg_buf_pos: usize,
 }
 
 // ─────────────────────────── Per-connection handler ──────────────────────────
@@ -315,6 +322,8 @@ impl ConnectionHandler {
                 last_refill: Instant::now(),
                 reply_sent: false,
                 is_stats_request: false,
+                dg_buf: vec![0u8; DATAGRAM_STRIDE],
+                dg_buf_pos: DATAGRAM_STRIDE, // sentinel: no partial datagram pending
             },
         );
     }
@@ -385,23 +394,33 @@ impl ConnectionHandler {
         let mut datagram = [0u8; DATAGRAM_STRIDE];
 
         loop {
-            // ── Token-bucket rate limiting ────────────────────────────────────
-            if state.bandwidth_limit > 0 {
-                let now = Instant::now();
-                let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-                // Refill; cap at one second's worth of tokens (burst limit).
-                state.tokens = (state.tokens + elapsed * state.bandwidth_limit as f64)
-                    .min(state.bandwidth_limit as f64);
-                state.last_refill = now;
-
-                if state.tokens < 1.0 {
-                    // No tokens yet – re-register and wait for the next callback.
-                    _ = conn.stream_want_write(stream_id, true);
-                    return;
+            // ── Flush any partial datagram left from a previous backpressure stall ─
+            // If we returned early last time because QUIC couldn't accept the full
+            // datagram, finish flushing it before producing a new one.
+            if state.dg_buf_pos < DATAGRAM_STRIDE && state.bytes_sent > 0 {
+                let pending_size = state.dg_buf.len().min(DATAGRAM_STRIDE);
+                while state.dg_buf_pos < pending_size {
+                    let slice = &state.dg_buf[state.dg_buf_pos..pending_size];
+                    match conn.stream_write(stream_id, Bytes::copy_from_slice(slice), false) {
+                        Ok(written) => {
+                            state.bytes_sent  += written;
+                            state.dg_buf_pos  += written;
+                            if state.bandwidth_limit > 0 { state.tokens -= written as f64; }
+                            if state.dg_buf_pos < pending_size {
+                                _ = conn.stream_want_write(stream_id, true);
+                                return;
+                            }
+                        }
+                        Err(Error::Done) => { _ = conn.stream_want_write(stream_id, true); return; }
+                        Err(e) => { error!("{} stream {} write: {:?}", conn.trace_id(), stream_id, e); return; }
+                    }
                 }
             }
 
             // ── Determine chunk to write ──────────────────────────────────────
+            // Always send whole DATAGRAM_STRIDE datagrams so the client's
+            // fixed-stride timestamp parser stays in sync. A partial write
+            // would cause payload bytes to be misread as send-timestamps.
             let to_send = if self.send_size > 0 {
                 let remaining = self.send_size.saturating_sub(state.bytes_sent);
                 if remaining == 0 {
@@ -417,39 +436,60 @@ impl ConnectionHandler {
                 DATAGRAM_STRIDE
             };
 
-            // Honour token budget.
-            let to_send = if state.bandwidth_limit > 0 {
-                to_send.min(state.tokens as usize).max(1)
-            } else {
-                to_send
-            };
+            // ── Token-bucket rate limiting ────────────────────────────────────
+            // Refill first, then require a full datagram's worth of tokens.
+            // Never write a partial datagram — wait until we can send `to_send`
+            // bytes in one shot so the timestamp framing is never broken.
+            if state.bandwidth_limit > 0 {
+                let now = Instant::now();
+                let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+                state.tokens = (state.tokens + elapsed * state.bandwidth_limit as f64)
+                    .min(state.bandwidth_limit as f64);
+                state.last_refill = now;
+
+                if state.tokens < to_send as f64 {
+                    // Not enough tokens for a full datagram – wait.
+                    _ = conn.stream_want_write(stream_id, true);
+                    return;
+                }
+            }
 
             // Stamp the send timestamp into bytes 0-7 of this datagram.
             let ts_us = start_time.elapsed().as_micros() as u64;
             datagram[0..8].copy_from_slice(&ts_us.to_le_bytes());
 
-            match conn.stream_write(
-                stream_id,
-                Bytes::copy_from_slice(&datagram[..to_send]),
-                false,
-            ) {
-                Ok(written) => {
-                    state.bytes_sent += written;
-                    if state.bandwidth_limit > 0 {
-                        state.tokens -= written as f64;
+            // Copy into the state's staging buffer and reset position.
+            // We always fill the staging buffer completely before writing,
+            // so QUIC backpressure can resume mid-datagram without framing loss.
+            state.dg_buf[..to_send].copy_from_slice(&datagram[..to_send]);
+            state.dg_buf_pos = 0;
+            let datagram_size = to_send;
+
+            // Flush the staging buffer (may take multiple stream_write calls
+            // if QUIC flow control only accepts part of it).
+            while state.dg_buf_pos < datagram_size {
+                let slice = &state.dg_buf[state.dg_buf_pos..datagram_size];
+                match conn.stream_write(stream_id, Bytes::copy_from_slice(slice), false) {
+                    Ok(written) => {
+                        state.bytes_sent  += written;
+                        state.dg_buf_pos  += written;
+                        if state.bandwidth_limit > 0 {
+                            state.tokens -= written as f64;
+                        }
+                        if state.dg_buf_pos < datagram_size {
+                            // QUIC can't accept more right now; retry when writable.
+                            _ = conn.stream_want_write(stream_id, true);
+                            return;
+                        }
                     }
-                    if written < to_send {
+                    Err(Error::Done) => {
                         _ = conn.stream_want_write(stream_id, true);
                         return;
                     }
-                }
-                Err(Error::Done) => {
-                    _ = conn.stream_want_write(stream_id, true);
-                    return;
-                }
-                Err(e) => {
-                    error!("{} stream {} write: {:?}", conn.trace_id(), stream_id, e);
-                    return;
+                    Err(e) => {
+                        error!("{} stream {} write: {:?}", conn.trace_id(), stream_id, e);
+                        return;
+                    }
                 }
             }
         }
