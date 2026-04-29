@@ -923,12 +923,13 @@ impl Worker {
             self.duration_expired.store(true, Ordering::Relaxed);
             if self.fin_deadline.is_none() {
                 // Snap duration and packet counters NOW (before satellite latency tail).
+                // live_sent/live_lost are updated from conn.stats() on every write/read,
+                // so they reflect the real-time QUIC transport counters at this moment.
+                // worker_ctx.conn_stats is only populated at connection close — unusable here.
                 let elapsed = (Instant::now() - self.start_time).as_secs_f64();
                 self.expiry_time.store(elapsed.to_bits(), Ordering::Relaxed);
-                let ctx = self.worker_ctx.borrow();
-                self.expiry_sent.fetch_add(ctx.conn_stats.sent_count, Ordering::Relaxed);
-                self.expiry_lost.fetch_add(ctx.conn_stats.lost_count, Ordering::Relaxed);
-                drop(ctx);
+                self.expiry_sent.store(self.live_sent.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.expiry_lost.store(self.live_lost.load(Ordering::Relaxed), Ordering::Relaxed);
                 self.fin_deadline = Some(Instant::now() + Duration::from_secs(60));
             }
             return false;
