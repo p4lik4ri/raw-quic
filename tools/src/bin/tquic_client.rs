@@ -334,6 +334,8 @@ impl Client {
         let reporter_sent    = Arc::clone(&self.live_sent);
         let reporter_jitter  = Arc::clone(&self.live_jitter);
         let reporter_srv_jitter = Arc::clone(&self.server_jitter);
+        let reporter_srv_lost   = Arc::clone(&self.server_lost);
+        let reporter_srv_sent   = Arc::clone(&self.server_sent);
         let reporter_done     = Arc::clone(&self.reporting_done);
         let reporter_duration = Arc::clone(&self.actual_duration_bits);
         let reporter_final_bytes = Arc::clone(&self.final_bytes);
@@ -458,14 +460,23 @@ impl Client {
                     }
                     TransferMode::Downlink => {
                         // In downlink the client IS the receiver; no sender row.
-                        let recv_loss_pct = if cur_sent > 0 { cur_lost as f64 / cur_sent as f64 * 100.0 } else { 0.0 };
+                        // Use server-reported loss (from stats reply) as the authoritative
+                        // figure — the server is the sender and tracks QUIC transport loss.
+                        let srv_lost = reporter_srv_lost.load(Ordering::Relaxed);
+                        let srv_sent = reporter_srv_sent.load(Ordering::Relaxed);
+                        let (dl_lost, dl_sent) = if srv_sent > 0 {
+                            (srv_lost, srv_sent)
+                        } else {
+                            (cur_lost, cur_sent)
+                        };
+                        let recv_loss_pct = if dl_sent > 0 { dl_lost as f64 / dl_sent as f64 * 100.0 } else { 0.0 };
                         println!(
                             "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
                             format!("{:.3} ms", jitter_ms),
-                            cur_lost, cur_sent, recv_loss_pct,
+                            dl_lost, dl_sent, recv_loss_pct,
                         );
                     }
                 }
@@ -538,8 +549,16 @@ impl Client {
             ctx.conn_total, ctx.conn_finish_success, ctx.conn_finish_failed,
         );
         let recv  = ctx.conn_stats.recv_count;
-        let sent  = ctx.conn_stats.sent_count;
-        let lost  = ctx.conn_stats.lost_count;
+        // For downlink, use the server-reported loss (sender-side QUIC transport).
+        // For uplink, use the client's own sent/lost counters.
+        let (sent, lost) = match ctx.mode {
+            TransferMode::Downlink => {
+                let sl = self.server_lost.load(Ordering::Relaxed);
+                let ss = self.server_sent.load(Ordering::Relaxed);
+                if ss > 0 { (ss, sl) } else { (ctx.conn_stats.sent_count, ctx.conn_stats.lost_count) }
+            }
+            TransferMode::Uplink => (ctx.conn_stats.sent_count, ctx.conn_stats.lost_count),
+        };
         let loss_pct = if sent > 0 { lost as f64 / sent as f64 * 100.0 } else { 0.0 };
         let jitter_ms = match ctx.mode {
             TransferMode::Downlink => ctx.jitter_ms,
