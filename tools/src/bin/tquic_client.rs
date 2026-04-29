@@ -611,6 +611,8 @@ struct DataReceiver {
     jitter_ms: f64,
     /// Timestamp of the last readable event, used for jitter calculation.
     last_recv_time: Option<Instant>,
+    /// Previous interarrival interval (ms), used for RFC 3550 jitter (|d_i - d_{i-1}|).
+    prev_interval_ms: f64,
     /// Accumulator for the 16-byte server stats reply (uplink) or stats-request reply (downlink).
     server_reply_buf: Vec<u8>,
     /// True once a downlink stats request has been sent on this connection.
@@ -631,6 +633,7 @@ impl DataReceiver {
             uplink: HashMap::new(),
             jitter_ms: 0.0,
             last_recv_time: None,
+            prev_interval_ms: 0.0,
             server_reply_buf: Vec::new(),
             stats_req_sent: false,
             stats_req_stream: None,
@@ -1278,10 +1281,17 @@ impl TransportHandler for WorkerHandler {
                     // Normal downlink bulk data.
                     if let Some(recv) = self.receivers.borrow_mut().get_mut(&idx) {
                         recv.bytes_received += n as u64;
-                        // RFC 3550 §A.8 interarrival jitter.
+                        // RFC 3550 §A.8 interarrival jitter: EWMA of |d_i - d_{i-1}|.
+                        // Using absolute deviation between successive interarrival intervals
+                        // (no sender timestamps available) so the metric stays near 0 for
+                        // steady delivery and only rises when intervals vary — unlike an
+                        // EWMA of raw d which converges to the mean interval and spikes at
+                        // end-of-stream when the last packet arrives after a long gap.
                         if let Some(last) = recv.last_recv_time {
                             let d = now.duration_since(last).as_secs_f64() * 1000.0; // ms
-                            recv.jitter_ms += (d - recv.jitter_ms) / 16.0;
+                            let diff = (d - recv.prev_interval_ms).abs();
+                            recv.jitter_ms += (diff - recv.jitter_ms) / 16.0;
+                            recv.prev_interval_ms = d;
                         }
                         recv.last_recv_time = Some(now);
                         // Publish current jitter as f64 bits.
