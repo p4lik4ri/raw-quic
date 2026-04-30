@@ -313,6 +313,8 @@ struct ConnectionHandler {
     last_recv_us: Option<u64>,
     /// RFC 3550 running jitter from per-datagram one-way delay variation.
     jitter_ms: f64,
+    /// Application-level datagrams received (completed DATAGRAM_STRIDE blocks).
+    app_datagrams_received: u64,
 }
 
 impl ConnectionHandler {
@@ -514,7 +516,6 @@ impl ConnectionHandler {
         conn: &mut Connection,
         stream_id: u64,
         live_jitter: &Arc<AtomicU64>,
-        recv_count: u64,
     ) {
         let state = match self.streams.get_mut(&stream_id) {
             Some(s) if s.ready && s.mode == TransferMode::Uplink => s,
@@ -561,6 +562,7 @@ impl ConnectionHandler {
                             i           += to_skip;
                             if self.dg_pos >= DATAGRAM_STRIDE {
                                 self.dg_pos = 0;
+                                self.app_datagrams_received += 1;
                             }
                         }
                     }
@@ -574,7 +576,7 @@ impl ConnectionHandler {
         if got_fin && !state.reply_sent {
             state.reply_sent = true;
             let jitter_bits = live_jitter.load(Ordering::Relaxed);
-            let reply = encode_uplink_stats_reply(jitter_bits, recv_count);
+            let reply = encode_uplink_stats_reply(jitter_bits, self.app_datagrams_received);
             match conn.stream_write(stream_id, Bytes::copy_from_slice(&reply), true) {
                 Ok(_) => {}
                 Err(e) => error!("{} uplink reply write {}: {:?}", conn.trace_id(), stream_id, e),
@@ -767,17 +769,14 @@ impl TransportHandler for ServerHandler {
                 }
                 TransferMode::Uplink => {
                     self.is_uplink.store(true, Ordering::Relaxed);
-                    // live_sent on the server tracks conn.stats().recv_count for uplink.
-                    let rc = self.live_sent.load(Ordering::Relaxed);
                     if let Some(handler) = self.conns.get_mut(&idx) {
-                        handler.drain_uplink(conn, stream_id, &self.live_jitter, rc);
+                        handler.drain_uplink(conn, stream_id, &self.live_jitter);
                     }
                 }
             }
         } else {
-            let rc = self.live_sent.load(Ordering::Relaxed);
             if let Some(handler) = self.conns.get_mut(&idx) {
-                handler.drain_uplink(conn, stream_id, &self.live_jitter, rc);
+                handler.drain_uplink(conn, stream_id, &self.live_jitter);
             }
         }
         // Update live uplink stats for the interval reporter.
@@ -790,8 +789,8 @@ impl TransportHandler for ServerHandler {
                     self.live_bytes.fetch_add(delta, Ordering::Relaxed);
                     // Jitter is now updated inside drain_uplink via per-datagram timestamps.
                 }
-                // For uplink server: "sent" = total datagrams received by server.
-                self.live_sent.store(stats.recv_count, Ordering::Relaxed);
+                // For uplink: "total datagrams" = app-level datagrams received.
+                self.live_sent.store(handler.app_datagrams_received, Ordering::Relaxed);
                 self.live_lost.store(stats.lost_count, Ordering::Relaxed);
             }
         }

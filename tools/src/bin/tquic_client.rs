@@ -1541,13 +1541,13 @@ impl TransportHandler for WorkerHandler {
                             self.live_bytes.fetch_add(written as u64, Ordering::Relaxed);
                             if state.bandwidth_limit > 0 { state.tokens -= written as f64; }
                             state.dg_buf_pos += written;
-                            let stats = conn.stats();
-                            self.live_lost.store(stats.lost_count, Ordering::Relaxed);
-                            self.live_sent.store(stats.sent_count, Ordering::Relaxed);
                             if state.dg_buf_pos < datagram_size {
                                 _ = conn.stream_want_write(stream_id, true);
                                 return;
                             }
+                            // Datagram fully written — count as one app-level datagram.
+                            self.live_lost.store(conn.stats().lost_count, Ordering::Relaxed);
+                            self.live_sent.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(Error::Done) => { _ = conn.stream_want_write(stream_id, true); return; }
                         Err(e) => { error!("{} uplink stream {} write: {:?}", conn.trace_id(), stream_id, e); return; }
@@ -1585,13 +1585,13 @@ impl TransportHandler for WorkerHandler {
                         self.live_bytes.fetch_add(written as u64, Ordering::Relaxed);
                         if state.bandwidth_limit > 0 { state.tokens -= written as f64; }
                         state.dg_buf_pos += written;
-                        let stats = conn.stats();
-                        self.live_lost.store(stats.lost_count, Ordering::Relaxed);
-                        self.live_sent.store(stats.sent_count, Ordering::Relaxed);
                         if state.dg_buf_pos < datagram_size {
                             _ = conn.stream_want_write(stream_id, true);
                             return;
                         }
+                        // Datagram fully written — count as one app-level datagram.
+                        self.live_lost.store(conn.stats().lost_count, Ordering::Relaxed);
+                        self.live_sent.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(Error::Done) => { _ = conn.stream_want_write(stream_id, true); return; }
                     Err(e) => { error!("{} uplink stream {} write: {:?}", conn.trace_id(), stream_id, e); return; }
