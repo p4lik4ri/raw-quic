@@ -249,40 +249,29 @@ impl MultipathScheduler for LinUCBScheduler {
         self.window_total += 1;
         self.total_selections += 1;
 
-        // Cache per-path local addresses for the final summary.
+        // Cache per-path addresses for the final summary.
+        // Prefer local_addr, but fall back to remote_addr when local is
+        // unspecified (server bound to 0.0.0.0 / ::).
         for &(pid, _, _, _) in &raw {
             if pid >= self.path_addrs.len() {
                 self.path_addrs.resize(pid + 1, None);
             }
             if self.path_addrs[pid].is_none() {
                 if let Ok(p) = paths.get(pid) {
-                    self.path_addrs[pid] = Some(p.local_addr().ip().to_string());
+                    let ip = {
+                        let local = p.local_addr().ip();
+                        if local.is_unspecified() {
+                            p.remote_addr().ip()
+                        } else {
+                            local
+                        }
+                    };
+                    self.path_addrs[pid] = Some(ip.to_string());
                 }
             }
         }
 
-        // Log whenever the selected path changes.
         if self.last_selected != Some(best_pid) {
-            // Build a compact score line: "path[0](192.168.100.50, 345µs, UCB=0.89) ← SELECTED"
-            let mut parts = Vec::new();
-            for &(pid, rtt_us, pressure, est, bonus, ucb) in &score_rows {
-                let addr = paths
-                    .get(pid)
-                    .map(|p| p.local_addr().ip().to_string())
-                    .unwrap_or_else(|_| "?".into());
-                let marker = if pid == best_pid { " ←" } else { "" };
-                parts.push(format!(
-                    "path[{pid}]({addr}, {rtt_us}µs, pressure={pressure:.2}, est={est:+.3}, explore={bonus:.3}, UCB={ucb:+.3}){marker}"
-                ));
-            }
-            info!(
-                "LinUCB path change: {} → path[{}]  |  {}",
-                self.last_selected
-                    .map(|p| format!("path[{p}]"))
-                    .unwrap_or_else(|| "none".into()),
-                best_pid,
-                parts.join("  ")
-            );
             self.last_selected = Some(best_pid);
         }
 
@@ -294,27 +283,22 @@ impl MultipathScheduler for LinUCBScheduler {
         if do_snapshot {
             let elapsed_s = now.duration_since(self.start_time).as_secs();
             let total = self.window_total.max(1);
-            let mut lines = Vec::new();
-            for &(pid, rtt_us, pressure, est, bonus, ucb) in &score_rows {
+            let mut parts = Vec::new();
+            for (pid, &cnt) in self.window_counts.iter().enumerate() {
+                if cnt == 0 {
+                    continue;
+                }
                 let addr = self
                     .path_addrs
                     .get(pid)
                     .and_then(|a| a.as_deref())
                     .unwrap_or("?");
-                let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
                 let pct = cnt * 100 / total;
-                let phase = if bonus > est.abs().max(0.1) {
-                    "exploring"
-                } else {
-                    "exploiting"
-                };
-                lines.push(format!(
-                    "    path[{pid}] {addr}  {rtt_us}µs  pressure={pressure:.2}  est={est:+.3}  explore={bonus:.3}  UCB={ucb:+.3}  share={pct}% ({cnt}/{total})  [{phase}]"
-                ));
+                parts.push(format!("path[{pid}] {addr} {pct}%"));
             }
             self.snapshots.push(format!(
-                "  t={elapsed_s:>3}s:\n{}",
-                lines.join("\n")
+                "  t={elapsed_s:>3}s:  {}",
+                parts.join("  |  ")
             ));
             self.last_log = Some(now);
             for c in &mut self.window_counts {
