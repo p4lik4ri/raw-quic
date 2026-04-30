@@ -96,6 +96,15 @@ pub struct LinUCBScheduler {
     snapshots: Vec<String>,
     /// Connection start time for elapsed-second labels in summary.
     start_time: Instant,
+    /// Per-path exponential moving average of latest_rtt (nanoseconds).
+    /// Used in on_ack to smooth transient first-packet RTT spikes.
+    ema_rtt_ns: Vec<f64>,
+    /// Number of ACKs received per path, used to control EMA warmup speed.
+    ack_counts: Vec<u64>,
+    /// Deficit credits for weighted round-robin path selection.
+    /// Each scheduling round adds softmax(UCB) weight to every active path;
+    /// the path with the most credits is chosen and loses one credit.
+    credits: Vec<f64>,
 }
 
 impl LinUCBScheduler {
@@ -114,6 +123,9 @@ impl LinUCBScheduler {
             path_addrs: Vec::new(),
             snapshots: Vec::new(),
             start_time: now,
+            ema_rtt_ns: Vec::new(),
+            ack_counts: Vec::new(),
+            credits: Vec::new(),
         }
     }
 
@@ -228,6 +240,37 @@ impl MultipathScheduler for LinUCBScheduler {
             }
         }
 
+        // Deficit weighted round-robin using softmax of UCB scores.
+        // Temperature 0.3: near-equal paths split traffic; large UCB gaps
+        // degenerate to argmax (bad paths get ~0% weight).
+        const SPLIT_TAU: f64 = 0.3;
+        let max_ucb = best_score;
+        let weights: Vec<f64> = score_rows
+            .iter()
+            .map(|&(.., ucb)| ((ucb - max_ucb) / SPLIT_TAU).exp())
+            .collect();
+        let total_w: f64 = weights.iter().sum();
+
+        // Grow credits to cover all active path ids.
+        let max_active_pid = score_rows.iter().map(|&(pid, ..)| pid).max().unwrap_or(0);
+        if max_active_pid >= self.credits.len() {
+            self.credits.resize(max_active_pid + 1, 0.0);
+        }
+        for (i, &(pid, ..)) in score_rows.iter().enumerate() {
+            self.credits[pid] += weights[i] / total_w;
+        }
+        // Choose path with most credits among active paths.
+        let best_pid = score_rows
+            .iter()
+            .map(|&(pid, ..)| pid)
+            .max_by(|&a, &b| {
+                self.credits[a]
+                    .partial_cmp(&self.credits[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(best_pid);
+        self.credits[best_pid] -= 1.0;
+
         // --- Logging and counters ---
         let now = Instant::now();
 
@@ -317,8 +360,21 @@ impl MultipathScheduler for LinUCBScheduler {
         };
 
         let rtt_ns = path.recovery.rtt.latest_rtt().as_nanos().max(1);
+
+        // Per-path EMA to smooth transient first-packet RTT spikes.
+        // Alpha=0.5 for the first 8 ACKs (fast warmup), then 0.2 (stable).
+        if path_id >= self.ema_rtt_ns.len() {
+            self.ema_rtt_ns.resize(path_id + 1, rtt_ns as f64);
+            self.ack_counts.resize(path_id + 1, 0);
+        }
+        self.ack_counts[path_id] += 1;
+        let alpha = if self.ack_counts[path_id] <= 8 { 0.5_f64 } else { 0.2_f64 };
+        self.ema_rtt_ns[path_id] =
+            alpha * rtt_ns as f64 + (1.0 - alpha) * self.ema_rtt_ns[path_id];
+        let ema_rtt_ns = self.ema_rtt_ns[path_id] as u128;
+
         let x = Self::make_context(
-            rtt_ns,
+            ema_rtt_ns,
             self.last_min_rtt_ns, // global minimum from last scheduling decision
             path.recovery.bytes_in_flight,
             path.recovery.congestion.congestion_window(),
