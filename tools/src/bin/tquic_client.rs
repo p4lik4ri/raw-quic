@@ -458,7 +458,7 @@ impl Client {
                         let loss_pct = if s_sent > 0 { s_lost as f64 / s_sent as f64 * 100.0 } else { 0.0 };
                         // Sender row: leave jitter blank (sender cannot measure it).
                         println!(
-                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  sender",
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  sender (QUIC retransmitted)",
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
@@ -475,7 +475,7 @@ impl Client {
                         };
                         let recv_loss_pct = if recv_total > 0 { recv_lost as f64 / recv_total as f64 * 100.0 } else { 0.0 };
                         println!(
-                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver (permanently lost)",
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
@@ -496,7 +496,7 @@ impl Client {
                         };
                         let recv_loss_pct = if dl_sent > 0 { dl_lost as f64 / dl_sent as f64 * 100.0 } else { 0.0 };
                         println!(
-                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver",
+                            "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.4}%)  receiver (QUIC retransmitted)",
                             format!("0.00-{:.2} s", total_secs),
                             format!("{:.2} MB", total_mb),
                             format!("{:.2} Mbits/sec", total_mbps),
