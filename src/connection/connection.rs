@@ -765,6 +765,11 @@ impl Connection {
                 self.stats.lost_count += lost_pkts;
                 self.stats.lost_bytes += lost_bytes;
 
+                // Notify the multipath scheduler of the ack event
+                if let Some(ref mut scheduler) = self.multipath_scheduler {
+                    scheduler.on_ack(now, path_id, &mut self.paths);
+                }
+
                 // An endpoint MUST discard its Handshake keys when the TLS
                 // handshake is confirmed.
                 if self.flags.contains(HandshakeConfirmed) {

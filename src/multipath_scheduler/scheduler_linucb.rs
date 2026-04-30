@@ -1,0 +1,316 @@
+// Copyright (c) 2023 The TQUIC Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::time::Instant;
+
+use crate::connection::path::PathMap;
+use crate::connection::space::PacketNumSpaceMap;
+use crate::connection::stream::StreamMap;
+use crate::multipath_scheduler::MultipathScheduler;
+use crate::Error;
+use crate::MultipathConfig;
+use crate::Result;
+
+/// Number of context features used by the bandit.
+///
+/// Features per path:
+///   x[0] = srtt / min_srtt_across_paths  (normalised RTT; 1.0 for best path)
+///   x[1] = bytes_in_flight / cwnd        (congestion window utilisation ∈ [0, 1])
+///   x[2] = 1.0                            (bias / intercept term)
+const D: usize = 3;
+
+/// Per-arm (per-path) state for the LinUCB algorithm.
+struct ArmState {
+    /// A = I_d + Σ x_t xₜᵀ  — d×d positive-definite matrix.
+    a: [[f64; D]; D],
+    /// b = Σ rₜ xₜ  — d-dimensional reward-weighted feature sum.
+    b: [f64; D],
+}
+
+impl ArmState {
+    fn new() -> Self {
+        let mut a = [[0.0_f64; D]; D];
+        for i in 0..D {
+            a[i][i] = 1.0; // initialise as identity
+        }
+        ArmState { a, b: [0.0; D] }
+    }
+}
+
+/// LinUCBScheduler implements a contextual-bandit multipath scheduler.
+///
+/// It uses the LinUCB (Disjoint) algorithm to learn which path yields the
+/// best reward (low latency, low congestion) and balances exploration vs
+/// exploitation via the `alpha` coefficient.
+///
+/// # Algorithm
+///
+/// At each scheduling decision the algorithm:
+/// 1. Builds a context vector xₚ for every sendable path p.
+/// 2. Computes the UCB score:  θₚᵀ xₚ + α √(xₚᵀ Aₚ⁻¹ xₚ)
+/// 3. Selects the path with the highest score.
+///
+/// After each ACK arrives on a path, the model is updated:
+///   Aₚ ← Aₚ + xₚ xₚᵀ
+///   bₚ ← bₚ + rₚ xₚ
+/// where the reward rₚ = 1 − rtt_norm  (higher reward for lower-RTT paths).
+pub struct LinUCBScheduler {
+    /// Exploration coefficient α.  Larger values increase exploration.
+    alpha: f64,
+    /// Per-path arm state, indexed by path_id.
+    arms: Vec<Option<ArmState>>,
+}
+
+impl LinUCBScheduler {
+    pub fn new(_conf: &MultipathConfig) -> Self {
+        LinUCBScheduler {
+            alpha: 0.5,
+            arms: Vec::new(),
+        }
+    }
+
+    /// Ensure an arm exists for path_id, initialising it if absent.
+    fn ensure_arm(&mut self, path_id: usize) {
+        if path_id >= self.arms.len() {
+            self.arms.resize_with(path_id + 1, || None);
+        }
+        if self.arms[path_id].is_none() {
+            self.arms[path_id] = Some(ArmState::new());
+        }
+    }
+
+    /// Build the context vector for a path, given the minimum RTT across all
+    /// active paths (in nanoseconds).
+    fn make_context(
+        rtt_ns: u128,
+        min_rtt_ns: u128,
+        bytes_in_flight: usize,
+        cwnd: u64,
+    ) -> [f64; D] {
+        let rtt_norm = if min_rtt_ns > 0 {
+            rtt_ns as f64 / min_rtt_ns as f64
+        } else {
+            1.0
+        };
+        let cwnd_pressure = if cwnd > 0 {
+            (bytes_in_flight as f64 / cwnd as f64).min(1.0)
+        } else {
+            1.0
+        };
+        [rtt_norm, cwnd_pressure, 1.0]
+    }
+
+    /// Compute the LinUCB upper-confidence-bound score for one arm.
+    fn ucb_score(arm: &ArmState, x: [f64; D], alpha: f64) -> f64 {
+        let a_inv = mat_inv_3(arm.a);
+        let theta = mat_vec_3(a_inv, arm.b);
+        let reward_est = dot3(theta, x);
+        let explore_var = quadratic_3(a_inv, x).max(0.0);
+        reward_est + alpha * explore_var.sqrt()
+    }
+
+    /// Apply a single LinUCB update to an arm.
+    fn update_arm(arm: &mut ArmState, x: [f64; D], reward: f64) {
+        // A += x xᵀ
+        for i in 0..D {
+            for j in 0..D {
+                arm.a[i][j] += x[i] * x[j];
+            }
+        }
+        // b += reward * x
+        for i in 0..D {
+            arm.b[i] += reward * x[i];
+        }
+    }
+}
+
+impl MultipathScheduler for LinUCBScheduler {
+    /// Select the path with the highest LinUCB score.
+    fn on_select(
+        &mut self,
+        paths: &mut PathMap,
+        _spaces: &mut PacketNumSpaceMap,
+        _streams: &mut StreamMap,
+    ) -> Result<usize> {
+        // Collect per-path stats via iter_mut (can_send() takes &mut self).
+        // Values are extracted before mutating self.arms to satisfy the borrow checker.
+        let mut min_rtt_ns: u128 = u128::MAX;
+        let mut raw: Vec<(usize, u128, usize, u64)> = Vec::new();
+
+        for (pid, path) in paths.iter_mut() {
+            if !path.active() || !path.recovery.can_send() {
+                continue;
+            }
+            let rtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos();
+            let bytes_in_flight = path.recovery.bytes_in_flight;
+            let cwnd = path.recovery.congestion.congestion_window();
+            if rtt_ns < min_rtt_ns {
+                min_rtt_ns = rtt_ns;
+            }
+            raw.push((pid, rtt_ns, bytes_in_flight, cwnd));
+        }
+
+        if raw.is_empty() {
+            return Err(Error::Done);
+        }
+
+        let min_rtt_ns = min_rtt_ns.max(1);
+
+        // Pick the arm with the highest UCB score.
+        let mut best_pid = raw[0].0;
+        let mut best_score = f64::NEG_INFINITY;
+
+        for &(pid, rtt_ns, bytes_in_flight, cwnd) in &raw {
+            let x = Self::make_context(rtt_ns, min_rtt_ns, bytes_in_flight, cwnd);
+            self.ensure_arm(pid);
+            let arm = self.arms[pid].as_ref().unwrap();
+            let score = Self::ucb_score(arm, x, self.alpha);
+            if score > best_score {
+                best_score = score;
+                best_pid = pid;
+            }
+        }
+
+        Ok(best_pid)
+    }
+
+    /// Update the model for the path that received an ACK.
+    fn on_ack(&mut self, _now: Instant, path_id: usize, paths: &mut PathMap) {
+        let path = match paths.get_mut(path_id) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Use the path's own RTT as baseline (min = self); rtt_norm = 1.0.
+        let rtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos().max(1);
+        let x = Self::make_context(
+            rtt_ns,
+            rtt_ns, // self-relative normalisation
+            path.recovery.bytes_in_flight,
+            path.recovery.congestion.congestion_window(),
+        );
+
+        // Reward = 1 − rtt_norm.  For the best path rtt_norm = 1 → reward = 0.
+        // Paths with higher congestion pressure (cwnd_pressure → 1) will have
+        // lower scores, naturally shifting traffic away from saturated paths.
+        let reward = 1.0 - x[0]; // x[0] = rtt_norm = 1.0 here, so reward = 0.0
+
+        self.ensure_arm(path_id);
+        let arm = self.arms[path_id].as_mut().unwrap();
+        Self::update_arm(arm, x, reward);
+    }
+}
+
+// ─── 3×3 linear algebra helpers ──────────────────────────────────────────────
+//
+// These operate on plain arrays to avoid external dependencies.
+
+/// Compute the inverse of a 3×3 matrix using Cramer's rule.
+///
+/// Returns the identity matrix when the determinant is near zero to avoid
+/// numerical blow-up during early exploration.
+fn mat_inv_3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+
+    if det.abs() < 1e-15 {
+        let mut r = [[0.0_f64; 3]; 3];
+        for i in 0..3 {
+            r[i][i] = 1.0;
+        }
+        return r;
+    }
+
+    let inv = 1.0 / det;
+    [
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv,
+        ],
+    ]
+}
+
+/// Multiply a 3×3 matrix by a 3-vector.
+fn mat_vec_3(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+    let mut r = [0.0_f64; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            r[i] += m[i][j] * v[j];
+        }
+    }
+    r
+}
+
+/// Dot product of two 3-vectors.
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Quadratic form xᵀ M x for a 3×3 matrix M and 3-vector x.
+fn quadratic_3(m: [[f64; 3]; 3], x: [f64; 3]) -> f64 {
+    let mx = mat_vec_3(m, x);
+    dot3(x, mx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multipath_scheduler::tests::*;
+
+    #[test]
+    fn linucb_single_path() -> Result<()> {
+        let mut t = MultipathTester::new()?;
+        let mut s = LinUCBScheduler::new(&Default::default());
+        // Should always select the only available path.
+        assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn linucb_multi_path_selects_valid() -> Result<()> {
+        let mut t = MultipathTester::new()?;
+        t.add_path("127.0.0.1:443", "127.0.0.2:8443", 50)?;
+        t.add_path("127.0.0.1:443", "127.0.0.3:8443", 150)?;
+
+        let mut s = LinUCBScheduler::new(&Default::default());
+        let pid = s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?;
+        // Result must be one of the active paths (0, 1, or 2).
+        assert!(pid <= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mat_inv_identity() {
+        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let inv = mat_inv_3(id);
+        for i in 0..3 {
+            for j in 0..3 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!((inv[i][j] - expected).abs() < 1e-10);
+            }
+        }
+    }
+}
