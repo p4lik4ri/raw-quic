@@ -86,10 +86,21 @@ pub struct LinUCBScheduler {
     window_counts: Vec<u64>,
     /// Total selections in the current 1-second window.
     window_total: u64,
+    /// Total selections across the entire session, indexed by path_id.
+    total_counts: Vec<u64>,
+    /// Total selections across the entire session.
+    total_selections: u64,
+    /// Per-path local address strings, populated on first selection.
+    path_addrs: Vec<Option<String>>,
+    /// Per-second snapshot lines buffered for the final summary.
+    snapshots: Vec<String>,
+    /// Connection start time for elapsed-second labels in summary.
+    start_time: Instant,
 }
 
 impl LinUCBScheduler {
     pub fn new(_conf: &MultipathConfig) -> Self {
+        let now = Instant::now();
         LinUCBScheduler {
             alpha: 0.5,
             arms: Vec::new(),
@@ -98,6 +109,11 @@ impl LinUCBScheduler {
             last_log: None,
             window_counts: Vec::new(),
             window_total: 0,
+            total_counts: Vec::new(),
+            total_selections: 0,
+            path_addrs: Vec::new(),
+            snapshots: Vec::new(),
+            start_time: now,
         }
     }
 
@@ -120,7 +136,9 @@ impl LinUCBScheduler {
         cwnd: u64,
     ) -> [f64; D] {
         let rtt_norm = if min_rtt_ns > 0 {
-            rtt_ns as f64 / min_rtt_ns as f64
+            // Clamp to [1.0, 4.0] so a single very-high-RTT measurement cannot
+            // produce a reward of −30 that overwhelms the learned model.
+            (rtt_ns as f64 / min_rtt_ns as f64).clamp(1.0, 4.0)
         } else {
             1.0
         };
@@ -216,15 +234,32 @@ impl MultipathScheduler for LinUCBScheduler {
             }
         }
 
-        // --- Logging ---
+        // --- Logging and counters ---
         let now = Instant::now();
 
-        // Update per-window selection counter.
+        // Update per-window and total selection counters.
         if best_pid >= self.window_counts.len() {
             self.window_counts.resize(best_pid + 1, 0);
         }
+        if best_pid >= self.total_counts.len() {
+            self.total_counts.resize(best_pid + 1, 0);
+        }
         self.window_counts[best_pid] += 1;
+        self.total_counts[best_pid] += 1;
         self.window_total += 1;
+        self.total_selections += 1;
+
+        // Cache per-path local addresses for the final summary.
+        for &(pid, _, _, _) in &raw {
+            if pid >= self.path_addrs.len() {
+                self.path_addrs.resize(pid + 1, None);
+            }
+            if self.path_addrs[pid].is_none() {
+                if let Ok(p) = paths.get(pid) {
+                    self.path_addrs[pid] = Some(p.local_addr().ip().to_string());
+                }
+            }
+        }
 
         // Log whenever the selected path changes.
         if self.last_selected != Some(best_pid) {
@@ -251,32 +286,36 @@ impl MultipathScheduler for LinUCBScheduler {
             self.last_selected = Some(best_pid);
         }
 
-        // Periodic 1-second snapshot.
-        let do_log = self
+        // Buffer a per-second snapshot for the final summary.
+        let do_snapshot = self
             .last_log
             .map(|t| now.duration_since(t) >= Duration::from_secs(1))
             .unwrap_or(true);
-        if do_log {
+        if do_snapshot {
+            let elapsed_s = now.duration_since(self.start_time).as_secs();
             let total = self.window_total.max(1);
             let mut lines = Vec::new();
             for &(pid, rtt_us, pressure, est, bonus, ucb) in &score_rows {
-                let addr = paths
+                let addr = self
+                    .path_addrs
                     .get(pid)
-                    .map(|p| p.local_addr().ip().to_string())
-                    .unwrap_or_else(|_| "?".into());
+                    .and_then(|a| a.as_deref())
+                    .unwrap_or("?");
                 let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
                 let pct = cnt * 100 / total;
-                // Phase: exploration dominates when bonus > |est| and bonus > 0.1.
                 let phase = if bonus > est.abs().max(0.1) {
                     "exploring"
                 } else {
                     "exploiting"
                 };
                 lines.push(format!(
-                    "  path[{pid}] {addr}  {rtt_us}µs  pressure={pressure:.2}  est={est:+.3}  explore={bonus:.3}  UCB={ucb:+.3}  share={pct}% ({cnt}/{total})  [{phase}]"
+                    "    path[{pid}] {addr}  {rtt_us}µs  pressure={pressure:.2}  est={est:+.3}  explore={bonus:.3}  UCB={ucb:+.3}  share={pct}% ({cnt}/{total})  [{phase}]"
                 ));
             }
-            info!("LinUCB 1s snapshot:\n{}", lines.join("\n"));
+            self.snapshots.push(format!(
+                "  t={elapsed_s:>3}s:\n{}",
+                lines.join("\n")
+            ));
             self.last_log = Some(now);
             for c in &mut self.window_counts {
                 *c = 0;
@@ -311,6 +350,55 @@ impl MultipathScheduler for LinUCBScheduler {
         self.ensure_arm(path_id);
         let arm = self.arms[path_id].as_mut().unwrap();
         Self::update_arm(arm, x, reward);
+    }
+
+    fn scheduler_summary(&self) -> Option<String> {
+        if self.total_selections == 0 {
+            return None;
+        }
+        let mut out = format!(
+            "LinUCB scheduler summary  ({} total selections over {} arms)\n",
+            self.total_selections,
+            self.total_counts.iter().filter(|&&c| c > 0).count(),
+        );
+
+        // Per-path totals.
+        out.push_str("  Path totals:\n");
+        for (pid, &cnt) in self.total_counts.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            let addr = self
+                .path_addrs
+                .get(pid)
+                .and_then(|a| a.as_deref())
+                .unwrap_or("?");
+            let pct = cnt * 100 / self.total_selections;
+            // Final model estimate using a neutral context (rtt_norm=1.0, pressure=0.0, bias=1.0).
+            let est_str = if let Some(Some(arm)) = self.arms.get(pid) {
+                let x = [1.0_f64, 0.0_f64, 1.0_f64];
+                let a_inv = mat_inv_3(arm.a);
+                let theta = mat_vec_3(a_inv, arm.b);
+                let est = dot3(theta, x);
+                format!("{est:+.3}")
+            } else {
+                "n/a".into()
+            };
+            out.push_str(&format!(
+                "    path[{pid}] {addr}  selections={cnt} ({pct}%)  est(neutral)={est_str}\n"
+            ));
+        }
+
+        // Per-second breakdown table.
+        if !self.snapshots.is_empty() {
+            out.push_str("  Per-second breakdown:\n");
+            for snap in &self.snapshots {
+                out.push_str(snap);
+                out.push('\n');
+            }
+        }
+
+        Some(out)
     }
 }
 

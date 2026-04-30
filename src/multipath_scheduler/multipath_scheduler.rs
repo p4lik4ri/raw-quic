@@ -61,6 +61,13 @@ pub(crate) trait MultipathScheduler {
 
     /// Process a path event.
     fn on_path_updated(&mut self, paths: &mut PathMap, event: PathEvent) {}
+
+    /// Return a final human-readable summary of scheduler decisions.
+    /// Called once at connection close. Returns None for schedulers that
+    /// have nothing to report.
+    fn scheduler_summary(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Available multipath scheduling algorithms.

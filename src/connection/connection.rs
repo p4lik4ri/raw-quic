@@ -3832,6 +3832,13 @@ impl Connection {
         Err(Error::InternalError)
     }
 
+    /// Return the final summary string from the multipath scheduler, if any.
+    pub fn multipath_scheduler_summary(&self) -> Option<String> {
+        self.multipath_scheduler
+            .as_ref()
+            .and_then(|s| s.scheduler_summary())
+    }
+
     /// Return an iterator over path addresses.
     pub fn paths_iter(&self) -> FourTupleIter {
         // Instead of trying to identify whether packets will be sent on the

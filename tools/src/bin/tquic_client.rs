@@ -1383,6 +1383,10 @@ impl TransportHandler for WorkerHandler {
         // Per-path breakdown (multipath).
         let paths: Vec<_> = conn.paths_iter().collect();
         if paths.len() > 1 {
+            // Print LinUCB summary (if applicable) before per-path stats.
+            if let Some(summary) = conn.multipath_scheduler_summary() {
+                info!("{}", summary);
+            }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
             for (i, four_tuple) in paths.iter().enumerate() {
                 if let Ok(ps) = conn.get_path_stats(four_tuple.local, four_tuple.remote) {
