@@ -1391,7 +1391,7 @@ impl TransportHandler for WorkerHandler {
             for (i, four_tuple) in paths.iter().enumerate() {
                 if let Ok(ps) = conn.get_path_stats(four_tuple.local, four_tuple.remote) {
                     info!(
-                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  srtt={} µs",
+                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  srtt={} µs  latest_rtt={} µs",
                         i,
                         four_tuple.local,
                         four_tuple.remote,
@@ -1399,6 +1399,7 @@ impl TransportHandler for WorkerHandler {
                         ps.sent_bytes, ps.sent_count,
                         ps.lost_bytes,
                         ps.srtt,
+                        ps.latest_rtt,
                     );
                 }
             }

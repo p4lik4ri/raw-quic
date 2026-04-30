@@ -1127,6 +1127,9 @@ pub struct PathStats {
     /// Smoothed roundtrip time in microseconds.
     pub srtt: u64,
 
+    /// Latest (most recent sample) roundtrip time in microseconds.
+    pub latest_rtt: u64,
+
     /// Roundtrip time variation in microseconds.
     pub rttvar: u64,
 
