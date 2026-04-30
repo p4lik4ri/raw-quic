@@ -150,12 +150,6 @@ impl LinUCBScheduler {
         [rtt_norm, cwnd_pressure, 1.0]
     }
 
-    /// Compute the LinUCB upper-confidence-bound score for one arm.
-    fn ucb_score(arm: &ArmState, x: [f64; D], alpha: f64) -> f64 {
-        let (est, bonus) = Self::ucb_parts(arm, x, alpha);
-        est + bonus
-    }
-
     /// Decompose the UCB score into (reward_estimate, exploration_bonus).
     fn ucb_parts(arm: &ArmState, x: [f64; D], alpha: f64) -> (f64, f64) {
         let a_inv = mat_inv_3(arm.a);
@@ -197,7 +191,7 @@ impl MultipathScheduler for LinUCBScheduler {
             if !path.active() || !path.recovery.can_send() {
                 continue;
             }
-            let rtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos();
+            let rtt_ns = path.recovery.rtt.min_rtt().as_nanos();
             let bytes_in_flight = path.recovery.bytes_in_flight;
             let cwnd = path.recovery.congestion.congestion_window();
             if rtt_ns < min_rtt_ns {
@@ -293,8 +287,13 @@ impl MultipathScheduler for LinUCBScheduler {
                     .get(pid)
                     .and_then(|a| a.as_deref())
                     .unwrap_or("?");
-                let pct = cnt * 100 / total;
-                parts.push(format!("path[{pid}] {addr} {pct}%"));
+                let pct = cnt * 1000 / total; // tenths of a percent
+                let pct_str = if pct % 10 == 0 {
+                    format!("{}%", pct / 10)
+                } else {
+                    format!("{}.{}%", pct / 10, pct % 10)
+                };
+                parts.push(format!("path[{pid}] {addr} {pct_str}"));
             }
             self.snapshots.push(format!(
                 "  t={elapsed_s:>3}s:  {}",
@@ -317,7 +316,7 @@ impl MultipathScheduler for LinUCBScheduler {
             Err(_) => return,
         };
 
-        let rtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos().max(1);
+        let rtt_ns = path.recovery.rtt.latest_rtt().as_nanos().max(1);
         let x = Self::make_context(
             rtt_ns,
             self.last_min_rtt_ns, // global minimum from last scheduling decision
