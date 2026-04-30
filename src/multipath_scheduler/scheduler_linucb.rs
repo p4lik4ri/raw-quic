@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Duration;
 use std::time::Instant;
+
+use log::info;
 
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
@@ -75,6 +78,14 @@ pub struct LinUCBScheduler {
     /// reward = 1 − rtt_norm is meaningful (0.0 for the best path, negative
     /// for worse paths).
     last_min_rtt_ns: u128,
+    /// Last path chosen — used to detect transitions and log path changes.
+    last_selected: Option<usize>,
+    /// Timestamp of the last periodic 1-second log.
+    last_log: Option<Instant>,
+    /// Per-path selection counter for the current 1-second window.
+    window_counts: Vec<u64>,
+    /// Total selections in the current 1-second window.
+    window_total: u64,
 }
 
 impl LinUCBScheduler {
@@ -83,6 +94,10 @@ impl LinUCBScheduler {
             alpha: 0.5,
             arms: Vec::new(),
             last_min_rtt_ns: 1,
+            last_selected: None,
+            last_log: None,
+            window_counts: Vec::new(),
+            window_total: 0,
         }
     }
 
@@ -119,11 +134,17 @@ impl LinUCBScheduler {
 
     /// Compute the LinUCB upper-confidence-bound score for one arm.
     fn ucb_score(arm: &ArmState, x: [f64; D], alpha: f64) -> f64 {
+        let (est, bonus) = Self::ucb_parts(arm, x, alpha);
+        est + bonus
+    }
+
+    /// Decompose the UCB score into (reward_estimate, exploration_bonus).
+    fn ucb_parts(arm: &ArmState, x: [f64; D], alpha: f64) -> (f64, f64) {
         let a_inv = mat_inv_3(arm.a);
         let theta = mat_vec_3(a_inv, arm.b);
         let reward_est = dot3(theta, x);
-        let explore_var = quadratic_3(a_inv, x).max(0.0);
-        reward_est + alpha * explore_var.sqrt()
+        let explore_bonus = alpha * quadratic_3(a_inv, x).max(0.0).sqrt();
+        (reward_est, explore_bonus)
     }
 
     /// Apply a single LinUCB update to an arm.
@@ -174,19 +195,93 @@ impl MultipathScheduler for LinUCBScheduler {
         let min_rtt_ns = min_rtt_ns.max(1);
         self.last_min_rtt_ns = min_rtt_ns;
 
-        // Pick the arm with the highest UCB score.
+        // Pick the arm with the highest UCB score and collect per-path scores
+        // for logging.
         let mut best_pid = raw[0].0;
         let mut best_score = f64::NEG_INFINITY;
+        // (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb)
+        let mut score_rows: Vec<(usize, u64, f64, f64, f64, f64)> = Vec::new();
 
         for &(pid, rtt_ns, bytes_in_flight, cwnd) in &raw {
             let x = Self::make_context(rtt_ns, min_rtt_ns, bytes_in_flight, cwnd);
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
-            let score = Self::ucb_score(arm, x, self.alpha);
-            if score > best_score {
-                best_score = score;
+            let (est, bonus) = Self::ucb_parts(arm, x, self.alpha);
+            let ucb = est + bonus;
+            let cwnd_pressure = x[1];
+            score_rows.push((pid, (rtt_ns / 1_000) as u64, cwnd_pressure, est, bonus, ucb));
+            if ucb > best_score {
+                best_score = ucb;
                 best_pid = pid;
             }
+        }
+
+        // --- Logging ---
+        let now = Instant::now();
+
+        // Update per-window selection counter.
+        if best_pid >= self.window_counts.len() {
+            self.window_counts.resize(best_pid + 1, 0);
+        }
+        self.window_counts[best_pid] += 1;
+        self.window_total += 1;
+
+        // Log whenever the selected path changes.
+        if self.last_selected != Some(best_pid) {
+            // Build a compact score line: "path[0](192.168.100.50, 345µs, UCB=0.89) ← SELECTED"
+            let mut parts = Vec::new();
+            for &(pid, rtt_us, pressure, est, bonus, ucb) in &score_rows {
+                let addr = paths
+                    .get(pid)
+                    .map(|p| p.local_addr().ip().to_string())
+                    .unwrap_or_else(|_| "?".into());
+                let marker = if pid == best_pid { " ←" } else { "" };
+                parts.push(format!(
+                    "path[{pid}]({addr}, {rtt_us}µs, pressure={pressure:.2}, est={est:+.3}, explore={bonus:.3}, UCB={ucb:+.3}){marker}"
+                ));
+            }
+            info!(
+                "LinUCB path change: {} → path[{}]  |  {}",
+                self.last_selected
+                    .map(|p| format!("path[{p}]"))
+                    .unwrap_or_else(|| "none".into()),
+                best_pid,
+                parts.join("  ")
+            );
+            self.last_selected = Some(best_pid);
+        }
+
+        // Periodic 1-second snapshot.
+        let do_log = self
+            .last_log
+            .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+            .unwrap_or(true);
+        if do_log {
+            let total = self.window_total.max(1);
+            let mut lines = Vec::new();
+            for &(pid, rtt_us, pressure, est, bonus, ucb) in &score_rows {
+                let addr = paths
+                    .get(pid)
+                    .map(|p| p.local_addr().ip().to_string())
+                    .unwrap_or_else(|_| "?".into());
+                let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
+                let pct = cnt * 100 / total;
+                // Phase: exploration dominates when bonus > |est| and bonus > 0.1.
+                let phase = if bonus > est.abs().max(0.1) {
+                    "exploring"
+                } else {
+                    "exploiting"
+                };
+                lines.push(format!(
+                    "  path[{pid}] {addr}  {rtt_us}µs  pressure={pressure:.2}  est={est:+.3}  explore={bonus:.3}  UCB={ucb:+.3}  share={pct}% ({cnt}/{total})  [{phase}]"
+                ));
+            }
+            info!("LinUCB 1s snapshot:\n{}", lines.join("\n"));
+            self.last_log = Some(now);
+            for c in &mut self.window_counts {
+                *c = 0;
+            }
+            self.window_total = 0;
         }
 
         Ok(best_pid)
