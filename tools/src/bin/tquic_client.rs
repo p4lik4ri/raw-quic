@@ -588,7 +588,6 @@ impl Client {
             "  Conns     : total {}, ok {}, failed {}",
             ctx.conn_total, ctx.conn_finish_success, ctx.conn_finish_failed,
         );
-        let recv  = ctx.conn_stats.recv_count;
         // For downlink, use server-reported loss (sender-side QUIC transport).
         // For uplink, use expiry-snapped counters so the satellite-latency tail
         // (retransmissions in-flight after duration expired) is excluded.
@@ -611,6 +610,13 @@ impl Client {
                 }
             }
         };
+        // For downlink: recv is the QUIC packets received by the client (= data datagrams).
+        // For uplink: ctx.conn_stats.recv_count is ACKs/control received by the client —
+        // meaningless as a data metric. Derive recv as sent-lost (packets server got).
+        let recv = match ctx.mode {
+            TransferMode::Downlink => ctx.conn_stats.recv_count,
+            TransferMode::Uplink   => sent.saturating_sub(lost),
+        };
         let loss_pct = if sent > 0 { lost as f64 / sent as f64 * 100.0 } else { 0.0 };
         let jitter_ms = match ctx.mode {
             TransferMode::Downlink => ctx.jitter_ms,
@@ -623,10 +629,6 @@ impl Client {
         println!(
             "  Pkts  recv/sent/lost : {}/{}/{}  ({:.2}% loss)",
             recv, sent, lost, loss_pct,
-        );
-        println!(
-            "  Bytes recv/sent/lost : {}/{}/{}",
-            ctx.conn_stats.recv_bytes, ctx.conn_stats.sent_bytes, ctx.conn_stats.lost_bytes,
         );
         println!();
     }
