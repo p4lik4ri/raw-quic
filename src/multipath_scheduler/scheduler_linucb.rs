@@ -70,6 +70,11 @@ pub struct LinUCBScheduler {
     alpha: f64,
     /// Per-path arm state, indexed by path_id.
     arms: Vec<Option<ArmState>>,
+    /// Minimum srtt (nanoseconds) observed across all paths at the last
+    /// on_select call.  Used as the normalisation baseline in on_ack so that
+    /// reward = 1 − rtt_norm is meaningful (0.0 for the best path, negative
+    /// for worse paths).
+    last_min_rtt_ns: u128,
 }
 
 impl LinUCBScheduler {
@@ -77,6 +82,7 @@ impl LinUCBScheduler {
         LinUCBScheduler {
             alpha: 0.5,
             arms: Vec::new(),
+            last_min_rtt_ns: 1,
         }
     }
 
@@ -166,6 +172,7 @@ impl MultipathScheduler for LinUCBScheduler {
         }
 
         let min_rtt_ns = min_rtt_ns.max(1);
+        self.last_min_rtt_ns = min_rtt_ns;
 
         // Pick the arm with the highest UCB score.
         let mut best_pid = raw[0].0;
@@ -192,19 +199,19 @@ impl MultipathScheduler for LinUCBScheduler {
             Err(_) => return,
         };
 
-        // Use the path's own RTT as baseline (min = self); rtt_norm = 1.0.
         let rtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos().max(1);
         let x = Self::make_context(
             rtt_ns,
-            rtt_ns, // self-relative normalisation
+            self.last_min_rtt_ns, // global minimum from last scheduling decision
             path.recovery.bytes_in_flight,
             path.recovery.congestion.congestion_window(),
         );
 
-        // Reward = 1 − rtt_norm.  For the best path rtt_norm = 1 → reward = 0.
-        // Paths with higher congestion pressure (cwnd_pressure → 1) will have
-        // lower scores, naturally shifting traffic away from saturated paths.
-        let reward = 1.0 - x[0]; // x[0] = rtt_norm = 1.0 here, so reward = 0.0
+        // Reward = 1 − rtt_norm.
+        // Best path (rtt_norm = 1.0) → reward = 0.0.
+        // Worse paths (rtt_norm > 1.0) → negative reward, discouraging selection.
+        // cwnd_pressure in x[1] further penalises congested paths via theta.
+        let reward = 1.0 - x[0];
 
         self.ensure_arm(path_id);
         let arm = self.arms[path_id].as_mut().unwrap();
