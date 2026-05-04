@@ -166,17 +166,17 @@ impl WandbLogger {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&json!({
                 "query": "mutation CreateRunFiles(\
-                    $entity: String!, $project: String!, $run: String!, \
-                    $files: [CreateRunFilesInput!]!) { \
-                    createRunFiles(input: { \
-                        files: $files, entityName: $entity, \
-                        projectName: $project, runName: $run \
-                    }) { runFiles { name uploadUrl } uploadHeaders } }",
+                    $entityName: String!, $projectName: String!, $runName: String!, \
+                    $files: [String]!) { \
+                    createRunFiles(entityName: $entityName, projectName: $projectName, \
+                        runName: $runName, files: $files) { \
+                        uploadHeaders \
+                        files { name url(upload: true) } } }",
                 "variables": {
-                    "entity": self.entity,
-                    "project": self.project,
-                    "run": self.run_name,
-                    "files": [{"name": "wandb-history.jsonl"}]
+                    "entityName": self.entity,
+                    "projectName": self.project,
+                    "runName": self.run_name,
+                    "files": ["wandb-history.jsonl"]
                 }
             }))
             .send()
@@ -199,14 +199,14 @@ impl WandbLogger {
             }
         }
 
-        let upload_url = match resp["data"]["createRunFiles"]["runFiles"]
+        let upload_url = match resp["data"]["createRunFiles"]["files"]
             .as_array()
             .and_then(|arr| arr.first())
-            .and_then(|f| f["uploadUrl"].as_str())
+            .and_then(|f| f["url"].as_str())
         {
             Some(u) => u.to_string(),
             None => {
-                wlog!("ERROR: no uploadUrl in createRunFiles response. Full: {resp}");
+                wlog!("ERROR: no upload url in createRunFiles response. Full: {resp}");
                 return false;
             }
         };
