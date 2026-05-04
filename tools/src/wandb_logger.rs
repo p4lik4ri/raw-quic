@@ -18,18 +18,15 @@
 //!  1. `WandbLogger::new()` — resolve entity from API key, create a new run.
 //!  2. `WandbLogger::upload_history()` — POST the JSONL metric history once at
 //!     connection close (batch upload, no streaming dependency required).
-//!
-//! The wandb REST API used here:
-//!  - GraphQL `{viewer{entity}}` — resolve username from API key.
-//!  - GraphQL `upsertBucket` mutation — create a new run.
-//!  - `POST /files/{entity}/{project}/{run}/file_batch` — obtain a presigned
-//!    upload URL for `wandb-history.jsonl`.
-//!  - `PUT {presigned_url}` — upload the JSONL history file.
 
-use log::{info, warn};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// Always prints to stderr regardless of log level so you always see what's happening.
+macro_rules! wlog {
+    ($($arg:tt)*) => { eprintln!("[wandb] {}", format!($($arg)*)) };
+}
 
 /// Handles a single wandb run for one QUIC connection.
 pub struct WandbLogger {
@@ -49,32 +46,44 @@ impl WandbLogger {
 
     /// Create a new wandb run.
     ///
-    /// Returns `None` and logs a warning if any network call fails, so callers
-    /// can treat wandb as optional and continue normally.
+    /// Returns `None` with a descriptive stderr message if any step fails,
+    /// so callers can treat wandb as optional and continue normally.
     pub fn new(api_key: &str, project: &str) -> Option<Self> {
+        wlog!("initializing for project={project}");
+
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
-            .map_err(|e| warn!("wandb: failed to create HTTP client: {e}"))
+            .map_err(|e| wlog!("ERROR: failed to build HTTP client: {e}"))
             .ok()?;
 
         // ── Step 1: resolve entity (username) from API key ────────────────────
-        let resp: Value = client
+        wlog!("step 1/4: resolving entity from API key ...");
+        let raw = match client
             .post(Self::GRAPHQL)
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&json!({"query": "{viewer{entity}}"}))
             .send()
-            .and_then(|r| r.json())
-            .map_err(|e| warn!("wandb: viewer query failed: {e}"))
-            .ok()?;
+        {
+            Ok(r) => r,
+            Err(e) => { wlog!("ERROR: viewer query network error: {e}"); return None; }
+        };
+        let status = raw.status();
+        let body = raw.text().unwrap_or_default();
+        wlog!("  viewer response HTTP {status}: {body}");
+        let resp: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => { wlog!("ERROR: could not parse viewer JSON: {e}"); return None; }
+        };
 
-        let entity = resp["data"]["viewer"]["entity"]
-            .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| {
-                warn!("wandb: could not read entity from viewer response: {resp}");
-                None
-            })?;
+        let entity = match resp["data"]["viewer"]["entity"].as_str() {
+            Some(s) => s.to_string(),
+            None => {
+                wlog!("ERROR: entity not found in viewer response. Full: {resp}");
+                return None;
+            }
+        };
+        wlog!("  entity resolved: {entity}");
 
         // ── Step 2: create run via upsertBucket mutation ──────────────────────
         let ts = SystemTime::now()
@@ -82,8 +91,9 @@ impl WandbLogger {
             .unwrap_or_default()
             .as_secs();
         let run_name = format!("tquic-linucb-{ts}");
+        wlog!("step 2/4: creating run \"{run_name}\" in {entity}/{project} ...");
 
-        let resp: Value = client
+        let raw = match client
             .post(Self::GRAPHQL)
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&json!({
@@ -97,17 +107,27 @@ impl WandbLogger {
                 }
             }))
             .send()
-            .and_then(|r| r.json())
-            .map_err(|e| warn!("wandb: upsertBucket failed: {e}"))
-            .ok()?;
+        {
+            Ok(r) => r,
+            Err(e) => { wlog!("ERROR: upsertBucket network error: {e}"); return None; }
+        };
+        let status = raw.status();
+        let body = raw.text().unwrap_or_default();
+        wlog!("  upsertBucket response HTTP {status}: {body}");
+        let resp: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => { wlog!("ERROR: could not parse upsertBucket JSON: {e}"); return None; }
+        };
 
-        if resp["errors"].is_array() {
-            warn!("wandb: upsertBucket returned errors: {}", resp["errors"]);
-            return None;
+        if let Some(errors) = resp["errors"].as_array() {
+            if !errors.is_empty() {
+                wlog!("ERROR: upsertBucket returned errors: {errors:?}");
+                return None;
+            }
         }
 
         let run_url = format!("https://wandb.ai/{entity}/{project}/runs/{run_name}");
-        info!("wandb run created: {run_url}");
+        wlog!("step 2/4 OK: run created → {run_url}");
 
         Some(WandbLogger {
             client,
@@ -121,25 +141,32 @@ impl WandbLogger {
 
     /// Upload per-second metric lines (JSONL) to the wandb run history.
     ///
-    /// Each element of `jsonl_lines` must be a valid JSON object string whose
-    /// keys are metric names.  The `_step` key is used by wandb for the x-axis.
-    ///
+    /// Each element of `jsonl_lines` must be a valid JSON object string.
     /// Returns `true` on success.
     pub fn upload_history(&self, jsonl_lines: &[String]) -> bool {
         if jsonl_lines.is_empty() {
+            wlog!("upload_history: no metrics to upload, skipping");
             return true;
         }
 
+        wlog!(
+            "step 3/4: uploading {} metric steps to {} ...",
+            jsonl_lines.len(),
+            self.run_url
+        );
+
         let content = jsonl_lines.join("\n");
         let md5_hex = format!("{:x}", md5::compute(content.as_bytes()));
+        wlog!("  JSONL size={} bytes  md5={md5_hex}", content.len());
 
         // ── Step 3: request a presigned upload URL ────────────────────────────
         let file_batch_url = format!(
             "https://api.wandb.ai/files/{}/{}/{}/file_batch",
             self.entity, self.project, self.run_name
         );
+        wlog!("  POST {file_batch_url}");
 
-        let resp: Value = match self
+        let raw = match self
             .client
             .post(&file_batch_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -152,24 +179,29 @@ impl WandbLogger {
                 }
             }))
             .send()
-            .and_then(|r| r.json())
         {
+            Ok(r) => r,
+            Err(e) => { wlog!("ERROR: file_batch network error: {e}"); return false; }
+        };
+        let status = raw.status();
+        let body = raw.text().unwrap_or_default();
+        wlog!("  file_batch response HTTP {status}: {body}");
+
+        let resp: Value = match serde_json::from_str(&body) {
             Ok(v) => v,
-            Err(e) => {
-                warn!("wandb: file_batch request failed: {e}");
-                return false;
-            }
+            Err(e) => { wlog!("ERROR: could not parse file_batch JSON: {e}"); return false; }
         };
 
         let upload_url = match resp["files"]["wandb-history.jsonl"]["uploadUrl"].as_str() {
             Some(u) => u.to_string(),
             None => {
-                warn!("wandb: no uploadUrl in file_batch response: {resp}");
+                wlog!("ERROR: no uploadUrl in response. Full: {resp}");
                 return false;
             }
         };
 
         // ── Step 4: upload the JSONL content via presigned URL ────────────────
+        wlog!("step 4/4: PUT presigned URL ...");
         match self
             .client
             .put(&upload_url)
@@ -177,18 +209,22 @@ impl WandbLogger {
             .body(content)
             .send()
         {
-            Ok(_) => {
-                info!(
-                    "wandb: {} metrics steps uploaded → {}",
-                    jsonl_lines.len(),
-                    self.run_url
-                );
-                true
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().unwrap_or_default();
+                if status.is_success() {
+                    wlog!(
+                        "SUCCESS: {} steps uploaded → {}",
+                        jsonl_lines.len(),
+                        self.run_url
+                    );
+                    true
+                } else {
+                    wlog!("ERROR: presigned PUT returned HTTP {status}: {body}");
+                    false
+                }
             }
-            Err(e) => {
-                warn!("wandb: history upload failed: {e}");
-                false
-            }
+            Err(e) => { wlog!("ERROR: presigned PUT network error: {e}"); false }
         }
     }
 }

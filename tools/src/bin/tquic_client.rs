@@ -234,8 +234,8 @@ pub struct ClientOpt {
     #[clap(long, env = "WANDB_API_KEY", value_name = "KEY", help_heading = "Observability")]
     pub wandb_api_key: Option<String>,
 
-    /// Weights & Biases project name (default: "tquic-linucb").
-    #[clap(long, default_value = "tquic-linucb", value_name = "STR", help_heading = "Observability")]
+    /// Weights & Biases project name (default: "quic").
+    #[clap(long, default_value = "quic", value_name = "STR", help_heading = "Observability")]
     pub wandb_project: String,
 }
 
@@ -1197,10 +1197,11 @@ impl WorkerHandler {
             server_sent,
             duration_expired,
             current_pkt_recv_us,
-            wandb: option
-                .wandb_api_key
-                .as_deref()
-                .and_then(|key| WandbLogger::new(key, &option.wandb_project)),
+            wandb: {
+                let key = option.wandb_api_key.as_deref()
+                    .unwrap_or("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");
+                WandbLogger::new(key, &option.wandb_project)
+            },
         }
     }
 
