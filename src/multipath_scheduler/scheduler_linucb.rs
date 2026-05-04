@@ -248,14 +248,19 @@ impl MultipathScheduler for LinUCBScheduler {
             }
         }
 
-        // Deficit weighted round-robin using softmax of UCB scores.
-        // Temperature 0.3: near-equal paths split traffic; large UCB gaps
-        // degenerate to argmax (bad paths get ~0% weight).
-        const SPLIT_TAU: f64 = 0.3;
-        let max_ucb = best_score;
+        // Proportional deficit round-robin: weight = min_rtt / path_rtt.
+        // A path with 2× higher RTT receives ½ the traffic; equal paths
+        // split 50/50.  This gives smooth intermediate splits (e.g. 67/33 for
+        // a 2× RTT difference) instead of collapsing to near-argmax.
+        let min_rtt_us = score_rows
+            .iter()
+            .map(|&(_, rtt_us, ..)| rtt_us)
+            .min()
+            .unwrap_or(1)
+            .max(1);
         let weights: Vec<f64> = score_rows
             .iter()
-            .map(|&(.., ucb)| ((ucb - max_ucb) / SPLIT_TAU).exp())
+            .map(|&(_, rtt_us, ..)| min_rtt_us as f64 / (rtt_us as f64).max(1.0))
             .collect();
         let total_w: f64 = weights.iter().sum();
 
