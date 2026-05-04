@@ -1409,9 +1409,21 @@ impl TransportHandler for WorkerHandler {
                 info!("{}", summary);
             }
             // Upload per-second LinUCB metrics to wandb (if configured).
-            if let Some(ref wb) = self.wandb {
-                let metrics = conn.multipath_scheduler_metrics_jsonl();
-                if !metrics.is_empty() {
+            let metrics = conn.multipath_scheduler_metrics_jsonl();
+            if !metrics.is_empty() {
+                // Always write to a local file so data is never lost even when
+                // the machine has no internet access.
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let metrics_path = format!("/tmp/tquic-metrics-{ts}.jsonl");
+                match std::fs::write(&metrics_path, metrics.join("\n")) {
+                    Ok(_) => eprintln!("[wandb] METRICS_FILE={metrics_path}"),
+                    Err(e) => eprintln!("[wandb] WARNING: could not write metrics file: {e}"),
+                }
+                // Attempt live upload — only works if this machine has internet.
+                if let Some(ref wb) = self.wandb {
                     wb.upload_history(&metrics);
                 }
             }
