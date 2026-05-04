@@ -156,59 +156,83 @@ impl WandbLogger {
         );
 
         let content = jsonl_lines.join("\n");
-        let md5_hex = format!("{:x}", md5::compute(content.as_bytes()));
-        wlog!("  JSONL size={} bytes  md5={md5_hex}", content.len());
+        wlog!("  JSONL size={} bytes", content.len());
 
-        // ── Step 3: request a presigned upload URL ────────────────────────────
-        let file_batch_url = format!(
-            "https://api.wandb.ai/files/{}/{}/{}/file_batch",
-            self.entity, self.project, self.run_name
-        );
-        wlog!("  POST {file_batch_url}");
-
+        // ── Step 3: get a presigned upload URL via createRunFiles mutation ────
+        wlog!("step 3/4: requesting upload URL via createRunFiles ...");
         let raw = match self
             .client
-            .post(&file_batch_url)
+            .post(Self::GRAPHQL)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&json!({
-                "files": {
-                    "wandb-history.jsonl": {
-                        "md5": md5_hex,
-                        "content-type": "application/octet-stream"
-                    }
+                "query": "mutation CreateRunFiles(\
+                    $entity: String!, $project: String!, $run: String!, \
+                    $files: [CreateRunFilesInput!]!) { \
+                    createRunFiles(input: { \
+                        files: $files, entityName: $entity, \
+                        projectName: $project, runName: $run \
+                    }) { runFiles { name uploadUrl } uploadHeaders } }",
+                "variables": {
+                    "entity": self.entity,
+                    "project": self.project,
+                    "run": self.run_name,
+                    "files": [{"name": "wandb-history.jsonl"}]
                 }
             }))
             .send()
         {
             Ok(r) => r,
-            Err(e) => { wlog!("ERROR: file_batch network error: {e}"); return false; }
+            Err(e) => { wlog!("ERROR: createRunFiles network error: {e}"); return false; }
         };
         let status = raw.status();
         let body = raw.text().unwrap_or_default();
-        wlog!("  file_batch response HTTP {status}: {body}");
+        wlog!("  createRunFiles response HTTP {status}: {body}");
 
         let resp: Value = match serde_json::from_str(&body) {
             Ok(v) => v,
-            Err(e) => { wlog!("ERROR: could not parse file_batch JSON: {e}"); return false; }
+            Err(e) => { wlog!("ERROR: could not parse createRunFiles JSON: {e}"); return false; }
         };
+        if let Some(errors) = resp["errors"].as_array() {
+            if !errors.is_empty() {
+                wlog!("ERROR: createRunFiles returned errors: {errors:?}");
+                return false;
+            }
+        }
 
-        let upload_url = match resp["files"]["wandb-history.jsonl"]["uploadUrl"].as_str() {
+        let upload_url = match resp["data"]["createRunFiles"]["runFiles"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|f| f["uploadUrl"].as_str())
+        {
             Some(u) => u.to_string(),
             None => {
-                wlog!("ERROR: no uploadUrl in response. Full: {resp}");
+                wlog!("ERROR: no uploadUrl in createRunFiles response. Full: {resp}");
                 return false;
             }
         };
 
+        // Extract any extra upload headers returned by the server.
+        let upload_headers: Vec<(String, String)> = resp["data"]["createRunFiles"]["uploadHeaders"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|h| h.as_str())
+                    .filter_map(|s| s.split_once(':').map(|(k, v)| (k.to_string(), v.trim().to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // ── Step 4: upload the JSONL content via presigned URL ────────────────
         wlog!("step 4/4: PUT presigned URL ...");
-        match self
+        let mut put_req = self
             .client
             .put(&upload_url)
-            .header("Content-Type", "application/octet-stream")
-            .body(content)
-            .send()
-        {
+            .header("Content-Type", "application/octet-stream");
+        for (k, v) in &upload_headers {
+            wlog!("  extra header: {k}: {v}");
+            put_req = put_req.header(k, v);
+        }
+        match put_req.body(content).send() {
             Ok(r) => {
                 let status = r.status();
                 let body = r.text().unwrap_or_default();
