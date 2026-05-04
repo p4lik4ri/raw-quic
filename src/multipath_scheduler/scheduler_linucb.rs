@@ -203,7 +203,15 @@ impl MultipathScheduler for LinUCBScheduler {
             if !path.active() || !path.recovery.can_send() {
                 continue;
             }
-            let rtt_ns = path.recovery.rtt.min_rtt().as_nanos();
+            // Use EMA RTT (learned from ACKs) if available; otherwise fall back
+            // to smoothed_rtt. This avoids scoring based on the historical
+            // min_rtt which is anchored to the sub-ms handshake and never
+            // reflects a permanently bad path.
+            let rtt_ns = if self.ack_counts.get(pid).copied().unwrap_or(0) > 0 {
+                self.ema_rtt_ns[pid] as u128
+            } else {
+                path.recovery.rtt.smoothed_rtt().as_nanos()
+            };
             let bytes_in_flight = path.recovery.bytes_in_flight;
             let cwnd = path.recovery.congestion.congestion_window();
             if rtt_ns < min_rtt_ns {
