@@ -28,10 +28,12 @@ use crate::Result;
 /// Number of context features used by the bandit.
 ///
 /// Features per path:
-///   x[0] = srtt / min_srtt_across_paths  (normalised RTT; 1.0 for best path)
-///   x[1] = bytes_in_flight / cwnd        (congestion window utilisation ∈ [0, 1])
-///   x[2] = 1.0                            (bias / intercept term)
-const D: usize = 3;
+///   x[0] = ema_rtt / min_ema_rtt          (normalised RTT; 1.0 for best path, clamped ≤ 4.0)
+///   x[1] = bytes_in_flight / cwnd         (congestion window utilisation ∈ [0, 1])
+///   x[2] = lost_pkts / sent_pkts          (cumulative packet loss rate ∈ [0, 1])
+///   x[3] = min_pacing / pacing            (inverse throughput norm; 1.0 for fastest path)
+///   x[4] = 1.0                            (bias / intercept term)
+const D: usize = 5;
 
 /// Per-arm (per-path) state for the LinUCB algorithm.
 struct ArmState {
@@ -69,8 +71,6 @@ impl ArmState {
 ///   bₚ ← bₚ + rₚ xₚ
 /// where the reward rₚ = 1 − rtt_norm  (higher reward for lower-RTT paths).
 pub struct LinUCBScheduler {
-    /// Exploration coefficient α.  Larger values increase exploration.
-    alpha: f64,
     /// Per-path arm state, indexed by path_id.
     arms: Vec<Option<ArmState>>,
     /// Minimum srtt (nanoseconds) observed across all paths at the last
@@ -111,7 +111,6 @@ impl LinUCBScheduler {
     pub fn new(_conf: &MultipathConfig) -> Self {
         let now = Instant::now();
         LinUCBScheduler {
-            alpha: 0.5,
             arms: Vec::new(),
             last_min_rtt_ns: 1,
             last_selected: None,
@@ -139,17 +138,26 @@ impl LinUCBScheduler {
         }
     }
 
-    /// Build the context vector for a path, given the minimum RTT across all
-    /// active paths (in nanoseconds).
+    /// Build the context vector for a path.
+    ///
+    /// Arguments:
+    ///   rtt_ns           — EMA RTT for this path (nanoseconds)
+    ///   min_rtt_ns       — minimum EMA RTT across all active paths (nanoseconds)
+    ///   bytes_in_flight  — current bytes in flight on this path
+    ///   cwnd             — current congestion window on this path (bytes)
+    ///   loss_rate        — cumulative lost_pkts / sent_pkts ∈ [0, 1]
+    ///   pacing_rate_bps  — pacing rate in bytes/sec (0 = not available)
+    ///   max_pacing_bps   — maximum pacing rate across all active paths
     fn make_context(
         rtt_ns: u128,
         min_rtt_ns: u128,
         bytes_in_flight: usize,
         cwnd: u64,
+        loss_rate: f64,
+        pacing_rate_bps: u64,
+        max_pacing_bps: u64,
     ) -> [f64; D] {
         let rtt_norm = if min_rtt_ns > 0 {
-            // Clamp to [1.0, 4.0] so a single very-high-RTT measurement cannot
-            // produce a reward of −30 that overwhelms the learned model.
             (rtt_ns as f64 / min_rtt_ns as f64).clamp(1.0, 4.0)
         } else {
             1.0
@@ -159,15 +167,22 @@ impl LinUCBScheduler {
         } else {
             1.0
         };
-        [rtt_norm, cwnd_pressure, 1.0]
+        // Inverse throughput norm: 1.0 for the fastest path, >1.0 for slower.
+        // If pacing rate is unavailable (0), treat as neutral (1.0).
+        let bw_norm = if pacing_rate_bps > 0 && max_pacing_bps > 0 {
+            (max_pacing_bps as f64 / pacing_rate_bps as f64).clamp(1.0, 4.0)
+        } else {
+            1.0
+        };
+        [rtt_norm, cwnd_pressure, loss_rate.clamp(0.0, 1.0), bw_norm, 1.0]
     }
 
     /// Decompose the UCB score into (reward_estimate, exploration_bonus).
     fn ucb_parts(arm: &ArmState, x: [f64; D], alpha: f64) -> (f64, f64) {
-        let a_inv = mat_inv_3(arm.a);
-        let theta = mat_vec_3(a_inv, arm.b);
-        let reward_est = dot3(theta, x);
-        let explore_bonus = alpha * quadratic_3(a_inv, x).max(0.0).sqrt();
+        let a_inv = mat_inv(arm.a);
+        let theta = mat_vec(a_inv, arm.b);
+        let reward_est = dot(theta, x);
+        let explore_bonus = alpha * quadratic(a_inv, x).max(0.0).sqrt();
         (reward_est, explore_bonus)
     }
 
@@ -197,16 +212,14 @@ impl MultipathScheduler for LinUCBScheduler {
         // Collect per-path stats via iter_mut (can_send() takes &mut self).
         // Values are extracted before mutating self.arms to satisfy the borrow checker.
         let mut min_rtt_ns: u128 = u128::MAX;
-        let mut raw: Vec<(usize, u128, usize, u64)> = Vec::new();
+        let mut max_pacing_bps: u64 = 0;
+        // (pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps)
+        let mut raw: Vec<(usize, u128, usize, u64, f64, u64)> = Vec::new();
 
         for (pid, path) in paths.iter_mut() {
             if !path.active() || !path.recovery.can_send() {
                 continue;
             }
-            // Use EMA RTT (learned from ACKs) if available; otherwise fall back
-            // to smoothed_rtt. This avoids scoring based on the historical
-            // min_rtt which is anchored to the sub-ms handshake and never
-            // reflects a permanently bad path.
             let rtt_ns = if self.ack_counts.get(pid).copied().unwrap_or(0) > 0 {
                 self.ema_rtt_ns[pid] as u128
             } else {
@@ -214,10 +227,17 @@ impl MultipathScheduler for LinUCBScheduler {
             };
             let bytes_in_flight = path.recovery.bytes_in_flight;
             let cwnd = path.recovery.congestion.congestion_window();
+            let sent = path.recovery.stats.sent_count;
+            let lost = path.recovery.stats.lost_count;
+            let loss_rate = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
+            let pacing_bps = path.recovery.congestion.pacing_rate().unwrap_or(0);
             if rtt_ns < min_rtt_ns {
                 min_rtt_ns = rtt_ns;
             }
-            raw.push((pid, rtt_ns, bytes_in_flight, cwnd));
+            if pacing_bps > max_pacing_bps {
+                max_pacing_bps = pacing_bps;
+            }
+            raw.push((pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps));
         }
 
         if raw.is_empty() {
@@ -234,11 +254,15 @@ impl MultipathScheduler for LinUCBScheduler {
         // (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb)
         let mut score_rows: Vec<(usize, u64, f64, f64, f64, f64)> = Vec::new();
 
-        for &(pid, rtt_ns, bytes_in_flight, cwnd) in &raw {
-            let x = Self::make_context(rtt_ns, min_rtt_ns, bytes_in_flight, cwnd);
+        for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps) in &raw {
+            let x = Self::make_context(rtt_ns, min_rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, max_pacing_bps);
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
-            let (est, bonus) = Self::ucb_parts(arm, x, self.alpha);
+            // Dynamic alpha: 1/sqrt(n+1). Starts at 1.0 (heavy exploration),
+            // decays as the arm accumulates ACKs, converges to ~0.1 after ~100 ACKs.
+            let n = self.ack_counts.get(pid).copied().unwrap_or(0);
+            let alpha = 1.0_f64 / ((n + 1) as f64).sqrt();
+            let (est, bonus) = Self::ucb_parts(arm, x, alpha);
             let ucb = est + bonus;
             let cwnd_pressure = x[1];
             score_rows.push((pid, (rtt_ns / 1_000) as u64, cwnd_pressure, est, bonus, ucb));
@@ -248,21 +272,32 @@ impl MultipathScheduler for LinUCBScheduler {
             }
         }
 
-        // Proportional deficit round-robin: weight = min_rtt / path_rtt.
-        // A path with 2× higher RTT receives ½ the traffic; equal paths
-        // split 50/50.  This gives smooth intermediate splits (e.g. 67/33 for
-        // a 2× RTT difference) instead of collapsing to near-argmax.
+        // Proportional deficit round-robin: weight = sqrt(min_rtt / path_rtt).
+        // During warmup (any path has < 8 ACKs) use equal weights so that the
+        // uninitialized last_min_rtt_ns=1 doesn't produce a meaningless split.
+        let min_acks = score_rows
+            .iter()
+            .map(|&(pid, ..)| self.ack_counts.get(pid).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
         let min_rtt_us = score_rows
             .iter()
             .map(|&(_, rtt_us, ..)| rtt_us)
             .min()
             .unwrap_or(1)
             .max(1);
-        let weights: Vec<f64> = score_rows
-            .iter()
-            .map(|&(_, rtt_us, ..)| min_rtt_us as f64 / (rtt_us as f64).max(1.0))
-            .collect();
-        let total_w: f64 = weights.iter().sum();
+        // Once warmed up: sqrt inverse-RTT weights compress the ratio scale so
+        // intermediate delays give intermediate splits (5ms→~80/20, 50ms→~92/8).
+        let weights: Vec<f64> = if min_acks < 8 || score_rows.len() == 1 {
+            vec![1.0; score_rows.len()]
+        } else {
+            score_rows
+                .iter()
+                .map(|&(_, rtt_us, ..)| {
+                    (min_rtt_us as f64 / (rtt_us as f64).max(1.0)).sqrt()
+                })
+                .collect()
+        };        let total_w: f64 = weights.iter().sum();
 
         // Grow credits to cover all active path ids.
         let max_active_pid = score_rows.iter().map(|&(pid, ..)| pid).max().unwrap_or(0);
@@ -302,7 +337,7 @@ impl MultipathScheduler for LinUCBScheduler {
         // Cache per-path addresses for the final summary.
         // Prefer local_addr, but fall back to remote_addr when local is
         // unspecified (server bound to 0.0.0.0 / ::).
-        for &(pid, _, _, _) in &raw {
+        for &(pid, _, _, _, _, _) in &raw {
             if pid >= self.path_addrs.len() {
                 self.path_addrs.resize(pid + 1, None);
             }
@@ -388,16 +423,27 @@ impl MultipathScheduler for LinUCBScheduler {
 
         let x = Self::make_context(
             ema_rtt_ns,
-            self.last_min_rtt_ns, // global minimum from last scheduling decision
+            self.last_min_rtt_ns,
             path.recovery.bytes_in_flight,
             path.recovery.congestion.congestion_window(),
+            {
+                let sent = path.recovery.stats.sent_count;
+                let lost = path.recovery.stats.lost_count;
+                if sent > 0 { lost as f64 / sent as f64 } else { 0.0 }
+            },
+            path.recovery.congestion.pacing_rate().unwrap_or(0),
+            // In on_ack we don't have cross-path max; pass 0 so bw_norm = 1.0 (neutral).
+            // The signal comes from on_select where we do have the cross-path max.
+            0,
         );
 
-        // Reward = 1 − rtt_norm.
-        // Best path (rtt_norm = 1.0) → reward = 0.0.
-        // Worse paths (rtt_norm > 1.0) → negative reward, discouraging selection.
-        // cwnd_pressure in x[1] further penalises congested paths via theta.
-        let reward = 1.0 - x[0];
+        // Reward combines three path-quality signals:
+        //   - rtt_norm      (x[0]): penalises high-latency paths
+        //   - cwnd_pressure (x[1]): penalises congested paths
+        //   - loss_rate     (x[2]): penalises lossy paths
+        // This lets LinUCB learn to avoid bad paths even when RTT alone is
+        // not yet reflecting the degradation.
+        let reward = 1.0 - x[0] - 0.3 * x[1] - 0.5 * x[2];
 
         self.ensure_arm(path_id);
         let arm = self.arms[path_id].as_mut().unwrap();
@@ -426,18 +472,22 @@ impl MultipathScheduler for LinUCBScheduler {
                 .and_then(|a| a.as_deref())
                 .unwrap_or("?");
             let pct = cnt * 100 / self.total_selections;
-            // Final model estimate using a neutral context (rtt_norm=1.0, pressure=0.0, bias=1.0).
-            let est_str = if let Some(Some(arm)) = self.arms.get(pid) {
-                let x = [1.0_f64, 0.0_f64, 1.0_f64];
-                let a_inv = mat_inv_3(arm.a);
-                let theta = mat_vec_3(a_inv, arm.b);
-                let est = dot3(theta, x);
-                format!("{est:+.3}")
+            // Final model estimate + exploration bonus using a neutral context:
+            // rtt_norm=1.0, cwnd_pressure=0.0, loss_rate=0.0, bw_norm=1.0, bias=1.0.
+            let (est_str, bonus_str) = if let Some(Some(arm)) = self.arms.get(pid) {
+                let x = [1.0_f64, 0.0_f64, 0.0_f64, 1.0_f64, 1.0_f64];
+                let a_inv = mat_inv(arm.a);
+                let theta = mat_vec(a_inv, arm.b);
+                let est = dot(theta, x);
+                let n = self.ack_counts.get(pid).copied().unwrap_or(0);
+                let alpha = 1.0_f64 / ((n + 1) as f64).sqrt();
+                let bonus = alpha * quadratic(a_inv, x).max(0.0).sqrt();
+                (format!("{est:+.3}"), format!("{bonus:.3} (n={n})"))
             } else {
-                "n/a".into()
+                ("n/a".into(), "n/a".into())
             };
             out.push_str(&format!(
-                "    path[{pid}] {addr}  selections={cnt} ({pct}%)  est(neutral)={est_str}\n"
+                "    path[{pid}] {addr}  selections={cnt} ({pct}%)  est(neutral)={est_str}  explore_bonus={bonus_str}\n"
             ));
         }
 
@@ -454,67 +504,85 @@ impl MultipathScheduler for LinUCBScheduler {
     }
 }
 
-// ─── 3×3 linear algebra helpers ──────────────────────────────────────────────
+// ─── D×D linear algebra helpers ──────────────────────────────────────────────
 //
-// These operate on plain arrays to avoid external dependencies.
+// Generic implementations that work for any const D.
+// mat_inv uses Gauss-Jordan elimination with partial pivoting.
 
-/// Compute the inverse of a 3×3 matrix using Cramer's rule.
+/// Compute the inverse of a D×D matrix using Gauss-Jordan elimination.
 ///
-/// Returns the identity matrix when the determinant is near zero to avoid
+/// Returns the identity matrix when the matrix is (near-)singular to avoid
 /// numerical blow-up during early exploration.
-fn mat_inv_3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-
-    if det.abs() < 1e-15 {
-        let mut r = [[0.0_f64; 3]; 3];
-        for i in 0..3 {
-            r[i][i] = 1.0;
-        }
-        return r;
+fn mat_inv(m: [[f64; D]; D]) -> [[f64; D]; D] {
+    let mut a = m;
+    let mut inv = [[0.0_f64; D]; D];
+    for i in 0..D {
+        inv[i][i] = 1.0;
     }
-
-    let inv = 1.0 / det;
-    [
-        [
-            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv,
-            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv,
-            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv,
-        ],
-        [
-            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv,
-            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv,
-            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv,
-        ],
-        [
-            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv,
-            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv,
-            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv,
-        ],
-    ]
+    for col in 0..D {
+        // Partial pivoting: find row with largest absolute value in this column.
+        let mut max_row = col;
+        let mut max_val = a[col][col].abs();
+        for row in (col + 1)..D {
+            if a[row][col].abs() > max_val {
+                max_val = a[row][col].abs();
+                max_row = row;
+            }
+        }
+        if max_val < 1e-15 {
+            // Singular — return identity to avoid blowing up.
+            let mut r = [[0.0_f64; D]; D];
+            for i in 0..D {
+                r[i][i] = 1.0;
+            }
+            return r;
+        }
+        a.swap(col, max_row);
+        inv.swap(col, max_row);
+        // Scale pivot row.
+        let pivot = a[col][col];
+        for j in 0..D {
+            a[col][j] /= pivot;
+            inv[col][j] /= pivot;
+        }
+        // Eliminate column in all other rows.
+        for row in 0..D {
+            if row == col {
+                continue;
+            }
+            let factor = a[row][col];
+            for j in 0..D {
+                a[row][j] -= factor * a[col][j];
+                inv[row][j] -= factor * inv[col][j];
+            }
+        }
+    }
+    inv
 }
 
-/// Multiply a 3×3 matrix by a 3-vector.
-fn mat_vec_3(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
-    let mut r = [0.0_f64; 3];
-    for i in 0..3 {
-        for j in 0..3 {
+/// Multiply a D×D matrix by a D-vector.
+fn mat_vec(m: [[f64; D]; D], v: [f64; D]) -> [f64; D] {
+    let mut r = [0.0_f64; D];
+    for i in 0..D {
+        for j in 0..D {
             r[i] += m[i][j] * v[j];
         }
     }
     r
 }
 
-/// Dot product of two 3-vectors.
-fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+/// Dot product of two D-vectors.
+fn dot(a: [f64; D], b: [f64; D]) -> f64 {
+    let mut s = 0.0_f64;
+    for i in 0..D {
+        s += a[i] * b[i];
+    }
+    s
 }
 
-/// Quadratic form xᵀ M x for a 3×3 matrix M and 3-vector x.
-fn quadratic_3(m: [[f64; 3]; 3], x: [f64; 3]) -> f64 {
-    let mx = mat_vec_3(m, x);
-    dot3(x, mx)
+/// Quadratic form xᵀ M x for a D×D matrix M and D-vector x.
+fn quadratic(m: [[f64; D]; D], x: [f64; D]) -> f64 {
+    dot(x, mat_vec(m, x))
 }
 
 #[cfg(test)]
@@ -546,10 +614,14 @@ mod tests {
 
     #[test]
     fn mat_inv_identity() {
-        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let inv = mat_inv_3(id);
-        for i in 0..3 {
-            for j in 0..3 {
+        // Build a D×D identity and verify inversion returns identity.
+        let mut id = [[0.0_f64; D]; D];
+        for i in 0..D {
+            id[i][i] = 1.0;
+        }
+        let inv = mat_inv(id);
+        for i in 0..D {
+            for j in 0..D {
                 let expected = if i == j { 1.0 } else { 0.0 };
                 assert!((inv[i][j] - expected).abs() < 1e-10);
             }
