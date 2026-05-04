@@ -59,7 +59,6 @@ use tquic::Endpoint;
 use tquic::MultipathAlgorithm;
 use tquic::PacketInfo;
 
-use tquic_tools::wandb_logger::WandbLogger;
 use tquic::TlsConfig;
 use tquic::TransportHandler;
 use tquic_tools::CertCompressionAlgorithmArg;
@@ -226,17 +225,6 @@ pub struct ClientOpt {
     #[clap(long, help_heading = "Misc")]
     pub disable_encryption: bool,
 
-    // ── Observability ─────────────────────────────────────────────────────────
-    /// Weights & Biases API key.  When set, per-second LinUCB metrics are
-    /// uploaded to wandb at connection close.  Keep this value in an env var
-    /// rather than passing it on the command line to avoid shell history leaks:
-    ///   WANDB_API_KEY=<key>  tquic_client --wandb-project my-project ...
-    #[clap(long, env = "WANDB_API_KEY", value_name = "KEY", help_heading = "Observability")]
-    pub wandb_api_key: Option<String>,
-
-    /// Weights & Biases project name (default: "quic").
-    #[clap(long, default_value = "quic", value_name = "STR", help_heading = "Observability")]
-    pub wandb_project: String,
 }
 
 const MAX_BUF_SIZE: usize = 65536;
@@ -1160,8 +1148,6 @@ struct WorkerHandler {
     /// immediately before calling endpoint.recv(), so on_stream_readable can read
     /// the accurate OS-level arrival time for the current QUIC packet.
     current_pkt_recv_us: Arc<AtomicU64>,
-    /// Optional wandb logger — created once at start, uploads metrics on close.
-    wandb: Option<WandbLogger>,
 }
 
 impl WorkerHandler {
@@ -1197,11 +1183,6 @@ impl WorkerHandler {
             server_sent,
             duration_expired,
             current_pkt_recv_us,
-            wandb: {
-                let key = option.wandb_api_key.as_deref()
-                    .unwrap_or("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");
-                WandbLogger::new(key, &option.wandb_project)
-            },
         }
     }
 
@@ -1407,25 +1388,6 @@ impl TransportHandler for WorkerHandler {
             // Print LinUCB summary (if applicable) before per-path stats.
             if let Some(summary) = conn.multipath_scheduler_summary() {
                 info!("{}", summary);
-            }
-            // Upload per-second LinUCB metrics to wandb (if configured).
-            let metrics = conn.multipath_scheduler_metrics_jsonl();
-            if !metrics.is_empty() {
-                // Always write to a local file so data is never lost even when
-                // the machine has no internet access.
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let metrics_path = format!("/tmp/tquic-metrics-{ts}.jsonl");
-                match std::fs::write(&metrics_path, metrics.join("\n")) {
-                    Ok(_) => eprintln!("[wandb] METRICS_FILE={metrics_path}"),
-                    Err(e) => eprintln!("[wandb] WARNING: could not write metrics file: {e}"),
-                }
-                // Attempt live upload — only works if this machine has internet.
-                if let Some(ref wb) = self.wandb {
-                    wb.upload_history(&metrics);
-                }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
             for (i, four_tuple) in paths.iter().enumerate() {

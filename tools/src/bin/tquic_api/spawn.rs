@@ -14,8 +14,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use tquic_tools::wandb_logger::WandbLogger;
-
 use crate::state::OUTPUT_CAP;
 
 // ─────────────────────────────────── formatting ───────────────────────────────
@@ -101,9 +99,6 @@ pub async fn spawn_and_capture(
     output_buf:   Arc<Mutex<VecDeque<String>>>,
     result_store: Option<Arc<Mutex<Vec<serde_json::Value>>>>,
     source:       &'static str,
-    // If Some((api_key, project)), automatically upload LinUCB metrics to
-    // wandb when the child exits (detected via `[wandb] METRICS_FILE=` line).
-    wandb_config: Option<(String, String)>,
 ) -> std::io::Result<Child> {
     use std::process::Stdio;
     cmd.stdout(Stdio::piped());
@@ -151,52 +146,18 @@ pub async fn spawn_and_capture(
         });
     }
 
-    // stderr → always visible at INFO; detect METRICS_FILE= for auto wandb upload
+    // stderr → always visible at INFO
     if let Some(stderr) = child.stderr.take() {
         let buf = Arc::clone(&output_buf);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
-            let mut metrics_file: Option<String> = None;
             while let Ok(Some(line)) = lines.next_line().await {
                 log::info!("[{source}] stderr: {line}");
-                // Detect the path written by tquic_client on connection close.
-                const TAG: &str = "[wandb] METRICS_FILE=";
-                if let Some(pos) = line.find(TAG) {
-                    metrics_file = Some(line[pos + TAG.len()..].trim().to_string());
-                }
                 let mut lock = buf.lock().await;
                 if lock.len() >= OUTPUT_CAP { lock.pop_front(); }
                 lock.push_back(line);
             }
             log::info!("[{source}] stderr stream ended");
-
-            // Auto-upload to wandb once the process has exited.
-            if let (Some(path), Some((api_key, project))) = (metrics_file, wandb_config) {
-                log::info!("[{source}] wandb: auto-uploading from {path} ...");
-                match tokio::fs::read_to_string(&path).await {
-                    Err(e) => log::warn!("[{source}] wandb: could not read {path}: {e}"),
-                    Ok(content) => {
-                        let metric_lines: Vec<String> = content
-                            .lines()
-                            .filter(|l| !l.trim().is_empty())
-                            .map(|l| l.to_string())
-                            .collect();
-                        if metric_lines.is_empty() {
-                            log::warn!("[{source}] wandb: metrics file {path} is empty");
-                        } else {
-                            let result = tokio::task::spawn_blocking(move || -> Option<String> {
-                                let wb = WandbLogger::new(&api_key, &project)?;
-                                wb.upload_history(&metric_lines).then_some(wb.run_url)
-                            }).await;
-                            match result {
-                                Ok(Some(url)) => log::info!("[{source}] wandb: upload complete → {url}"),
-                                Ok(None)      => log::warn!("[{source}] wandb: upload failed (see stderr above)"),
-                                Err(e)        => log::warn!("[{source}] wandb: task error: {e}"),
-                            }
-                        }
-                    }
-                }
-            }
         });
     }
 

@@ -199,18 +199,3 @@ pub fn default_listen() -> String { "0.0.0.0:4433".into() }
 pub fn default_cc()     -> String { "cubic".into() }
 pub fn default_log()    -> String { "info".into() }
 pub fn default_mode()   -> String { "downlink".into() }
-
-// ─────────────────────────────────── wandb upload ─────────────────────────────
-
-/// Optional body for `POST /client/wandb_upload`.
-/// All fields have defaults so the endpoint can be called with an empty body.
-#[derive(Debug, Deserialize, Default)]
-pub struct WandbUploadRequest {
-    /// wandb API key.  Falls back to the compiled-in default when omitted.
-    pub api_key: Option<String>,
-    /// wandb project name [default: "quic"]
-    pub project: Option<String>,
-    /// Path to a JSONL metrics file.  When omitted the server looks for the
-    /// path printed by the most recent tquic_client run.
-    pub metrics_file: Option<String>,
-}

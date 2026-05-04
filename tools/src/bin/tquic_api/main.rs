@@ -34,7 +34,7 @@ use axum::routing::{get, post};
 use tokio::sync::Mutex;
 
 use handlers::{
-    client_start, client_status, client_stop, client_intervals, client_wandb_upload,
+    client_start, client_status, client_stop, client_intervals,
     last_json_result, overall_status, server_clear, server_intervals,
     server_last_json_result, server_start, server_status, server_stop,
 };
@@ -80,7 +80,6 @@ async fn main() {
         .route("/client/stop",            post(client_stop))
         .route("/client/status",          get(client_status))
         .route("/client/intervals",       get(client_intervals))
-        .route("/client/wandb_upload",    post(client_wandb_upload))
         .route("/status",                 get(overall_status))
         .route("/LastJsonResult",         get(last_json_result))
         .layer(axum::middleware::from_fn(middleware::log_request))

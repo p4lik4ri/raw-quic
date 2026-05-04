@@ -11,9 +11,7 @@ use axum::Json;
 use axum::extract::State;
 use tokio::process::Command;
 
-use tquic_tools::wandb_logger::WandbLogger;
-
-use crate::models::{ClientStartRequest, OverallStatus, ServerStartRequest, WandbUploadRequest};
+use crate::models::{ClientStartRequest, OverallStatus, ServerStartRequest};
 use crate::spawn::{fmt_float, spawn_and_capture};
 use crate::state::{AppState, ProcessStatus};
 
@@ -65,7 +63,7 @@ pub async fn server_start(
     proc.output.lock().await.clear();
     // Parse server stdout into last_server: the server is the receiver in
     // uplink mode, so its interval rows contain real jitter values.
-    match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_server)), "server", None).await {
+    match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_server)), "server").await {
         Ok(child) => {
             let pid = child.id();
             proc.child = Some(child);
@@ -170,10 +168,7 @@ pub async fn client_start(
         std::sync::atomic::Ordering::Relaxed,
     );
     // Parse interval lines from client stdout into last_client (last session only).
-    const WANDB_KEY: &str =
-        "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";
-    let wandb_config = Some((WANDB_KEY.to_string(), "quic".to_string()));
-    match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_client)), "client", wandb_config).await {
+    match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_client)), "client").await {
         Ok(child) => {
             let pid = child.id();
             proc.child = Some(child);
@@ -313,98 +308,4 @@ pub async fn server_last_json_result(
         )
     }).collect();
     format!("Last Json Result: [{}]", items.join(", "))
-}
-
-/// `POST /client/wandb_upload` — upload LinUCB metrics from the last client
-/// run to Weights & Biases.
-///
-/// Because `tquic_client` may run on a machine without general internet access
-/// (e.g. a Raspberry Pi on a closed lab LAN), the metrics JSONL file is written
-/// locally by the client and the upload is performed here, from the API server,
-/// which is reachable from the internet via Tailscale.
-///
-/// The metrics file path is detected automatically from the `[wandb] METRICS_FILE=`
-/// line that `tquic_client` prints to stderr (captured in the output ring buffer).
-/// You may also supply it explicitly in the request body.
-pub async fn client_wandb_upload(
-    State(state): State<Arc<AppState>>,
-    body: Option<Json<WandbUploadRequest>>,
-) -> Json<serde_json::Value> {
-    let req = body.map(|b| b.0).unwrap_or_default();
-
-    const DEFAULT_API_KEY: &str =
-        "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";
-    let api_key = req.api_key
-        .as_deref()
-        .unwrap_or(DEFAULT_API_KEY)
-        .to_string();
-    let project = req.project
-        .as_deref()
-        .unwrap_or("quic")
-        .to_string();
-
-    // ── Locate the metrics file ───────────────────────────────────────────────
-    let metrics_path: String = if let Some(p) = req.metrics_file {
-        p
-    } else {
-        // Scan the client output ring buffer for the most recent METRICS_FILE= line.
-        let output = state.client.lock().await.output.lock().await.clone();
-        let found = output.iter().rev()
-            .find_map(|line| {
-                let tag = "[wandb] METRICS_FILE=";
-                line.find(tag).map(|pos| line[pos + tag.len()..].trim().to_string())
-            });
-        match found {
-            Some(p) => p,
-            None => return Json(serde_json::json!({
-                "ok": false,
-                "error": "No metrics file found in client output. Run a multipath client test first, or supply metrics_file in the request body."
-            })),
-        }
-    };
-
-    // ── Read the JSONL file ───────────────────────────────────────────────────
-    let jsonl_content = match std::fs::read_to_string(&metrics_path) {
-        Ok(s) => s,
-        Err(e) => return Json(serde_json::json!({
-            "ok": false,
-            "error": format!("Could not read metrics file {metrics_path}: {e}")
-        })),
-    };
-    let lines: Vec<String> = jsonl_content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.to_string())
-        .collect();
-    if lines.is_empty() {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error": format!("Metrics file {metrics_path} is empty")
-        }));
-    }
-
-    // ── Upload via WandbLogger (blocking) ────────────────────────────────────
-    let result = tokio::task::spawn_blocking(move || {
-        match WandbLogger::new(&api_key, &project) {
-            None => Err("WandbLogger::new failed — check stderr for details".to_string()),
-            Some(wb) => {
-                let ok = wb.upload_history(&lines);
-                if ok {
-                    Ok(wb.run_url.clone())
-                } else {
-                    Err("upload_history failed — check stderr for details".to_string())
-                }
-            }
-        }
-    }).await;
-
-    match result {
-        Ok(Ok(run_url)) => Json(serde_json::json!({
-            "ok": true,
-            "run_url": run_url,
-            "metrics_file": metrics_path,
-        })),
-        Ok(Err(msg)) => Json(serde_json::json!({ "ok": false, "error": msg })),
-        Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
-    }
 }
