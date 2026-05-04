@@ -415,11 +415,35 @@ impl MultipathScheduler for LinUCBScheduler {
             self.ema_rtt_ns.resize(path_id + 1, rtt_ns as f64);
             self.ack_counts.resize(path_id + 1, 0);
         }
+        let old_ema = self.ema_rtt_ns[path_id];
         self.ack_counts[path_id] += 1;
-        let alpha = if self.ack_counts[path_id] <= 8 { 0.5_f64 } else { 0.2_f64 };
+        let ema_alpha = if self.ack_counts[path_id] <= 8 { 0.5_f64 } else { 0.2_f64 };
         self.ema_rtt_ns[path_id] =
-            alpha * rtt_ns as f64 + (1.0 - alpha) * self.ema_rtt_ns[path_id];
+            ema_alpha * rtt_ns as f64 + (1.0 - ema_alpha) * old_ema;
         let ema_rtt_ns = self.ema_rtt_ns[path_id] as u128;
+
+        // ── RTT-jump reset ────────────────────────────────────────────────────
+        // If the EMA RTT has changed by more than 30% since the previous ACK,
+        // the path quality has shifted significantly (delay added or removed).
+        // Inject uncertainty into the arm's A matrix by blending it back
+        // toward the identity, which raises the exploration bonus and forces
+        // the model to re-learn from current observations rather than relying
+        // on stale history.
+        //
+        // The injection magnitude (10.0 × I) is chosen so that after a jump:
+        //   alpha_effective = 1/sqrt(n_injected) ≈ 1/sqrt(10) ≈ 0.32
+        // i.e. the arm behaves as if it has only ~10 recent observations,
+        // regardless of how many ACKs it has accumulated.
+        self.ensure_arm(path_id);
+        if self.ack_counts[path_id] > 8 {
+            let rtt_change = (self.ema_rtt_ns[path_id] - old_ema) / old_ema;
+            if rtt_change.abs() > 0.30 {
+                let arm = self.arms[path_id].as_mut().unwrap();
+                for i in 0..D {
+                    arm.a[i][i] += 10.0;
+                }
+            }
+        }
 
         let x = Self::make_context(
             ema_rtt_ns,
@@ -445,7 +469,6 @@ impl MultipathScheduler for LinUCBScheduler {
         // not yet reflecting the degradation.
         let reward = 1.0 - x[0] - 0.3 * x[1] - 0.5 * x[2];
 
-        self.ensure_arm(path_id);
         let arm = self.arms[path_id].as_mut().unwrap();
         Self::update_arm(arm, x, reward);
     }
