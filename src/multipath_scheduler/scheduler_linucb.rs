@@ -108,6 +108,11 @@ pub struct LinUCBScheduler {
     /// Per-second JSONL metric lines buffered for wandb upload at run end.
     /// Each line is a flat JSON object with a `_step` key and per-path metrics.
     metrics_jsonl: Vec<String>,
+    /// Last context vector used for each path in on_select.
+    /// Stored here so on_ack can update the model with the *exact same* features
+    /// that were used at selection time (avoids training mismatch from missing
+    /// cross-path max_pacing_bps in on_ack).
+    last_context: Vec<Option<[f64; D]>>,
 }
 
 impl LinUCBScheduler {
@@ -129,6 +134,7 @@ impl LinUCBScheduler {
             ack_counts: Vec::new(),
             credits: Vec::new(),
             metrics_jsonl: Vec::new(),
+            last_context: Vec::new(),
         }
     }
 
@@ -268,6 +274,11 @@ impl MultipathScheduler for LinUCBScheduler {
             let alpha = 1.0_f64 / ((n + 1) as f64).sqrt();
             let (est, bonus) = Self::ucb_parts(arm, x, alpha);
             let ucb = est + bonus;
+            // Store context so on_ack uses the same feature vector (no mismatch).
+            if pid >= self.last_context.len() {
+                self.last_context.resize(pid + 1, None);
+            }
+            self.last_context[pid] = Some(x);
             let cwnd_pressure = x[1];
             score_rows.push((pid, (rtt_ns / 1_000) as u64, cwnd_pressure, est, bonus, ucb, x));
             if ucb > best_score {
@@ -483,29 +494,36 @@ impl MultipathScheduler for LinUCBScheduler {
             }
         }
 
-        let x = Self::make_context(
-            ema_rtt_ns,
-            self.last_min_rtt_ns,
-            path.recovery.bytes_in_flight,
-            path.recovery.congestion.congestion_window(),
-            {
-                let sent = path.recovery.stats.sent_count;
-                let lost = path.recovery.stats.lost_count;
-                if sent > 0 { lost as f64 / sent as f64 } else { 0.0 }
-            },
-            path.recovery.congestion.pacing_rate().unwrap_or(0),
-            // In on_ack we don't have cross-path max; pass 0 so bw_norm = 1.0 (neutral).
-            // The signal comes from on_select where we do have the cross-path max.
-            0,
-        );
+        // Use the context vector that was built at selection time (on_select
+        // has the cross-path max_pacing_bps; on_ack does not).  Fall back to
+        // recomputing only if no selection has happened yet for this path.
+        let x = self
+            .last_context
+            .get(path_id)
+            .and_then(|c| *c)
+            .unwrap_or_else(|| {
+                Self::make_context(
+                    ema_rtt_ns,
+                    self.last_min_rtt_ns,
+                    path.recovery.bytes_in_flight,
+                    path.recovery.congestion.congestion_window(),
+                    {
+                        let sent = path.recovery.stats.sent_count;
+                        let lost = path.recovery.stats.lost_count;
+                        if sent > 0 { lost as f64 / sent as f64 } else { 0.0 }
+                    },
+                    0,
+                    0,
+                )
+            });
 
-        // Reward combines three path-quality signals:
-        //   - rtt_norm      (x[0]): penalises high-latency paths
-        //   - cwnd_pressure (x[1]): penalises congested paths
-        //   - loss_rate     (x[2]): penalises lossy paths
-        // This lets LinUCB learn to avoid bad paths even when RTT alone is
-        // not yet reflecting the degradation.
-        let reward = 1.0 - x[0] - 0.3 * x[1] - 0.5 * x[2];
+        // Reward: exp(-rtt_norm) * (1 - loss_rate)
+        //   - Always positive and bounded in (0, 1]
+        //   - rtt_norm = 1.0 on best path → exp(-1) ≈ 0.37 (max reward)
+        //   - rtt_norm = 4.0 on worst path → exp(-4) ≈ 0.018 (strong penalty)
+        //   - loss_rate multiplier further suppresses lossy paths
+        //   - Stable scale prevents reward drift that destabilises theta
+        let reward = (-x[0]).exp() * (1.0 - x[2]);
 
         let arm = self.arms[path_id].as_mut().unwrap();
         Self::update_arm(arm, x, reward);
