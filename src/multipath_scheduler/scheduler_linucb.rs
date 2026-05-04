@@ -105,6 +105,9 @@ pub struct LinUCBScheduler {
     /// Each scheduling round adds softmax(UCB) weight to every active path;
     /// the path with the most credits is chosen and loses one credit.
     credits: Vec<f64>,
+    /// Per-second JSONL metric lines buffered for wandb upload at run end.
+    /// Each line is a flat JSON object with a `_step` key and per-path metrics.
+    metrics_jsonl: Vec<String>,
 }
 
 impl LinUCBScheduler {
@@ -125,6 +128,7 @@ impl LinUCBScheduler {
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
             credits: Vec::new(),
+            metrics_jsonl: Vec::new(),
         }
     }
 
@@ -251,8 +255,8 @@ impl MultipathScheduler for LinUCBScheduler {
         // for logging.
         let mut best_pid = raw[0].0;
         let mut best_score = f64::NEG_INFINITY;
-        // (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb)
-        let mut score_rows: Vec<(usize, u64, f64, f64, f64, f64)> = Vec::new();
+        // (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb, context_x)
+        let mut score_rows: Vec<(usize, u64, f64, f64, f64, f64, [f64; D])> = Vec::new();
 
         for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps) in &raw {
             let x = Self::make_context(rtt_ns, min_rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, max_pacing_bps);
@@ -265,7 +269,7 @@ impl MultipathScheduler for LinUCBScheduler {
             let (est, bonus) = Self::ucb_parts(arm, x, alpha);
             let ucb = est + bonus;
             let cwnd_pressure = x[1];
-            score_rows.push((pid, (rtt_ns / 1_000) as u64, cwnd_pressure, est, bonus, ucb));
+            score_rows.push((pid, (rtt_ns / 1_000) as u64, cwnd_pressure, est, bonus, ucb, x));
             if ucb > best_score {
                 best_score = ucb;
                 best_pid = pid;
@@ -390,6 +394,40 @@ impl MultipathScheduler for LinUCBScheduler {
                 "  t={elapsed_s:>3}s:  {}",
                 parts.join("  |  ")
             ));
+
+            // ── wandb JSONL metric line ──────────────────────────────────────
+            // Flat JSON object per second.  Metric names use "p{pid}." prefix
+            // so wandb groups them by path in the UI.
+            // Features: x0=rtt_norm, x1=cwnd_p, x2=loss_rate, x3=bw_norm, x4=bias
+            // Theta:    th0..th4 = learned LinUCB weights for each feature.
+            {
+                let step = self.metrics_jsonl.len() as u64;
+                let feat_names = ["rtt_norm", "cwnd_p", "loss_rate", "bw_norm", "bias"];
+                let mut jline = format!("{{\"_step\":{step},\"t\":{elapsed_s}");
+                for &(pid, rtt_us, _cp, reward_est, explore_bonus, _ucb, x) in &score_rows {
+                    let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
+                    let pct = cnt as f64 * 100.0 / total as f64;
+                    let n = self.ack_counts.get(pid).copied().unwrap_or(0);
+                    let theta = if let Some(Some(arm)) = self.arms.get(pid) {
+                        mat_vec(mat_inv(arm.a), arm.b)
+                    } else {
+                        [0.0_f64; D]
+                    };
+                    jline.push_str(&format!(
+                        ",\"p{pid}.pct\":{pct:.2},\"p{pid}.rtt_us\":{rtt_us},\"p{pid}.reward\":{reward_est:.4},\"p{pid}.bonus\":{explore_bonus:.4},\"p{pid}.n\":{n}",
+                    ));
+                    for (i, xi) in x.iter().enumerate() {
+                        jline.push_str(&format!(",\"p{pid}.x_{}\":{xi:.4}", feat_names[i]));
+                    }
+                    for (i, ti) in theta.iter().enumerate() {
+                        jline.push_str(&format!(",\"p{pid}.th_{}\":{ti:.4}", feat_names[i]));
+                    }
+                }
+                jline.push('}');
+                self.metrics_jsonl.push(jline);
+            }
+            // ── end wandb line ───────────────────────────────────────────────
+
             self.last_log = Some(now);
             for c in &mut self.window_counts {
                 *c = 0;
@@ -524,6 +562,10 @@ impl MultipathScheduler for LinUCBScheduler {
         }
 
         Some(out)
+    }
+
+    fn scheduler_metrics_jsonl(&self) -> Vec<String> {
+        self.metrics_jsonl.clone()
     }
 }
 

@@ -68,6 +68,13 @@ pub(crate) trait MultipathScheduler {
     fn scheduler_summary(&self) -> Option<String> {
         None
     }
+
+    /// Return per-second JSONL metric lines for external logging (e.g. wandb).
+    /// Each element is a JSON object string with a flat set of metric keys.
+    /// Returns an empty Vec for schedulers that do not produce metrics.
+    fn scheduler_metrics_jsonl(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Available multipath scheduling algorithms.

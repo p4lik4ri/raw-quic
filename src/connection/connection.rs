@@ -3839,6 +3839,16 @@ impl Connection {
             .and_then(|s| s.scheduler_summary())
     }
 
+    /// Return per-second JSONL metric lines from the multipath scheduler.
+    /// Used by external loggers such as wandb.  Returns an empty Vec if the
+    /// scheduler produces no metrics (e.g. for non-LinUCB schedulers).
+    pub fn multipath_scheduler_metrics_jsonl(&self) -> Vec<String> {
+        self.multipath_scheduler
+            .as_ref()
+            .map(|s| s.scheduler_metrics_jsonl())
+            .unwrap_or_default()
+    }
+
     /// Return an iterator over path addresses.
     pub fn paths_iter(&self) -> FourTupleIter {
         // Instead of trying to identify whether packets will be sent on the
