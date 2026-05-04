@@ -98,7 +98,7 @@ impl WandbLogger {
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&json!({
                 "query": "mutation UpsertBucket($name: String, $project: String, $entity: String) \
-                          { upsertBucket(name: $name, modelName: $project, entityName: $entity) \
+                          { upsertBucket(input: {name: $name, modelName: $project, entityName: $entity}) \
                             { bucket { id name } } }",
                 "variables": {
                     "name": run_name,
