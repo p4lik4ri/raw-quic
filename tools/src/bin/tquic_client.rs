@@ -1400,12 +1400,11 @@ impl TransportHandler for WorkerHandler {
             if let Some(summary) = conn.multipath_scheduler_summary() {
                 info!("{}", summary);
             }
-            // Upload per-second LinUCB metrics to wandb.
-            // Create the run lazily here — only when real data exists — so that
-            // non-multipath tests never create empty wandb runs.
-            // take() the key so only the first connection per session uploads.
+            // Upload metrics to wandb only in uplink mode: the client is the
+            // sender, so its scheduler metrics are meaningful. In downlink the
+            // server uploads instead.
             let metrics = conn.multipath_scheduler_metrics_jsonl();
-            if !metrics.is_empty() {
+            if !metrics.is_empty() && self.option.mode == TransferMode::Uplink {
                 if let Some(key) = self.wandb_key.take() {
                     let sched = match self.option.multipath_algor {
                         tquic::MultipathAlgorithm::MinRtt     => "minrtt",

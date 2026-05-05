@@ -728,9 +728,11 @@ impl TransportHandler for ServerHandler {
             if let Some(summary) = conn.multipath_scheduler_summary() {
                 info!("{}", summary);
             }
-            // Upload per-second LinUCB metrics to wandb (downlink: server is the sender).
+            // Upload metrics to wandb only in downlink mode: the server is the
+            // sender, so its scheduler metrics are meaningful. In uplink the
+            // client uploads instead.
             let metrics = conn.multipath_scheduler_metrics_jsonl();
-            if !metrics.is_empty() {
+            if !metrics.is_empty() && !self.is_uplink.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(key) = self.wandb_key.take() {
                     if let Some(wb) = WandbLogger::new(&key, "quic", &self.scheduler_name) {
                         wb.upload_history(&metrics);
