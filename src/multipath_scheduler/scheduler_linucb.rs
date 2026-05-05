@@ -469,34 +469,34 @@ impl MultipathScheduler for LinUCBScheduler {
                     let rtt_ms         = rtt_us as f64 / 1000.0;
                     // traffic / latency / throughput
                     jline.push_str(&format!(
-                        ",\"traffic/p{pid}_pct\":{pct:.2}\
-                         ,\"latency/p{pid}_rtt_ms\":{rtt_ms:.3}\
-                         ,\"throughput/p{pid}_mbps\":{throughput_mbps:.3}",
+                        ",\"traffic/path{pid}_pct\":{pct:.2}\
+                         ,\"latency/path{pid}_rtt_ms\":{rtt_ms:.3}\
+                         ,\"throughput/path{pid}_mbps\":{throughput_mbps:.3}",
                     ));
                     // congestion control
                     jline.push_str(&format!(
-                        ",\"congestion/p{pid}_cwnd_KB\":{cwnd_kb:.1}\
-                         ,\"congestion/p{pid}_inflight_KB\":{inflight_kb:.1}\
-                         ,\"congestion/p{pid}_pacing_mbps\":{pacing_mbps:.3}",
+                        ",\"congestion/path{pid}_cwnd_KB\":{cwnd_kb:.1}\
+                         ,\"congestion/path{pid}_inflight_KB\":{inflight_kb:.1}\
+                         ,\"congestion/path{pid}_pacing_mbps\":{pacing_mbps:.3}",
                     ));
                     // packet counts
                     jline.push_str(&format!(
-                        ",\"loss/p{pid}_sent\":{sent_total}\
-                         ,\"loss/p{pid}_lost\":{lost_total}",
+                        ",\"loss/path{pid}_sent\":{sent_total}\
+                         ,\"loss/path{pid}_lost\":{lost_total}",
                     ));
                     // LinUCB internals
                     jline.push_str(&format!(
-                        ",\"linucb/p{pid}_reward\":{reward_est:.4}\
-                         ,\"linucb/p{pid}_explore_bonus\":{explore_bonus:.4}\
-                         ,\"linucb/p{pid}_samples\":{n}",
+                        ",\"linucb/path{pid}_reward\":{reward_est:.4}\
+                         ,\"linucb/path{pid}_explore_bonus\":{explore_bonus:.4}\
+                         ,\"linucb/path{pid}_samples\":{n}",
                     ));
                     // context features (x vector)
                     for (i, xi) in x.iter().enumerate() {
-                        jline.push_str(&format!(",\"features/p{pid}_{}\":{xi:.4}", feat_names[i]));
+                        jline.push_str(&format!(",\"features/path{pid}_{}\":{xi:.4}", feat_names[i]));
                     }
                     // learned weights (theta)
                     for (i, ti) in theta.iter().enumerate() {
-                        jline.push_str(&format!(",\"weights/p{pid}_{}\":{ti:.4}", feat_names[i]));
+                        jline.push_str(&format!(",\"weights/path{pid}_{}\":{ti:.4}", feat_names[i]));
                     }
                 }
                 jline.push('}');

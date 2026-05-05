@@ -53,6 +53,7 @@ use tquic::TransportHandler;
 use tquic_tools::CertCompressionAlgorithmArg;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
+use tquic_tools::wandb_logger::WandbLogger;
 
 #[cfg(unix)]
 #[global_allocator]
@@ -607,6 +608,8 @@ struct ServerHandler {
     actual_duration_bits: Arc<AtomicU64>,
     /// Time of the first connection establishment in this session.
     session_start: Option<Instant>,
+    /// wandb API key, consumed on the first multipath connection with LinUCB metrics.
+    wandb_key: Option<String>,
 }
 
 impl ServerHandler {
@@ -644,6 +647,12 @@ impl ServerHandler {
             rep_done,
             actual_duration_bits,
             session_start: None,
+            wandb_key: {
+                const DEFAULT_KEY: &str = "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";
+                let key = std::env::var("WANDB_API_KEY")
+                    .unwrap_or_else(|_| DEFAULT_KEY.to_string());
+                if !key.is_empty() { Some(key) } else { None }
+            },
         })
     }
 
@@ -710,6 +719,15 @@ impl TransportHandler for ServerHandler {
         if paths.len() > 1 {
             if let Some(summary) = conn.multipath_scheduler_summary() {
                 info!("{}", summary);
+            }
+            // Upload per-second LinUCB metrics to wandb (downlink: server is the sender).
+            let metrics = conn.multipath_scheduler_metrics_jsonl();
+            if !metrics.is_empty() {
+                if let Some(key) = self.wandb_key.take() {
+                    if let Some(wb) = WandbLogger::new(&key, "quic") {
+                        wb.upload_history(&metrics);
+                    }
+                }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
             for (i, four_tuple) in paths.iter().enumerate() {
