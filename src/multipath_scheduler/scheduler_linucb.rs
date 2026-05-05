@@ -108,6 +108,9 @@ pub struct LinUCBScheduler {
     /// Per-second JSONL metric lines buffered for wandb upload at run end.
     /// Each line is a flat JSON object with a `_step` key and per-path metrics.
     metrics_jsonl: Vec<String>,
+    /// Cumulative sent-bytes snapshot from the previous 1-second window.
+    /// Used to compute per-second actual throughput (delta bytes × 8 / 1e6 Mbps).
+    prev_sent_bytes: Vec<u64>,
     /// Last context vector used for each path in on_select.
     /// Stored here so on_ack can update the model with the *exact same* features
     /// that were used at selection time (avoids training mismatch from missing
@@ -134,6 +137,7 @@ impl LinUCBScheduler {
             ack_counts: Vec::new(),
             credits: Vec::new(),
             metrics_jsonl: Vec::new(),
+            prev_sent_bytes: Vec::new(),
             last_context: Vec::new(),
         }
     }
@@ -223,8 +227,8 @@ impl MultipathScheduler for LinUCBScheduler {
         // Values are extracted before mutating self.arms to satisfy the borrow checker.
         let mut min_rtt_ns: u128 = u128::MAX;
         let mut max_pacing_bps: u64 = 0;
-        // (pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps)
-        let mut raw: Vec<(usize, u128, usize, u64, f64, u64)> = Vec::new();
+        // (pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps, sent_bytes_total, lost_count_total, sent_count_total)
+        let mut raw: Vec<(usize, u128, usize, u64, f64, u64, u64, u64, u64)> = Vec::new();
 
         for (pid, path) in paths.iter_mut() {
             if !path.active() || !path.recovery.can_send() {
@@ -241,13 +245,14 @@ impl MultipathScheduler for LinUCBScheduler {
             let lost = path.recovery.stats.lost_count;
             let loss_rate = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
             let pacing_bps = path.recovery.congestion.pacing_rate().unwrap_or(0);
+            let sent_bytes_total = path.recovery.stats.sent_bytes;
             if rtt_ns < min_rtt_ns {
                 min_rtt_ns = rtt_ns;
             }
             if pacing_bps > max_pacing_bps {
                 max_pacing_bps = pacing_bps;
             }
-            raw.push((pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps));
+            raw.push((pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, sent_bytes_total, lost, sent));
         }
 
         if raw.is_empty() {
@@ -264,7 +269,7 @@ impl MultipathScheduler for LinUCBScheduler {
         // (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb, context_x)
         let mut score_rows: Vec<(usize, u64, f64, f64, f64, f64, [f64; D])> = Vec::new();
 
-        for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps) in &raw {
+        for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, ..) in &raw {
             let x = Self::make_context(rtt_ns, min_rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, max_pacing_bps);
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
@@ -352,7 +357,7 @@ impl MultipathScheduler for LinUCBScheduler {
         // Cache per-path addresses for the final summary.
         // Prefer local_addr, but fall back to remote_addr when local is
         // unspecified (server bound to 0.0.0.0 / ::).
-        for &(pid, _, _, _, _, _) in &raw {
+        for &(pid, _, _, _, _, _, _, _, _) in &raw {
             if pid >= self.path_addrs.len() {
                 self.path_addrs.resize(pid + 1, None);
             }
@@ -424,8 +429,26 @@ impl MultipathScheduler for LinUCBScheduler {
                     } else {
                         [0.0_f64; D]
                     };
+                    // Traffic metrics from raw stats.
+                    let (bytes_in_flight, cwnd, pacing_bps, sent_bytes_total, lost_total, sent_total) =
+                        raw.iter().find(|r| r.0 == pid)
+                            .map(|r| (r.2, r.3, r.5, r.6, r.7, r.8))
+                            .unwrap_or((0, 0, 0, 0, 0, 0));
+                    // Per-second actual throughput: delta sent_bytes since last window.
+                    if pid >= self.prev_sent_bytes.len() {
+                        self.prev_sent_bytes.resize(pid + 1, 0);
+                    }
+                    let delta_bytes = sent_bytes_total.saturating_sub(self.prev_sent_bytes[pid]);
+                    self.prev_sent_bytes[pid] = sent_bytes_total;
+                    let tput_mbps = delta_bytes as f64 * 8.0 / 1_000_000.0;
+                    let pacing_mbps = pacing_bps as f64 * 8.0 / 1_000_000.0;
+                    let cwnd_kb = cwnd as f64 / 1024.0;
+                    let bif_kb = bytes_in_flight as f64 / 1024.0;
                     jline.push_str(&format!(
                         ",\"p{pid}.pct\":{pct:.2},\"p{pid}.rtt_us\":{rtt_us},\"p{pid}.reward\":{reward_est:.4},\"p{pid}.bonus\":{explore_bonus:.4},\"p{pid}.n\":{n}",
+                    ));
+                    jline.push_str(&format!(
+                        ",\"p{pid}.tput_mbps\":{tput_mbps:.3},\"p{pid}.pacing_mbps\":{pacing_mbps:.3},\"p{pid}.cwnd_kb\":{cwnd_kb:.1},\"p{pid}.bif_kb\":{bif_kb:.1},\"p{pid}.lost_pkts\":{lost_total},\"p{pid}.sent_pkts\":{sent_total}",
                     ));
                     for (i, xi) in x.iter().enumerate() {
                         jline.push_str(&format!(",\"p{pid}.x_{}\":{xi:.4}", feat_names[i]));
