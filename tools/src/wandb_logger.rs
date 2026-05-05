@@ -31,11 +31,13 @@ macro_rules! wlog {
 }
 
 pub struct WandbLogger {
-    client:   Client,
-    api_key:  String,
-    entity:   String,
-    project:  String,
-    run_name: String,
+    client:    Client,
+    api_key:   String,
+    entity:    String,
+    project:   String,
+    run_name:  String,
+    /// Opaque bucket ID returned by upsertBucket — used to finish the run.
+    bucket_id: String,
     /// Public URL shown in the dashboard.
     pub run_url: String,
 }
@@ -106,6 +108,11 @@ impl WandbLogger {
             }
         }
 
+        let bucket_id = resp["data"]["upsertBucket"]["bucket"]["id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
         let run_url = format!("https://wandb.ai/{entity}/{project}/runs/{run_name}");
         wlog!("step 2/4 OK → {run_url}");
 
@@ -115,6 +122,7 @@ impl WandbLogger {
             entity,
             project: project.to_string(),
             run_name,
+            bucket_id,
             run_url,
         })
     }
@@ -138,7 +146,7 @@ impl WandbLogger {
             .json(&json!({
                 "query": "mutation CreateRunFiles($input:CreateRunFilesInput!) \
                     { createRunFiles(input:$input) \
-                      { uploadHeaders files { name url(upload:true) } } }",
+                      { runID uploadHeaders files { name uploadUrl } } }",
                 "variables": {
                     "input": {
                         "entityName":  self.entity,
@@ -165,7 +173,7 @@ impl WandbLogger {
         let upload_url = match resp["data"]["createRunFiles"]["files"]
             .as_array()
             .and_then(|a| a.first())
-            .and_then(|f| f["url"].as_str())
+            .and_then(|f| f["uploadUrl"].as_str())
         {
             Some(u) => u.to_string(),
             None => { wlog!("ERROR no upload url. Full: {resp}"); return false; }
@@ -192,22 +200,29 @@ impl WandbLogger {
         match req.body(content).send() {
             Ok(r) if r.status().is_success() => {
                 wlog!("SUCCESS: {} steps → {}", jsonl_lines.len(), self.run_url);
-                // Mark the run as finished so wandb finalises charts.
-                let _ = self.client
+                // Mark the run finished using its bucket ID so wandb ingests the history.
+                wlog!("step 5/5: marking run finished (id={}) ...", self.bucket_id);
+                match self.client
                     .post(Self::GRAPHQL)
                     .header("Authorization", format!("Bearer {}", self.api_key))
                     .json(&serde_json::json!({
-                        "query": "mutation Finish($name:String,$entity:String,$project:String,$state:String) \
-                            { upsertBucket(input:{name:$name,entityName:$entity,modelName:$project,state:$state}) \
+                        "query": "mutation FinishRun($id:String,$state:String) \
+                            { upsertBucket(input:{id:$id,state:$state}) \
                               { bucket { id } } }",
                         "variables": {
-                            "name":    self.run_name,
-                            "entity":  self.entity,
-                            "project": self.project,
-                            "state":   "finished"
+                            "id":    self.bucket_id,
+                            "state": "finished"
                         }
                     }))
-                    .send();
+                    .send()
+                {
+                    Ok(r) => {
+                        let status = r.status();
+                        let body = r.text().unwrap_or_default();
+                        wlog!("  finish HTTP {status}: {body}");
+                    }
+                    Err(e) => wlog!("  finish ERROR: {e}"),
+                }
                 true
             }
             Ok(r) => {
