@@ -422,14 +422,25 @@ impl MultipathScheduler for LinUCBScheduler {
             ));
 
             // ── wandb JSONL metric line ──────────────────────────────────────
-            // Flat JSON object per second.  Metric names use "p{pid}." prefix
-            // so wandb groups them by path in the UI.
-            // Features: x0=rtt_norm, x1=cwnd_p, x2=loss_rate, x3=bw_norm, x4=bias
-            // Theta:    th0..th4 = learned LinUCB weights for each feature.
+            // Flat JSON object per second.
+            //
+            // Metric names use wandb's "/" section separator so that all paths
+            // appear as separate lines on the *same* chart per section:
+            //
+            //   traffic/       — % of packets scheduled to each path
+            //   throughput/    — actual send rate (Mbps) per path
+            //   latency/       — smoothed RTT (ms) per path
+            //   congestion/    — cwnd (KB), bytes-in-flight (KB), pacing (Mbps)
+            //   loss/          — cumulative sent / lost packet counts
+            //   linucb/        — reward estimate, exploration bonus, sample count
+            //   features/      — context vector fed to LinUCB (x0..x4)
+            //   weights/       — learned θ weights (updated after each ACK)
             {
                 let step = self.metrics_jsonl.len() as u64;
                 let timestamp = self.start_unix_secs + elapsed_s;
-                let feat_names = ["rtt_norm", "cwnd_p", "loss_rate", "bw_norm", "bias"];
+                // Feature / weight names in context-vector order:
+                //   x0=rtt_norm  x1=cwnd_pressure  x2=loss_rate  x3=bw_norm  x4=bias
+                let feat_names = ["rtt_norm", "cwnd_pressure", "loss_rate", "bw_norm", "bias"];
                 let mut jline = format!("{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s}");
                 for &(pid, rtt_us, _cp, reward_est, explore_bonus, _ucb, x) in &score_rows {
                     let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
@@ -451,21 +462,41 @@ impl MultipathScheduler for LinUCBScheduler {
                     }
                     let delta_bytes = sent_bytes_total.saturating_sub(self.prev_sent_bytes[pid]);
                     self.prev_sent_bytes[pid] = sent_bytes_total;
-                    let tput_mbps = delta_bytes as f64 * 8.0 / 1_000_000.0;
-                    let pacing_mbps = pacing_bps as f64 * 8.0 / 1_000_000.0;
-                    let cwnd_kb = cwnd as f64 / 1024.0;
-                    let bif_kb = bytes_in_flight as f64 / 1024.0;
+                    let throughput_mbps = delta_bytes as f64 * 8.0 / 1_000_000.0;
+                    let pacing_mbps    = pacing_bps as f64 * 8.0 / 1_000_000.0;
+                    let cwnd_kb        = cwnd as f64 / 1024.0;
+                    let inflight_kb    = bytes_in_flight as f64 / 1024.0;
+                    let rtt_ms         = rtt_us as f64 / 1000.0;
+                    // traffic / latency / throughput
                     jline.push_str(&format!(
-                        ",\"p{pid}.pct\":{pct:.2},\"p{pid}.rtt_us\":{rtt_us},\"p{pid}.reward\":{reward_est:.4},\"p{pid}.bonus\":{explore_bonus:.4},\"p{pid}.n\":{n}",
+                        ",\"traffic/p{pid}_pct\":{pct:.2}\
+                         ,\"latency/p{pid}_rtt_ms\":{rtt_ms:.3}\
+                         ,\"throughput/p{pid}_mbps\":{throughput_mbps:.3}",
                     ));
+                    // congestion control
                     jline.push_str(&format!(
-                        ",\"p{pid}.tput_mbps\":{tput_mbps:.3},\"p{pid}.pacing_mbps\":{pacing_mbps:.3},\"p{pid}.cwnd_kb\":{cwnd_kb:.1},\"p{pid}.bif_kb\":{bif_kb:.1},\"p{pid}.lost_pkts\":{lost_total},\"p{pid}.sent_pkts\":{sent_total}",
+                        ",\"congestion/p{pid}_cwnd_KB\":{cwnd_kb:.1}\
+                         ,\"congestion/p{pid}_inflight_KB\":{inflight_kb:.1}\
+                         ,\"congestion/p{pid}_pacing_mbps\":{pacing_mbps:.3}",
                     ));
+                    // packet counts
+                    jline.push_str(&format!(
+                        ",\"loss/p{pid}_sent\":{sent_total}\
+                         ,\"loss/p{pid}_lost\":{lost_total}",
+                    ));
+                    // LinUCB internals
+                    jline.push_str(&format!(
+                        ",\"linucb/p{pid}_reward\":{reward_est:.4}\
+                         ,\"linucb/p{pid}_explore_bonus\":{explore_bonus:.4}\
+                         ,\"linucb/p{pid}_samples\":{n}",
+                    ));
+                    // context features (x vector)
                     for (i, xi) in x.iter().enumerate() {
-                        jline.push_str(&format!(",\"p{pid}.x_{}\":{xi:.4}", feat_names[i]));
+                        jline.push_str(&format!(",\"features/p{pid}_{}\":{xi:.4}", feat_names[i]));
                     }
+                    // learned weights (theta)
                     for (i, ti) in theta.iter().enumerate() {
-                        jline.push_str(&format!(",\"p{pid}.th_{}\":{ti:.4}", feat_names[i]));
+                        jline.push_str(&format!(",\"weights/p{pid}_{}\":{ti:.4}", feat_names[i]));
                     }
                 }
                 jline.push('}');
