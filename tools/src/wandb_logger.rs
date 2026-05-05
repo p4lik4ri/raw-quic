@@ -45,8 +45,8 @@ impl WandbLogger {
 
     /// Initialise a new wandb run.  Returns `None` on any error so callers
     /// can treat wandb as fully optional and continue normally.
-    pub fn new(api_key: &str, project: &str) -> Option<Self> {
-        wlog!("initializing for project={project}");
+    pub fn new(api_key: &str, project: &str, scheduler: &str) -> Option<Self> {
+        wlog!("initializing for project={project} scheduler={scheduler}");
 
         let client = Client::builder()
             .timeout(Duration::from_secs(20))
@@ -75,11 +75,13 @@ impl WandbLogger {
         wlog!("  entity={entity}");
 
         // ── Step 2: create run ────────────────────────────────────────────────
+        // Use milliseconds for the timestamp to avoid duplicate-key collisions
+        // when two tests finish within the same second.
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        let run_name = format!("tquic-linucb-{ts}");
+            .as_millis();
+        let run_name = format!("tquic-{scheduler}-{ts}");
         wlog!("step 2/4: creating run \"{run_name}\" ...");
 
         let raw = client

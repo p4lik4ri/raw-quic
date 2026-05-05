@@ -610,6 +610,8 @@ struct ServerHandler {
     session_start: Option<Instant>,
     /// wandb API key, consumed on the first multipath connection with LinUCB metrics.
     wandb_key: Option<String>,
+    /// Scheduler name for the wandb run label (e.g. "minrtt", "linucb").
+    scheduler_name: String,
 }
 
 impl ServerHandler {
@@ -652,6 +654,12 @@ impl ServerHandler {
                 let key = std::env::var("WANDB_API_KEY")
                     .unwrap_or_else(|_| DEFAULT_KEY.to_string());
                 if !key.is_empty() { Some(key) } else { None }
+            },
+            scheduler_name: match option.multipath_algor {
+                MultipathAlgorithm::MinRtt     => "minrtt".to_string(),
+                MultipathAlgorithm::RoundRobin => "roundrobin".to_string(),
+                MultipathAlgorithm::Redundant  => "redundant".to_string(),
+                MultipathAlgorithm::LinUCB     => "linucb".to_string(),
             },
         })
     }
@@ -724,7 +732,7 @@ impl TransportHandler for ServerHandler {
             let metrics = conn.multipath_scheduler_metrics_jsonl();
             if !metrics.is_empty() {
                 if let Some(key) = self.wandb_key.take() {
-                    if let Some(wb) = WandbLogger::new(&key, "quic") {
+                    if let Some(wb) = WandbLogger::new(&key, "quic", &self.scheduler_name) {
                         wb.upload_history(&metrics);
                     }
                 }

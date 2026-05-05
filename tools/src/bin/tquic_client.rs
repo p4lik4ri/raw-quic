@@ -1407,7 +1407,13 @@ impl TransportHandler for WorkerHandler {
             let metrics = conn.multipath_scheduler_metrics_jsonl();
             if !metrics.is_empty() {
                 if let Some(key) = self.wandb_key.take() {
-                    if let Some(wb) = WandbLogger::new(&key, "quic") {
+                    let sched = match self.option.multipath_algor {
+                        tquic::MultipathAlgorithm::MinRtt     => "minrtt",
+                        tquic::MultipathAlgorithm::RoundRobin => "roundrobin",
+                        tquic::MultipathAlgorithm::Redundant  => "redundant",
+                        tquic::MultipathAlgorithm::LinUCB     => "linucb",
+                    };
+                    if let Some(wb) = WandbLogger::new(&key, "quic", sched) {
                         wb.upload_history(&metrics);
                     }
                 }
