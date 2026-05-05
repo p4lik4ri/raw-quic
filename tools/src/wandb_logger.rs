@@ -136,16 +136,16 @@ impl WandbLogger {
             .post(Self::GRAPHQL)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&json!({
-                "query": "mutation CreateRunFiles(\
-                    $entityName:String!,$projectName:String!,$runName:String!,$files:[String]!) \
-                    { createRunFiles(entityName:$entityName,projectName:$projectName,\
-                        runName:$runName,files:$files) \
+                "query": "mutation CreateRunFiles($input:CreateRunFilesInput!) \
+                    { createRunFiles(input:$input) \
                       { uploadHeaders files { name url(upload:true) } } }",
                 "variables": {
-                    "entityName":  self.entity,
-                    "projectName": self.project,
-                    "runName":     self.run_name,
-                    "files":       ["wandb-history.jsonl"]
+                    "input": {
+                        "entityName":  self.entity,
+                        "projectName": self.project,
+                        "runName":     self.run_name,
+                        "files":       ["wandb-history.jsonl"]
+                    }
                 }
             }))
             .send()

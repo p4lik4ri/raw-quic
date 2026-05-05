@@ -1149,6 +1149,8 @@ struct WorkerHandler {
     /// immediately before calling endpoint.recv(), so on_stream_readable can read
     /// the accurate OS-level arrival time for the current QUIC packet.
     current_pkt_recv_us: Arc<AtomicU64>,
+    /// wandb run for the whole session — created once, consumed on first upload.
+    wandb: Option<WandbLogger>,
 }
 
 impl WorkerHandler {
@@ -1184,6 +1186,16 @@ impl WorkerHandler {
             server_sent,
             duration_expired,
             current_pkt_recv_us,
+            wandb: {
+                const DEFAULT_KEY: &str = "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";
+                let key = std::env::var("WANDB_API_KEY")
+                    .unwrap_or_else(|_| DEFAULT_KEY.to_string());
+                if !key.is_empty() {
+                    WandbLogger::new(&key, "quic")
+                } else {
+                    None
+                }
+            },
         }
     }
 
@@ -1391,17 +1403,12 @@ impl TransportHandler for WorkerHandler {
                 info!("{}", summary);
             }
             // Upload per-second LinUCB metrics to wandb.
-            // API key is read from WANDB_API_KEY env var; falls back to the
-            // compiled-in default.  Set to empty string to disable.
+            // The run was opened once in WorkerHandler::new(); we take() it here
+            // so only the first connection with real metrics uploads (one run per session).
             let metrics = conn.multipath_scheduler_metrics_jsonl();
             if !metrics.is_empty() {
-                const DEFAULT_KEY: &str = "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";
-                let key = std::env::var("WANDB_API_KEY")
-                    .unwrap_or_else(|_| DEFAULT_KEY.to_string());
-                if !key.is_empty() {
-                    if let Some(wb) = WandbLogger::new(&key, "quic") {
-                        wb.upload_history(&metrics);
-                    }
+                if let Some(wb) = self.wandb.take() {
+                    wb.upload_history(&metrics);
                 }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
