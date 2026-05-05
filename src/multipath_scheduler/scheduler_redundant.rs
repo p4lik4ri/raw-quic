@@ -21,6 +21,7 @@ use crate::connection::space::PacketNumSpaceMap;
 use crate::connection::space::SentPacket;
 use crate::connection::stream::StreamMap;
 use crate::frame::Frame;
+use crate::multipath_scheduler::traffic_metrics::TrafficMetricsCollector;
 use crate::multipath_scheduler::MultipathScheduler;
 use crate::Error;
 use crate::MultipathConfig;
@@ -33,11 +34,15 @@ use crate::Result;
 /// bandwidth requirements that can be met by a single path.
 /// In scenarios where two paths with varying available bandwidths are present,
 /// it ensures a goodput at least equivalent to the best single path.
-pub struct RedundantScheduler {}
+pub struct RedundantScheduler {
+    metrics: TrafficMetricsCollector,
+}
 
 impl RedundantScheduler {
     pub fn new(_conf: &MultipathConfig) -> RedundantScheduler {
-        RedundantScheduler {}
+        RedundantScheduler {
+            metrics: TrafficMetricsCollector::new(),
+        }
     }
 }
 
@@ -49,14 +54,26 @@ impl MultipathScheduler for RedundantScheduler {
         spaces: &mut PacketNumSpaceMap,
         streams: &mut StreamMap,
     ) -> Result<usize> {
+        let mut selected = None;
         for (pid, path) in paths.iter_mut() {
             // Skip the path that is not ready for sending non-probing packets.
             if !path.active() || !path.recovery.can_send() {
                 continue;
             }
-            return Ok(pid);
+            selected = Some(pid);
+            break;
         }
-        Err(Error::Done)
+        match selected {
+            Some(pid) => {
+                self.metrics.record(pid, paths);
+                Ok(pid)
+            }
+            None => Err(Error::Done),
+        }
+    }
+
+    fn scheduler_metrics_jsonl(&self) -> Vec<String> {
+        self.metrics.metrics.clone()
     }
 
     /// Try to reinject the sent packet to other available paths.

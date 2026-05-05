@@ -15,6 +15,7 @@
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
 use crate::connection::stream::StreamMap;
+use crate::multipath_scheduler::traffic_metrics::TrafficMetricsCollector;
 use crate::multipath_scheduler::MultipathScheduler;
 use crate::Error;
 use crate::MultipathConfig;
@@ -27,11 +28,15 @@ use crate::Result;
 /// The scheduler aims to optimize throughput and achieve load balancing, making
 /// it particularly advantageous for bulk transfer applications in heterogeneous
 /// networks.
-pub struct MinRttScheduler {}
+pub struct MinRttScheduler {
+    metrics: TrafficMetricsCollector,
+}
 
 impl MinRttScheduler {
     pub fn new(_conf: &MultipathConfig) -> MinRttScheduler {
-        MinRttScheduler {}
+        MinRttScheduler {
+            metrics: TrafficMetricsCollector::new(),
+        }
     }
 }
 
@@ -64,9 +69,16 @@ impl MultipathScheduler for MinRttScheduler {
         }
 
         match best {
-            Some((i, _)) => Ok(i),
+            Some((pid, _)) => {
+                self.metrics.record(pid, paths);
+                Ok(pid)
+            }
             None => Err(Error::Done),
         }
+    }
+
+    fn scheduler_metrics_jsonl(&self) -> Vec<String> {
+        self.metrics.metrics.clone()
     }
 }
 
