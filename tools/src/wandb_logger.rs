@@ -192,6 +192,22 @@ impl WandbLogger {
         match req.body(content).send() {
             Ok(r) if r.status().is_success() => {
                 wlog!("SUCCESS: {} steps → {}", jsonl_lines.len(), self.run_url);
+                // Mark the run as finished so wandb finalises charts.
+                let _ = self.client
+                    .post(Self::GRAPHQL)
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .json(&serde_json::json!({
+                        "query": "mutation Finish($name:String,$entity:String,$project:String,$state:String) \
+                            { upsertBucket(input:{name:$name,entityName:$entity,modelName:$project,state:$state}) \
+                              { bucket { id } } }",
+                        "variables": {
+                            "name":    self.run_name,
+                            "entity":  self.entity,
+                            "project": self.project,
+                            "state":   "finished"
+                        }
+                    }))
+                    .send();
                 true
             }
             Ok(r) => {
