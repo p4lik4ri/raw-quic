@@ -31,13 +31,11 @@ macro_rules! wlog {
 }
 
 pub struct WandbLogger {
-    client:    Client,
-    api_key:   String,
-    entity:    String,
-    project:   String,
-    run_name:  String,
-    /// Opaque bucket ID returned by upsertBucket — used to finish the run.
-    bucket_id: String,
+    client:   Client,
+    api_key:  String,
+    entity:   String,
+    project:  String,
+    run_name: String,
     /// Public URL shown in the dashboard.
     pub run_url: String,
 }
@@ -108,13 +106,8 @@ impl WandbLogger {
             }
         }
 
-        let bucket_id = resp["data"]["upsertBucket"]["bucket"]["id"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
         let run_url = format!("https://wandb.ai/{entity}/{project}/runs/{run_name}");
-        wlog!("step 2/4 OK → {run_url}");
+        wlog!("step 2/3 OK → {run_url}");
 
         Some(WandbLogger {
             client,
@@ -122,116 +115,67 @@ impl WandbLogger {
             entity,
             project: project.to_string(),
             run_name,
-            bucket_id,
             run_url,
         })
     }
 
-    /// Upload per-second JSONL lines to this run's history file.
-    /// Each element must be a valid JSON object string.
+    /// Upload per-second JSONL lines to this run's history file and mark the
+    /// run as finished, using the wandb file-stream API in one POST.
+    ///
+    /// The file-stream endpoint is the same mechanism used by the wandb Python
+    /// SDK.  Sending `complete:true, exitcode:0` is what causes wandb to
+    /// finalize the run and render all charts.
     pub fn upload_history(&self, jsonl_lines: &[String]) -> bool {
         if jsonl_lines.is_empty() {
             return true;
         }
-        let content = jsonl_lines.join("\n");
         wlog!(
-            "step 3/4: requesting upload URL ({} steps, {} bytes) ...",
-            jsonl_lines.len(), content.len()
+            "step 3/3: streaming {} steps to wandb file-stream ...",
+            jsonl_lines.len()
         );
 
-        // ── Step 3: get presigned URL via createRunFiles ──────────────────────
-        let raw = match self.client
-            .post(Self::GRAPHQL)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&json!({
-                "query": "mutation CreateRunFiles($input:CreateRunFilesInput!) \
-                    { createRunFiles(input:$input) \
-                      { runID uploadHeaders files { name uploadUrl } } }",
-                "variables": {
-                    "input": {
-                        "entityName":  self.entity,
-                        "projectName": self.project,
-                        "runName":     self.run_name,
-                        "files":       ["wandb-history.jsonl"]
-                    }
+        // The file-stream endpoint accepts a JSON body with a `files` map and
+        // optional `complete` / `exitcode` fields.
+        // Each content line must end with '\n'.
+        let lines: Vec<String> = jsonl_lines.iter()
+            .map(|l| format!("{l}\n"))
+            .collect();
+
+        let stream_url = format!(
+            "https://api.wandb.ai/files/{}/{}/{}/file_stream",
+            self.entity, self.project, self.run_name
+        );
+
+        let body = json!({
+            "files": {
+                "wandb-history.jsonl": {
+                    "offset":  0,
+                    "content": lines
                 }
-            }))
+            },
+            "complete": true,
+            "exitcode": 0
+        });
+
+        match self.client
+            .post(&stream_url)
+            // File-stream uses HTTP Basic auth: username="api", password=api_key
+            // (same as the wandb Python SDK — Bearer works for GraphQL but not here)
+            .basic_auth("api", Some(&self.api_key))
+            .json(&body)
             .send()
         {
-            Ok(r) => r,
-            Err(e) => { wlog!("ERROR createRunFiles network: {e}"); return false; }
-        };
-        let body = raw.text().unwrap_or_default();
-        wlog!("  createRunFiles: {body}");
-        let resp: Value = match serde_json::from_str(&body) {
-            Ok(v) => v,
-            Err(e) => { wlog!("ERROR parse createRunFiles: {e}"); return false; }
-        };
-        if let Some(errs) = resp["errors"].as_array() {
-            if !errs.is_empty() { wlog!("ERROR createRunFiles errors: {errs:?}"); return false; }
-        }
-        let upload_url = match resp["data"]["createRunFiles"]["files"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|f| f["uploadUrl"].as_str())
-        {
-            Some(u) => u.to_string(),
-            None => { wlog!("ERROR no upload url. Full: {resp}"); return false; }
-        };
-        let extra_headers: Vec<(String, String)> = resp["data"]["createRunFiles"]["uploadHeaders"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|h| h.as_str())
-                    .filter_map(|s| s.split_once(':')
-                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // ── Step 4: PUT to presigned S3 URL ───────────────────────────────────
-        wlog!("step 4/4: uploading to S3 ...");
-        let mut req = self.client
-            .put(&upload_url)
-            .header("Content-Type", "application/octet-stream");
-        for (k, v) in &extra_headers {
-            req = req.header(k, v);
-        }
-        match req.body(content).send() {
             Ok(r) if r.status().is_success() => {
                 wlog!("SUCCESS: {} steps → {}", jsonl_lines.len(), self.run_url);
-                // Mark the run finished using its bucket ID so wandb ingests the history.
-                wlog!("step 5/5: marking run finished (id={}) ...", self.bucket_id);
-                match self.client
-                    .post(Self::GRAPHQL)
-                    .header("Authorization", format!("Bearer {}", self.api_key))
-                    .json(&serde_json::json!({
-                        "query": "mutation FinishRun($id:String,$state:String) \
-                            { upsertBucket(input:{id:$id,state:$state}) \
-                              { bucket { id } } }",
-                        "variables": {
-                            "id":    self.bucket_id,
-                            "state": "finished"
-                        }
-                    }))
-                    .send()
-                {
-                    Ok(r) => {
-                        let status = r.status();
-                        let body = r.text().unwrap_or_default();
-                        wlog!("  finish HTTP {status}: {body}");
-                    }
-                    Err(e) => wlog!("  finish ERROR: {e}"),
-                }
                 true
             }
             Ok(r) => {
-                let s = r.status();
-                let b = r.text().unwrap_or_default();
-                wlog!("ERROR S3 PUT HTTP {s}: {b}");
+                let status = r.status();
+                let text = r.text().unwrap_or_default();
+                wlog!("ERROR file-stream HTTP {status}: {text}");
                 false
             }
-            Err(e) => { wlog!("ERROR S3 PUT network: {e}"); false }
+            Err(e) => { wlog!("ERROR file-stream network: {e}"); false }
         }
     }
 }
