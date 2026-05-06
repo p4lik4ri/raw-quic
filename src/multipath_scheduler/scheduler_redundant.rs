@@ -119,7 +119,7 @@ mod tests {
         let mut t = MultipathTester::new()?;
         t.add_path("127.0.0.1:443", "127.0.0.2:8443", 50)?;
 
-        let mut s = RedundantScheduler {};
+        let mut s = RedundantScheduler::new(&MultipathConfig::default());
         assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 0);
 
         t.set_path_active(0, false)?;
