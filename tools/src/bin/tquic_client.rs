@@ -64,6 +64,8 @@ use tquic::TransportHandler;
 use tquic_tools::CertCompressionAlgorithmArg;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
+use tquic_tools::kernel_net_stats;
+use tquic_tools::kernel_net_stats::KernelNetSnapshot;
 use tquic_tools::wandb_logger::WandbLogger;
 
 #[cfg(unix)]
@@ -226,6 +228,13 @@ pub struct ClientOpt {
     #[clap(long, help_heading = "Misc")]
     pub disable_encryption: bool,
 
+    /// Network interface to monitor for kernel-level drop counters
+    /// (NIC RX drops, qdisc TX drops, rx_missed_errors).
+    /// If omitted, the default-route interface is detected automatically.
+    /// Set to "none" to disable interface monitoring.
+    #[clap(long, value_name = "IFACE", help_heading = "Misc")]
+    pub iface: Option<String>,
+
 }
 
 const MAX_BUF_SIZE: usize = 65536;
@@ -308,6 +317,8 @@ struct Client {
     expiry_sent: Arc<AtomicU64>,
     /// Cumulative lost packet count snapped at duration-expiry across all connections.
     expiry_lost: Arc<AtomicU64>,
+    /// Resolved network interface name for kernel drop monitoring (None = disabled).
+    iface: Option<String>,
 }
 
 impl Client {
@@ -315,6 +326,17 @@ impl Client {
         let context = Arc::new(Mutex::new(ClientContext::default()));
         let terminated = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&terminated))?;
+
+        // Resolve the network interface: explicit flag > auto-detect > None.
+        let iface = match option.iface.as_deref() {
+            Some("none") => None,
+            Some(explicit) => Some(explicit.to_string()),
+            None => kernel_net_stats::default_iface(),
+        };
+        if let Some(ref dev) = iface {
+            info!("Kernel drop monitoring on interface: {dev}");
+        }
+
         Ok(Self {
             option,
             context,
@@ -334,6 +356,7 @@ impl Client {
             expiry_time: Arc::new(AtomicU64::new(0)),
             expiry_sent: Arc::new(AtomicU64::new(0)),
             expiry_lost: Arc::new(AtomicU64::new(0)),
+            iface,
         })
     }
 
@@ -354,6 +377,7 @@ impl Client {
         let reporter_expiry_sent = Arc::clone(&self.expiry_sent);
         let reporter_expiry_lost = Arc::clone(&self.expiry_lost);
         let reporter_mode    = self.option.mode;
+        let reporter_iface   = self.iface.clone();
         let reporter_handle = thread::spawn(move || {
             let direction = match reporter_mode {
                 TransferMode::Downlink => "server\u{2192}client",
@@ -377,6 +401,11 @@ impl Client {
             let mut last_sent:  u64 = 0;
             let mut last_lost:  u64 = 0;
             let mut interval:   u64 = 0;
+            // Kernel-drop baseline snapshot taken once before the first interval.
+            let iface_ref = reporter_iface.as_deref();
+            let mut kern_prev = kernel_net_stats::snapshot(iface_ref);
+            // Accumulated kernel drops over the whole test (for final summary).
+            let mut kern_total = KernelNetSnapshot::default();
             loop {
                 thread::sleep(Duration::from_secs(1));
                 let done      = reporter_done.load(Ordering::Relaxed);
@@ -390,6 +419,16 @@ impl Client {
                 last_bytes = current;
                 last_sent  = cur_sent;
                 last_lost  = cur_lost;
+                // Read kernel counters for this interval.
+                let kern_now   = kernel_net_stats::snapshot(iface_ref);
+                let kern_delta = kern_now.delta(&kern_prev);
+                kern_prev = kern_now;
+                // Accumulate across intervals so the summary doesn't need a
+                // second snapshot that might race with interface teardown.
+                kern_total.udp_rcvbuf_drops  = kern_total.udp_rcvbuf_drops.saturating_add(kern_delta.udp_rcvbuf_drops);
+                kern_total.nic_rx_dropped    = kern_total.nic_rx_dropped.saturating_add(kern_delta.nic_rx_dropped);
+                kern_total.qdisc_tx_dropped  = kern_total.qdisc_tx_dropped.saturating_add(kern_delta.qdisc_tx_dropped);
+                kern_total.nic_rx_missed     = kern_total.nic_rx_missed.saturating_add(kern_delta.nic_rx_missed);
                 let t_start = interval as f64;
                 let t_end   = interval as f64 + 1.0;
                 interval   += 1;
@@ -423,6 +462,17 @@ impl Client {
                                 d_lost, d_sent, loss_pct,
                             );
                         }
+                    }
+                    // Show kernel drops for this interval when any are non-zero.
+                    if !kern_delta.all_zero() {
+                        println!(
+                            "  {:<12}  [kernel] rcvbuf_drop={} nic_rx_drop={} qdisc_tx_drop={} nic_rx_miss={}",
+                            format!("{:.2}-{:.2} s", t_start, t_end),
+                            kern_delta.udp_rcvbuf_drops,
+                            kern_delta.nic_rx_dropped,
+                            kern_delta.qdisc_tx_dropped,
+                            kern_delta.nic_rx_missed,
+                        );
                     }
                     let _ = std::io::stdout().flush();
                 }
@@ -506,6 +556,19 @@ impl Client {
                             format!("{:.3} ms", jitter_ms),
                             dl_lost, dl_sent, recv_loss_pct,
                         );
+                    }
+                }
+                // ─── Kernel-level drop summary ────────────────────────────────
+                if !kern_total.all_zero() || reporter_iface.is_some() {
+                    println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
+                    println!("[ kernel ] Drop counters (entire test)");
+                    let iface_label = reporter_iface.as_deref().unwrap_or("(none)");
+                    println!("  UDP ingress drops (SO_RCVBUF full) : {}", kern_total.udp_rcvbuf_drops);
+                    println!("  NIC/driver RX drops  [{iface_label}] : {}", kern_total.nic_rx_dropped);
+                    println!("  NIC hardware RX miss [{iface_label}] : {}", kern_total.nic_rx_missed);
+                    println!("  Qdisc TX drops       [{iface_label}] : {}", kern_total.qdisc_tx_dropped);
+                    if kern_total.udp_rcvbuf_drops > 0 {
+                        println!("  ⚠  UDP rcvbuf overflow detected — consider increasing SO_RCVBUF");
                     }
                 }
                 let _ = std::io::stdout().flush();

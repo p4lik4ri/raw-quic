@@ -15,6 +15,7 @@
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 
+pub mod kernel_net_stats;
 pub mod wandb_logger;
 
 use clap::builder::PossibleValue;
