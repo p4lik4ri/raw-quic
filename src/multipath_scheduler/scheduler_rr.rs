@@ -15,6 +15,7 @@
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
 use crate::connection::stream::StreamMap;
+use crate::multipath_scheduler::traffic_metrics::TrafficMetricsCollector;
 use crate::multipath_scheduler::MultipathScheduler;
 use crate::Error;
 use crate::MultipathConfig;
@@ -28,12 +29,16 @@ use crate::Result;
 /// fully utilized as the distribution across all path is equal. It is for
 /// testing purposes only.
 pub struct RoundRobinScheduler {
-    last: Option<usize>,
+    last:    Option<usize>,
+    metrics: TrafficMetricsCollector,
 }
 
 impl RoundRobinScheduler {
     pub fn new(_conf: &MultipathConfig) -> RoundRobinScheduler {
-        RoundRobinScheduler { last: None }
+        RoundRobinScheduler {
+            last:    None,
+            metrics: TrafficMetricsCollector::new(),
+        }
     }
 }
 
@@ -87,6 +92,7 @@ impl MultipathScheduler for RoundRobinScheduler {
 
         // Find the next available path
         if let Some(pid) = self.select(&mut iter) {
+            self.metrics.record(pid, paths);
             return Ok(pid);
         }
         if !exist_last {
@@ -95,9 +101,14 @@ impl MultipathScheduler for RoundRobinScheduler {
 
         let mut iter = paths.iter_mut();
         if let Some(pid) = self.select(&mut iter) {
+            self.metrics.record(pid, paths);
             return Ok(pid);
         }
         Err(Error::Done)
+    }
+
+    fn scheduler_metrics_jsonl(&self) -> Vec<String> {
+        self.metrics.metrics.clone()
     }
 }
 

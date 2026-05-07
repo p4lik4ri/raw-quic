@@ -765,6 +765,11 @@ impl Connection {
                 self.stats.lost_count += lost_pkts;
                 self.stats.lost_bytes += lost_bytes;
 
+                // Notify the multipath scheduler of the ack event
+                if let Some(ref mut scheduler) = self.multipath_scheduler {
+                    scheduler.on_ack(now, path_id, &mut self.paths);
+                }
+
                 // An endpoint MUST discard its Handshake keys when the TLS
                 // handshake is confirmed.
                 if self.flags.contains(HandshakeConfirmed) {
@@ -3825,6 +3830,23 @@ impl Connection {
     pub fn migrate_path(&mut self, local_addr: SocketAddr, remote_addr: SocketAddr) -> Result<()> {
         // TODO: support migration
         Err(Error::InternalError)
+    }
+
+    /// Return the final summary string from the multipath scheduler, if any.
+    pub fn multipath_scheduler_summary(&self) -> Option<String> {
+        self.multipath_scheduler
+            .as_ref()
+            .and_then(|s| s.scheduler_summary())
+    }
+
+    /// Return per-second JSONL metric lines from the multipath scheduler.
+    /// Used by external loggers such as wandb.  Returns an empty Vec if the
+    /// scheduler produces no metrics (e.g. for non-LinUCB schedulers).
+    pub fn multipath_scheduler_metrics_jsonl(&self) -> Vec<String> {
+        self.multipath_scheduler
+            .as_ref()
+            .map(|s| s.scheduler_metrics_jsonl())
+            .unwrap_or_default()
     }
 
     /// Return an iterator over path addresses.

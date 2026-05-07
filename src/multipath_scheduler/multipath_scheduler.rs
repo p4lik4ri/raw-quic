@@ -17,6 +17,8 @@
 use core::str::FromStr;
 use std::time::Instant;
 
+use self::scheduler_linucb::*;
+use self::scheduler_epsilon_greedy::*;
 use self::scheduler_minrtt::*;
 use self::scheduler_redundant::*;
 use self::scheduler_rr::*;
@@ -55,8 +57,25 @@ pub(crate) trait MultipathScheduler {
     ) {
     }
 
+    /// Process a packet acknowledgement event.
+    fn on_ack(&mut self, now: Instant, path_id: usize, paths: &mut PathMap) {}
+
     /// Process a path event.
     fn on_path_updated(&mut self, paths: &mut PathMap, event: PathEvent) {}
+
+    /// Return a final human-readable summary of scheduler decisions.
+    /// Called once at connection close. Returns None for schedulers that
+    /// have nothing to report.
+    fn scheduler_summary(&self) -> Option<String> {
+        None
+    }
+
+    /// Return per-second JSONL metric lines for external logging (e.g. wandb).
+    /// Each element is a JSON object string with a flat set of metric keys.
+    /// Returns an empty Vec for schedulers that do not produce metrics.
+    fn scheduler_metrics_jsonl(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Available multipath scheduling algorithms.
@@ -83,6 +102,19 @@ pub enum MultipathAlgorithm {
     /// distribution across all path is equal. It is only used for testing
     /// purposes.
     RoundRobin,
+
+    /// The scheduler uses the LinUCB contextual bandit algorithm to
+    /// adaptively select paths by balancing exploration and exploitation.
+    /// It learns per-path reward models based on RTT and congestion window
+    /// utilisation, making it suitable for heterogeneous multi-path
+    /// environments such as combined satellite and 5G networks.
+    LinUCB,
+
+    /// The scheduler uses an epsilon-greedy contextual bandit policy with a
+    /// per-path linear reward model. It explores random sendable paths with a
+    /// fixed probability and otherwise selects the path with the highest
+    /// estimated reward from current network-state features.
+    EpsilonGreedy,
 }
 
 impl FromStr for MultipathAlgorithm {
@@ -95,6 +127,14 @@ impl FromStr for MultipathAlgorithm {
             Ok(MultipathAlgorithm::Redundant)
         } else if algor.eq_ignore_ascii_case("roundrobin") {
             Ok(MultipathAlgorithm::RoundRobin)
+        } else if algor.eq_ignore_ascii_case("linucb") {
+            Ok(MultipathAlgorithm::LinUCB)
+        } else if algor.eq_ignore_ascii_case("epsilongreedy")
+            || algor.eq_ignore_ascii_case("epsilon-greedy")
+            || algor.eq_ignore_ascii_case("epsilon_greedy")
+            || algor.eq_ignore_ascii_case("egreedy")
+        {
+            Ok(MultipathAlgorithm::EpsilonGreedy)
         } else {
             Err(Error::InvalidConfig("unknown".into()))
         }
@@ -107,6 +147,8 @@ pub(crate) fn build_multipath_scheduler(conf: &MultipathConfig) -> Box<dyn Multi
         MultipathAlgorithm::MinRtt => Box::new(MinRttScheduler::new(conf)),
         MultipathAlgorithm::Redundant => Box::new(RedundantScheduler::new(conf)),
         MultipathAlgorithm::RoundRobin => Box::new(RoundRobinScheduler::new(conf)),
+        MultipathAlgorithm::LinUCB => Box::new(LinUCBScheduler::new(conf)),
+        MultipathAlgorithm::EpsilonGreedy => Box::new(EpsilonGreedyScheduler::new(conf)),
     }
 }
 
@@ -115,6 +157,8 @@ pub(crate) fn buffer_required(algor: MultipathAlgorithm) -> bool {
         MultipathAlgorithm::MinRtt => false,
         MultipathAlgorithm::Redundant => true,
         MultipathAlgorithm::RoundRobin => false,
+        MultipathAlgorithm::LinUCB => false,
+        MultipathAlgorithm::EpsilonGreedy => false,
     }
 }
 
@@ -196,6 +240,11 @@ pub(crate) mod tests {
             ("Roundrobin", Ok(MultipathAlgorithm::RoundRobin)),
             ("RoundRobin", Ok(MultipathAlgorithm::RoundRobin)),
             ("ROUNDROBIN", Ok(MultipathAlgorithm::RoundRobin)),
+            ("epsilongreedy", Ok(MultipathAlgorithm::EpsilonGreedy)),
+            ("EpsilonGreedy", Ok(MultipathAlgorithm::EpsilonGreedy)),
+            ("epsilon-greedy", Ok(MultipathAlgorithm::EpsilonGreedy)),
+            ("epsilon_greedy", Ok(MultipathAlgorithm::EpsilonGreedy)),
+            ("egreedy", Ok(MultipathAlgorithm::EpsilonGreedy)),
             ("redun", Err(Error::InvalidConfig("unknown".into()))),
         ];
 
@@ -205,6 +254,9 @@ pub(crate) mod tests {
     }
 }
 
+mod scheduler_linucb;
+mod scheduler_epsilon_greedy;
 mod scheduler_minrtt;
 mod scheduler_redundant;
 mod scheduler_rr;
+pub(crate) mod traffic_metrics;

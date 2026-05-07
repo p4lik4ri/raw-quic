@@ -965,6 +965,7 @@ impl Recovery {
         self.stats.min_rtt = self.rtt.min_rtt().as_micros() as u64;
         self.stats.max_rtt = self.rtt.max_rtt().as_micros() as u64;
         self.stats.srtt = self.rtt.smoothed_rtt().as_micros() as u64;
+        self.stats.latest_rtt = self.rtt.latest_rtt().as_micros() as u64;
         self.stats.rttvar = self.rtt.rttvar().as_micros() as u64;
         self.stats.in_slow_start = self.congestion.in_slow_start();
         self.stats.pacing_rate = self.congestion.pacing_rate().unwrap_or_default();

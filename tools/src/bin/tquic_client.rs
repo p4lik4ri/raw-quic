@@ -58,11 +58,13 @@ use tquic::Connection;
 use tquic::Endpoint;
 use tquic::MultipathAlgorithm;
 use tquic::PacketInfo;
+
 use tquic::TlsConfig;
 use tquic::TransportHandler;
 use tquic_tools::CertCompressionAlgorithmArg;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
+use tquic_tools::wandb_logger::WandbLogger;
 
 #[cfg(unix)]
 #[global_allocator]
@@ -223,6 +225,7 @@ pub struct ClientOpt {
     /// Disable encryption on 1-RTT packets.
     #[clap(long, help_heading = "Misc")]
     pub disable_encryption: bool,
+
 }
 
 const MAX_BUF_SIZE: usize = 65536;
@@ -1146,6 +1149,10 @@ struct WorkerHandler {
     /// immediately before calling endpoint.recv(), so on_stream_readable can read
     /// the accurate OS-level arrival time for the current QUIC packet.
     current_pkt_recv_us: Arc<AtomicU64>,
+    /// wandb API key, consumed on the first connection that has LinUCB metrics.
+    /// Keeping just the key (not a live run) avoids creating empty wandb runs
+    /// for tests that don't use multipath/LinUCB.
+    wandb_key: Option<String>,
 }
 
 impl WorkerHandler {
@@ -1181,6 +1188,12 @@ impl WorkerHandler {
             server_sent,
             duration_expired,
             current_pkt_recv_us,
+            wandb_key: {
+                const DEFAULT_KEY: &str = "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";
+                let key = std::env::var("WANDB_API_KEY")
+                    .unwrap_or_else(|_| DEFAULT_KEY.to_string());
+                if !key.is_empty() { Some(key) } else { None }
+            },
         }
     }
 
@@ -1383,11 +1396,33 @@ impl TransportHandler for WorkerHandler {
         // Per-path breakdown (multipath).
         let paths: Vec<_> = conn.paths_iter().collect();
         if paths.len() > 1 {
+            // Print LinUCB summary (if applicable) before per-path stats.
+            if let Some(summary) = conn.multipath_scheduler_summary() {
+                info!("{}", summary);
+            }
+            // Upload metrics to wandb only in uplink mode: the client is the
+            // sender, so its scheduler metrics are meaningful. In downlink the
+            // server uploads instead.
+            let metrics = conn.multipath_scheduler_metrics_jsonl();
+            if !metrics.is_empty() && self.option.mode == TransferMode::Uplink {
+                if let Some(key) = self.wandb_key.take() {
+                    let sched = match self.option.multipath_algor {
+                        tquic::MultipathAlgorithm::MinRtt     => "minrtt",
+                        tquic::MultipathAlgorithm::RoundRobin => "roundrobin",
+                        tquic::MultipathAlgorithm::Redundant  => "redundant",
+                        tquic::MultipathAlgorithm::LinUCB     => "linucb",
+                        tquic::MultipathAlgorithm::EpsilonGreedy => "epsilongreedy",
+                    };
+                    if let Some(wb) = WandbLogger::new(&key, "quic", sched) {
+                        wb.upload_history(&metrics);
+                    }
+                }
+            }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
             for (i, four_tuple) in paths.iter().enumerate() {
                 if let Ok(ps) = conn.get_path_stats(four_tuple.local, four_tuple.remote) {
                     info!(
-                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  srtt={} µs",
+                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  srtt={} µs  latest_rtt={} µs",
                         i,
                         four_tuple.local,
                         four_tuple.remote,
@@ -1395,6 +1430,7 @@ impl TransportHandler for WorkerHandler {
                         ps.sent_bytes, ps.sent_count,
                         ps.lost_bytes,
                         ps.srtt,
+                        ps.latest_rtt,
                     );
                 }
             }

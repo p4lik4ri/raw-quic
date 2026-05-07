@@ -53,6 +53,7 @@ use tquic::TransportHandler;
 use tquic_tools::CertCompressionAlgorithmArg;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
+use tquic_tools::wandb_logger::WandbLogger;
 
 #[cfg(unix)]
 #[global_allocator]
@@ -607,6 +608,10 @@ struct ServerHandler {
     actual_duration_bits: Arc<AtomicU64>,
     /// Time of the first connection establishment in this session.
     session_start: Option<Instant>,
+    /// wandb API key, consumed on the first multipath connection with LinUCB metrics.
+    wandb_key: Option<String>,
+    /// Scheduler name for the wandb run label (e.g. "minrtt", "linucb").
+    scheduler_name: String,
 }
 
 impl ServerHandler {
@@ -644,6 +649,19 @@ impl ServerHandler {
             rep_done,
             actual_duration_bits,
             session_start: None,
+            wandb_key: {
+                const DEFAULT_KEY: &str = "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";
+                let key = std::env::var("WANDB_API_KEY")
+                    .unwrap_or_else(|_| DEFAULT_KEY.to_string());
+                if !key.is_empty() { Some(key) } else { None }
+            },
+            scheduler_name: match option.multipath_algor {
+                MultipathAlgorithm::MinRtt     => "minrtt".to_string(),
+                MultipathAlgorithm::RoundRobin => "roundrobin".to_string(),
+                MultipathAlgorithm::Redundant  => "redundant".to_string(),
+                MultipathAlgorithm::LinUCB     => "linucb".to_string(),
+                MultipathAlgorithm::EpsilonGreedy => "epsilongreedy".to_string(),
+            },
         })
     }
 
@@ -704,6 +722,42 @@ impl TransportHandler for ServerHandler {
             s.sent_count, s.sent_bytes,
             s.lost_count, s.lost_bytes,
         );
+
+        // Per-path breakdown (multipath).
+        let paths: Vec<_> = conn.paths_iter().collect();
+        if paths.len() > 1 {
+            if let Some(summary) = conn.multipath_scheduler_summary() {
+                info!("{}", summary);
+            }
+            // Upload metrics to wandb only in downlink mode: the server is the
+            // sender, so its scheduler metrics are meaningful. In uplink the
+            // client uploads instead.
+            let metrics = conn.multipath_scheduler_metrics_jsonl();
+            if !metrics.is_empty() && !self.is_uplink.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(key) = self.wandb_key.take() {
+                    if let Some(wb) = WandbLogger::new(&key, "quic", &self.scheduler_name) {
+                        wb.upload_history(&metrics);
+                    }
+                }
+            }
+            info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
+            for (i, four_tuple) in paths.iter().enumerate() {
+                if let Ok(ps) = conn.get_path_stats(four_tuple.local, four_tuple.remote) {
+                    info!(
+                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  srtt={} µs  latest_rtt={} µs",
+                        i,
+                        four_tuple.local,
+                        four_tuple.remote,
+                        ps.recv_bytes, ps.recv_count,
+                        ps.sent_bytes, ps.sent_count,
+                        ps.lost_bytes,
+                        ps.srtt,
+                        ps.latest_rtt,
+                    );
+                }
+            }
+        }
+
         // Record actual session duration so the reporter shows real elapsed time.
         if let Some(start) = self.session_start.take() {
             let secs = Instant::now().duration_since(start).as_secs_f64();

@@ -157,6 +157,7 @@ pub async fn spawn_and_capture(
                 if lock.len() >= OUTPUT_CAP { lock.pop_front(); }
                 lock.push_back(line);
             }
+            log::info!("[{source}] stderr stream ended");
         });
     }
 

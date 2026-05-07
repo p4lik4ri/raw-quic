@@ -110,6 +110,16 @@ typedef enum quic_multipath_algorithm {
    * purposes.
    */
   QUIC_MULTIPATH_ALGORITHM_ROUND_ROBIN,
+  /**
+   * The scheduler uses the LinUCB contextual bandit algorithm to
+   * adaptively select paths by balancing exploration and exploitation.
+   */
+  QUIC_MULTIPATH_ALGORITHM_LIN_UCB,
+  /**
+   * The scheduler uses an epsilon-greedy contextual bandit policy with a
+   * per-path linear reward model.
+   */
+  QUIC_MULTIPATH_ALGORITHM_EPSILON_GREEDY,
 } quic_multipath_algorithm;
 
 /**
