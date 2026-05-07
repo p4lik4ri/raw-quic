@@ -660,7 +660,6 @@ impl ServerHandler {
                 MultipathAlgorithm::RoundRobin => "roundrobin".to_string(),
                 MultipathAlgorithm::Redundant  => "redundant".to_string(),
                 MultipathAlgorithm::LinUCB     => "linucb".to_string(),
-                MultipathAlgorithm::EpsilonGreedy => "epsilongreedy".to_string(),
             },
         })
     }

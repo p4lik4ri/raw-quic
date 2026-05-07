@@ -1411,7 +1411,6 @@ impl TransportHandler for WorkerHandler {
                         tquic::MultipathAlgorithm::RoundRobin => "roundrobin",
                         tquic::MultipathAlgorithm::Redundant  => "redundant",
                         tquic::MultipathAlgorithm::LinUCB     => "linucb",
-                        tquic::MultipathAlgorithm::EpsilonGreedy => "epsilongreedy",
                     };
                     if let Some(wb) = WandbLogger::new(&key, "quic", sched) {
                         wb.upload_history(&metrics);

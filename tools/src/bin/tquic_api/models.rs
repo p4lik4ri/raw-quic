@@ -40,7 +40,7 @@ pub struct ServerStartRequest {
     #[serde(default)]
     pub enable_multipath: bool,
 
-    /// RoundRobin / MinRTT / Redundant / LinUCB / EpsilonGreedy
+    /// RoundRobin / MinRTT / Redundant
     pub multipath_algor: Option<String>,
 
     /// Maximum outgoing UDP payload size in bytes [default: 1200].
