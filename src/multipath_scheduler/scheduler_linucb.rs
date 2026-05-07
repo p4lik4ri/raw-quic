@@ -103,10 +103,6 @@ pub struct LinUCBScheduler {
     ema_rtt_ns: Vec<f64>,
     /// Number of ACKs received per path, used to control EMA warmup speed.
     ack_counts: Vec<u64>,
-    /// Deficit credits for weighted round-robin path selection.
-    /// Each scheduling round adds softmax(UCB) weight to every active path;
-    /// the path with the most credits is chosen and loses one credit.
-    credits: Vec<f64>,
     /// Per-second JSONL metric lines buffered for wandb upload at run end.
     /// Each line is a flat JSON object with a `_step` key and per-path metrics.
     metrics_jsonl: Vec<String>,
@@ -144,7 +140,6 @@ impl LinUCBScheduler {
             start_time: now,
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
-            credits: Vec::new(),
             metrics_jsonl: Vec::new(),
             start_unix_secs,
             prev_sent_bytes: Vec::new(),
@@ -301,53 +296,6 @@ impl MultipathScheduler for LinUCBScheduler {
                 best_pid = pid;
             }
         }
-
-        // Proportional deficit round-robin: weight = sqrt(min_rtt / path_rtt).
-        // During warmup (any path has < 8 ACKs) use equal weights so that the
-        // uninitialized last_min_rtt_ns=1 doesn't produce a meaningless split.
-        let min_acks = score_rows
-            .iter()
-            .map(|&(pid, ..)| self.ack_counts.get(pid).copied().unwrap_or(0))
-            .min()
-            .unwrap_or(0);
-        let min_rtt_us = score_rows
-            .iter()
-            .map(|&(_, rtt_us, ..)| rtt_us)
-            .min()
-            .unwrap_or(1)
-            .max(1);
-        // Once warmed up: sqrt inverse-RTT weights compress the ratio scale so
-        // intermediate delays give intermediate splits (5ms→~80/20, 50ms→~92/8).
-        let weights: Vec<f64> = if min_acks < 8 || score_rows.len() == 1 {
-            vec![1.0; score_rows.len()]
-        } else {
-            score_rows
-                .iter()
-                .map(|&(_, rtt_us, ..)| {
-                    (min_rtt_us as f64 / (rtt_us as f64).max(1.0)).sqrt()
-                })
-                .collect()
-        };        let total_w: f64 = weights.iter().sum();
-
-        // Grow credits to cover all active path ids.
-        let max_active_pid = score_rows.iter().map(|&(pid, ..)| pid).max().unwrap_or(0);
-        if max_active_pid >= self.credits.len() {
-            self.credits.resize(max_active_pid + 1, 0.0);
-        }
-        for (i, &(pid, ..)) in score_rows.iter().enumerate() {
-            self.credits[pid] += weights[i] / total_w;
-        }
-        // Choose path with most credits among active paths.
-        let best_pid = score_rows
-            .iter()
-            .map(|&(pid, ..)| pid)
-            .max_by(|&a, &b| {
-                self.credits[a]
-                    .partial_cmp(&self.credits[b])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap_or(best_pid);
-        self.credits[best_pid] -= 1.0;
 
         // --- Logging and counters ---
         let now = Instant::now();
