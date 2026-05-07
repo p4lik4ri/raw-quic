@@ -103,6 +103,9 @@ pub struct LinUCBScheduler {
     ema_rtt_ns: Vec<f64>,
     /// Number of ACKs received per path, used to control EMA warmup speed.
     ack_counts: Vec<u64>,
+    /// Timestamp of the last time each path was selected.  Used to detect stale
+    /// arms that should be reset when conditions may have changed.
+    last_selected_at: Vec<Option<Instant>>,
     /// Per-second JSONL metric lines buffered for wandb upload at run end.
     /// Each line is a flat JSON object with a `_step` key and per-path metrics.
     metrics_jsonl: Vec<String>,
@@ -140,6 +143,7 @@ impl LinUCBScheduler {
             start_time: now,
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
+            last_selected_at: Vec::new(),
             metrics_jsonl: Vec::new(),
             start_unix_secs,
             prev_sent_bytes: Vec::new(),
@@ -232,17 +236,20 @@ impl MultipathScheduler for LinUCBScheduler {
         // Values are extracted before mutating self.arms to satisfy the borrow checker.
         let mut min_rtt_ns: u128 = u128::MAX;
         let mut max_pacing_bps: u64 = 0;
-        // (pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps, sent_bytes_total, lost_count_total, sent_count_total)
-        let mut raw: Vec<(usize, u128, usize, u64, f64, u64, u64, u64, u64)> = Vec::new();
+        // (pid, rtt_ns_ema, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps, sent_bytes_total, lost_count_total, sent_count_total, live_rtt_ns)
+        let mut raw: Vec<(usize, u128, usize, u64, f64, u64, u64, u64, u64, u128)> = Vec::new();
 
         for (pid, path) in paths.iter_mut() {
             if !path.active() || !path.recovery.can_send() {
                 continue;
             }
+            // live_rtt_ns: the most recent RTT measurement from the QUIC stack.
+            let live_rtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos().max(1);
+            // rtt_ns: our EMA (stable, but can be stale for rarely-selected paths).
             let rtt_ns = if self.ack_counts.get(pid).copied().unwrap_or(0) > 0 {
                 self.ema_rtt_ns[pid] as u128
             } else {
-                path.recovery.rtt.smoothed_rtt().as_nanos()
+                live_rtt_ns
             };
             let bytes_in_flight = path.recovery.bytes_in_flight;
             let cwnd = path.recovery.congestion.congestion_window();
@@ -251,13 +258,15 @@ impl MultipathScheduler for LinUCBScheduler {
             let loss_rate = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
             let pacing_bps = path.recovery.congestion.pacing_rate().unwrap_or(0);
             let sent_bytes_total = path.recovery.stats.sent_bytes;
-            if rtt_ns < min_rtt_ns {
-                min_rtt_ns = rtt_ns;
+            // Track the minimum across both EMA and live RTT to be optimistic.
+            let effective = live_rtt_ns.min(rtt_ns);
+            if effective < min_rtt_ns {
+                min_rtt_ns = effective;
             }
             if pacing_bps > max_pacing_bps {
                 max_pacing_bps = pacing_bps;
             }
-            raw.push((pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, sent_bytes_total, lost, sent));
+            raw.push((pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, sent_bytes_total, lost, sent, live_rtt_ns));
         }
 
         if raw.is_empty() {
@@ -267,6 +276,32 @@ impl MultipathScheduler for LinUCBScheduler {
         let min_rtt_ns = min_rtt_ns.max(1);
         self.last_min_rtt_ns = min_rtt_ns;
 
+        let now = Instant::now();
+
+        // ── Stale arm reset ───────────────────────────────────────────────────
+        // If a path has not been selected in STALE_SECS, its reward history may
+        // be based on outdated network conditions (e.g. a delay was removed).
+        // Reset the arm to a fresh state so it gets a high exploration bonus
+        // and is probed again.  A single probe is enough to update the EMA and
+        // recover the true current RTT.
+        const STALE_SECS: u64 = 10;
+        for &(pid, _, _, _, _, _, _, _, _, live_rtt_ns) in &raw {
+            let is_stale = self.last_selected_at
+                .get(pid)
+                .and_then(|t| *t)
+                .map(|t| now.duration_since(t).as_secs() >= STALE_SECS)
+                .unwrap_or(false); // brand-new arm → not stale, gets natural exploration
+            if is_stale {
+                self.arms[pid] = Some(ArmState::new());
+                if let Some(ac) = self.ack_counts.get_mut(pid) { *ac = 0; }
+                // Seed EMA with the live SRTT so the next context is as fresh as possible.
+                if pid < self.ema_rtt_ns.len() {
+                    self.ema_rtt_ns[pid] = live_rtt_ns as f64;
+                }
+                info!("LinUCB: path[{pid}] stale (>{STALE_SECS}s unselected), arm reset for re-exploration");
+            }
+        }
+
         // Pick the arm with the highest UCB score and collect per-path scores
         // for logging.
         let mut best_pid = raw[0].0;
@@ -274,8 +309,11 @@ impl MultipathScheduler for LinUCBScheduler {
         // (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb, context_x)
         let mut score_rows: Vec<(usize, u64, f64, f64, f64, f64, [f64; D])> = Vec::new();
 
-        for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, ..) in &raw {
-            let x = Self::make_context(rtt_ns, min_rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, max_pacing_bps);
+        for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, _, _, _, live_rtt_ns) in &raw {
+            // Use the more optimistic of the EMA RTT and the live SRTT so that
+            // any path improvement visible to the QUIC stack is reflected immediately.
+            let effective_rtt_ns = live_rtt_ns.min(rtt_ns);
+            let x = Self::make_context(effective_rtt_ns, min_rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, max_pacing_bps);
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
             // Dynamic alpha: 1/sqrt(n+1). Starts at 1.0 (heavy exploration),
@@ -298,7 +336,6 @@ impl MultipathScheduler for LinUCBScheduler {
         }
 
         // --- Logging and counters ---
-        let now = Instant::now();
 
         // Update per-window and total selection counters.
         if best_pid >= self.window_counts.len() {
@@ -312,10 +349,16 @@ impl MultipathScheduler for LinUCBScheduler {
         self.window_total += 1;
         self.total_selections += 1;
 
+        // Record selection time for stale-reset tracking.
+        if best_pid >= self.last_selected_at.len() {
+            self.last_selected_at.resize(best_pid + 1, None);
+        }
+        self.last_selected_at[best_pid] = Some(now);
+
         // Cache per-path addresses for the final summary.
         // Prefer local_addr, but fall back to remote_addr when local is
         // unspecified (server bound to 0.0.0.0 / ::).
-        for &(pid, _, _, _, _, _, _, _, _) in &raw {
+        for &(pid, _, _, _, _, _, _, _, _, _) in &raw {
             if pid >= self.path_addrs.len() {
                 self.path_addrs.resize(pid + 1, None);
             }
@@ -368,6 +411,24 @@ impl MultipathScheduler for LinUCBScheduler {
                 "  t={elapsed_s:>3}s:  {}",
                 parts.join("  |  ")
             ));
+
+            // ── Time-based forgetting factor ─────────────────────────────────
+            // Decay A and b by λ=0.97 per second so the model gradually forgets
+            // stale observations and can adapt when network conditions change
+            // (e.g. a delay is added or removed mid-connection).
+            // Adding back (1-λ) to the diagonal keeps A positive-definite.
+            const LAMBDA: f64 = 0.97;
+            for arm_opt in self.arms.iter_mut() {
+                if let Some(arm) = arm_opt {
+                    for i in 0..D {
+                        for j in 0..D {
+                            arm.a[i][j] *= LAMBDA;
+                        }
+                        arm.a[i][i] += 1.0 - LAMBDA;
+                        arm.b[i] *= LAMBDA;
+                    }
+                }
+            }
 
             // ── wandb JSONL metric line ──────────────────────────────────────
             // Flat JSON object per second.
