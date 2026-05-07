@@ -30,12 +30,9 @@ use crate::Result;
 /// Number of context features used by the bandit.
 ///
 /// Features per path:
-///   x[0] = ema_rtt / min_ema_rtt          (normalised RTT; 1.0 for best path, clamped ≤ 4.0)
-///   x[1] = bytes_in_flight / cwnd         (congestion window utilisation ∈ [0, 1])
-///   x[2] = lost_pkts / sent_pkts          (cumulative packet loss rate ∈ [0, 1])
-///   x[3] = min_pacing / pacing            (inverse throughput norm; 1.0 for fastest path)
-///   x[4] = 1.0                            (bias / intercept term)
-const D: usize = 5;
+///   x[0] = ema_rtt / min_ema_rtt   (normalised RTT; 1.0 for best path, clamped ≤ 4.0)
+///   x[1] = lost_pkts / sent_pkts   (cumulative packet loss rate ∈ [0, 1])
+const D: usize = 2;
 
 /// Per-arm (per-path) state for the LinUCB algorithm.
 struct ArmState {
@@ -164,40 +161,20 @@ impl LinUCBScheduler {
     /// Build the context vector for a path.
     ///
     /// Arguments:
-    ///   rtt_ns           — EMA RTT for this path (nanoseconds)
-    ///   min_rtt_ns       — minimum EMA RTT across all active paths (nanoseconds)
-    ///   bytes_in_flight  — current bytes in flight on this path
-    ///   cwnd             — current congestion window on this path (bytes)
-    ///   loss_rate        — cumulative lost_pkts / sent_pkts ∈ [0, 1]
-    ///   pacing_rate_bps  — pacing rate in bytes/sec (0 = not available)
-    ///   max_pacing_bps   — maximum pacing rate across all active paths
+    ///   rtt_ns     — EMA RTT for this path (nanoseconds)
+    ///   min_rtt_ns — minimum EMA RTT across all active paths (nanoseconds)
+    ///   loss_rate  — cumulative lost_pkts / sent_pkts ∈ [0, 1]
     fn make_context(
         rtt_ns: u128,
         min_rtt_ns: u128,
-        bytes_in_flight: usize,
-        cwnd: u64,
         loss_rate: f64,
-        pacing_rate_bps: u64,
-        max_pacing_bps: u64,
     ) -> [f64; D] {
         let rtt_norm = if min_rtt_ns > 0 {
             (rtt_ns as f64 / min_rtt_ns as f64).clamp(1.0, 4.0)
         } else {
             1.0
         };
-        let cwnd_pressure = if cwnd > 0 {
-            (bytes_in_flight as f64 / cwnd as f64).min(1.0)
-        } else {
-            1.0
-        };
-        // Inverse throughput norm: 1.0 for the fastest path, >1.0 for slower.
-        // If pacing rate is unavailable (0), treat as neutral (1.0).
-        let bw_norm = if pacing_rate_bps > 0 && max_pacing_bps > 0 {
-            (max_pacing_bps as f64 / pacing_rate_bps as f64).clamp(1.0, 4.0)
-        } else {
-            1.0
-        };
-        [rtt_norm, cwnd_pressure, loss_rate.clamp(0.0, 1.0), bw_norm, 1.0]
+        [rtt_norm, loss_rate.clamp(0.0, 1.0)]
     }
 
     /// Decompose the UCB score into (reward_estimate, exploration_bonus).
@@ -235,7 +212,6 @@ impl MultipathScheduler for LinUCBScheduler {
         // Collect per-path stats via iter_mut (can_send() takes &mut self).
         // Values are extracted before mutating self.arms to satisfy the borrow checker.
         let mut min_rtt_ns: u128 = u128::MAX;
-        let mut max_pacing_bps: u64 = 0;
         // (pid, rtt_ns_ema, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps, sent_bytes_total, lost_count_total, sent_count_total, live_rtt_ns)
         let mut raw: Vec<(usize, u128, usize, u64, f64, u64, u64, u64, u64, u128)> = Vec::new();
 
@@ -262,9 +238,6 @@ impl MultipathScheduler for LinUCBScheduler {
             let effective = live_rtt_ns.min(rtt_ns);
             if effective < min_rtt_ns {
                 min_rtt_ns = effective;
-            }
-            if pacing_bps > max_pacing_bps {
-                max_pacing_bps = pacing_bps;
             }
             raw.push((pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, sent_bytes_total, lost, sent, live_rtt_ns));
         }
@@ -306,14 +279,14 @@ impl MultipathScheduler for LinUCBScheduler {
         // for logging.
         let mut best_pid = raw[0].0;
         let mut best_score = f64::NEG_INFINITY;
-        // (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb, context_x)
-        let mut score_rows: Vec<(usize, u64, f64, f64, f64, f64, [f64; D])> = Vec::new();
+        // (pid, rtt_us, reward_est, explore_bonus, ucb, context_x)
+        let mut score_rows: Vec<(usize, u64, f64, f64, f64, [f64; D])> = Vec::new();
 
-        for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, _, _, _, live_rtt_ns) in &raw {
+        for &(pid, rtt_ns, _, _, loss_rate, _, _, _, _, live_rtt_ns) in &raw {
             // Use the more optimistic of the EMA RTT and the live SRTT so that
             // any path improvement visible to the QUIC stack is reflected immediately.
             let effective_rtt_ns = live_rtt_ns.min(rtt_ns);
-            let x = Self::make_context(effective_rtt_ns, min_rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, max_pacing_bps);
+            let x = Self::make_context(effective_rtt_ns, min_rtt_ns, loss_rate);
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
             // Dynamic alpha: 1/sqrt(n+1). Starts at 1.0 (heavy exploration),
@@ -327,8 +300,7 @@ impl MultipathScheduler for LinUCBScheduler {
                 self.last_context.resize(pid + 1, None);
             }
             self.last_context[pid] = Some(x);
-            let cwnd_pressure = x[1];
-            score_rows.push((pid, (rtt_ns / 1_000) as u64, cwnd_pressure, est, bonus, ucb, x));
+            score_rows.push((pid, (rtt_ns / 1_000) as u64, est, bonus, ucb, x));
             if ucb > best_score {
                 best_score = ucb;
                 best_pid = pid;
@@ -448,10 +420,10 @@ impl MultipathScheduler for LinUCBScheduler {
                 let step = self.metrics_jsonl.len() as u64;
                 let timestamp = self.start_unix_secs + elapsed_s;
                 // Feature / weight names in context-vector order:
-                //   x0=rtt_norm  x1=cwnd_pressure  x2=loss_rate  x3=bw_norm  x4=bias
-                let feat_names = ["rtt_norm", "cwnd_pressure", "loss_rate", "bw_norm", "bias"];
+                //   x0=rtt_norm  x1=loss_rate
+                let feat_names = ["rtt_norm", "loss_rate"];
                 let mut jline = format!("{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s}");
-                for &(pid, rtt_us, _cp, reward_est, explore_bonus, _ucb, x) in &score_rows {
+                for &(pid, rtt_us, reward_est, explore_bonus, _ucb, x) in &score_rows {
                     let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
                     let pct = cnt as f64 * 100.0 / total as f64;
                     let n = self.ack_counts.get(pid).copied().unwrap_or(0);
@@ -576,19 +548,10 @@ impl MultipathScheduler for LinUCBScheduler {
             .get(path_id)
             .and_then(|c| *c)
             .unwrap_or_else(|| {
-                Self::make_context(
-                    ema_rtt_ns,
-                    self.last_min_rtt_ns,
-                    path.recovery.bytes_in_flight,
-                    path.recovery.congestion.congestion_window(),
-                    {
-                        let sent = path.recovery.stats.sent_count;
-                        let lost = path.recovery.stats.lost_count;
-                        if sent > 0 { lost as f64 / sent as f64 } else { 0.0 }
-                    },
-                    0,
-                    0,
-                )
+                let sent = path.recovery.stats.sent_count;
+                let lost = path.recovery.stats.lost_count;
+                let loss_rate = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
+                Self::make_context(ema_rtt_ns, self.last_min_rtt_ns, loss_rate)
             });
 
         // Reward: exp(-rtt_norm) * (1 - loss_rate)
@@ -597,7 +560,7 @@ impl MultipathScheduler for LinUCBScheduler {
         //   - rtt_norm = 4.0 on worst path → exp(-4) ≈ 0.018 (strong penalty)
         //   - loss_rate multiplier further suppresses lossy paths
         //   - Stable scale prevents reward drift that destabilises theta
-        let reward = (-x[0]).exp() * (1.0 - x[2]);
+        let reward = (-x[0]).exp() * (1.0 - x[1]);
 
         let arm = self.arms[path_id].as_mut().unwrap();
         Self::update_arm(arm, x, reward);
@@ -626,9 +589,9 @@ impl MultipathScheduler for LinUCBScheduler {
                 .unwrap_or("?");
             let pct = cnt * 100 / self.total_selections;
             // Final model estimate + exploration bonus using a neutral context:
-            // rtt_norm=1.0, cwnd_pressure=0.0, loss_rate=0.0, bw_norm=1.0, bias=1.0.
+            // rtt_norm=1.0, loss_rate=0.0, bias=1.0.
             let (est_str, bonus_str) = if let Some(Some(arm)) = self.arms.get(pid) {
-                let x = [1.0_f64, 0.0_f64, 0.0_f64, 1.0_f64, 1.0_f64];
+                let x = [1.0_f64, 0.0_f64];
                 let a_inv = mat_inv(arm.a);
                 let theta = mat_vec(a_inv, arm.b);
                 let est = dot(theta, x);
