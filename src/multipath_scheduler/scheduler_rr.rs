@@ -19,92 +19,62 @@ use crate::multipath_scheduler::traffic_metrics::TrafficMetricsCollector;
 use crate::multipath_scheduler::MultipathScheduler;
 use crate::Error;
 use crate::MultipathConfig;
-use crate::Path;
 use crate::Result;
 
-/// RoundRobinScheduler iterates over the available paths and select the next
-/// one whose congestion window is open.
+/// RoundRobinScheduler distributes packets equally across available paths.
 ///
-/// The simple scheduler aims to guarantee that the capacity of each path is
-/// fully utilized as the distribution across all path is equal. It is for
-/// testing purposes only.
+/// On each selection it picks the sendable path that has been sent the fewest
+/// packets so far, breaking ties by path id. This gives a true equal split
+/// even when one path temporarily has a full congestion window.
 pub struct RoundRobinScheduler {
-    last:    Option<usize>,
-    metrics: TrafficMetricsCollector,
+    sent_counts: std::collections::HashMap<usize, u64>,
+    metrics:     TrafficMetricsCollector,
 }
 
 impl RoundRobinScheduler {
     pub fn new(_conf: &MultipathConfig) -> RoundRobinScheduler {
         RoundRobinScheduler {
-            last:    None,
-            metrics: TrafficMetricsCollector::new(),
+            sent_counts: std::collections::HashMap::new(),
+            metrics:     TrafficMetricsCollector::new(),
         }
     }
 }
 
-impl RoundRobinScheduler {
-    /// Iterate and find the last used path
-    fn find_last(&self, iter: &mut slab::IterMut<Path>, last: usize) -> bool {
-        for (pid, _) in iter.by_ref() {
-            if pid != last {
-                continue;
-            }
-            return true;
-        }
-        false
-    }
 
-    /// Try to select an available path
-    fn select(&mut self, iter: &mut slab::IterMut<Path>) -> Option<usize> {
-        for (pid, path) in iter.by_ref() {
-            // Skip the path that is not ready for sending non-probing packets.
-            if !path.active() || !path.recovery.can_send() {
-                continue;
-            }
-
-            self.last = Some(pid);
-            return Some(pid);
-        }
-        None
-    }
-}
 
 impl MultipathScheduler for RoundRobinScheduler {
-    /// Select the next path with sufficient congestion window.
+    /// Select the sendable path with the fewest packets sent so far.
     fn on_select(
         &mut self,
         paths: &mut PathMap,
         spaces: &mut PacketNumSpaceMap,
         streams: &mut StreamMap,
     ) -> Result<usize> {
-        let mut iter = paths.iter_mut();
-        let mut exist_last = false;
+        let mut best: Option<(usize, u64)> = None;
 
-        // Iterate and find the last used path
-        if let Some(last) = self.last {
-            if self.find_last(&mut iter, last) {
-                exist_last = true;
-            } else {
-                // The last path has been abandoned
-                iter = paths.iter_mut();
+        for (pid, path) in paths.iter_mut() {
+            if !path.active() || !path.recovery.can_send() {
+                continue;
+            }
+            let count = self.sent_counts.get(&pid).copied().unwrap_or(0);
+            match best {
+                None => best = Some((pid, count)),
+                Some((_, best_count)) => {
+                    if count < best_count {
+                        best = Some((pid, count));
+                    }
+                }
             }
         }
 
-        // Find the next available path
-        if let Some(pid) = self.select(&mut iter) {
-            self.metrics.record(pid, paths);
-            return Ok(pid);
+        match best {
+            Some((pid, count)) => {
+                self.sent_counts.insert(pid, count + 1);
+                self.metrics.record(pid, paths);
+                Ok(pid)
+            }
+            None => Err(Error::Done),
         }
-        if !exist_last {
-            return Err(Error::Done);
-        }
-
-        let mut iter = paths.iter_mut();
-        if let Some(pid) = self.select(&mut iter) {
-            self.metrics.record(pid, paths);
-            return Ok(pid);
-        }
-        Err(Error::Done)
     }
 
     fn scheduler_metrics_jsonl(&self) -> Vec<String> {
