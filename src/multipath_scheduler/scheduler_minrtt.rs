@@ -56,13 +56,18 @@ impl MultipathScheduler for MinRttScheduler {
                 continue;
             }
 
-            // Select the path with the minimum srtt
+            // Select the path with the minimum effective RTT.
+            // Use min(srtt, latest_rtt) so the scheduler reacts quickly
+            // when a path's conditions improve (latest_rtt drops), rather
+            // than waiting for the slow SRTT EMA to converge.
             let srtt = path.recovery.rtt.smoothed_rtt();
+            let latest = path.recovery.rtt.latest_rtt();
+            let effective = srtt.min(latest);
             match best {
-                None => best = Some((pid, srtt)),
+                None => best = Some((pid, effective)),
                 Some((_, rtt)) => {
-                    if srtt < rtt {
-                        best = Some((pid, srtt));
+                    if effective < rtt {
+                        best = Some((pid, effective));
                     }
                 }
             }

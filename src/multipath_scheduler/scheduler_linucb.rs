@@ -283,9 +283,19 @@ impl MultipathScheduler for LinUCBScheduler {
         let mut score_rows: Vec<(usize, u64, f64, f64, f64, [f64; D])> = Vec::new();
 
         for &(pid, rtt_ns, _, _, loss_rate, _, _, _, _, live_rtt_ns) in &raw {
-            // Use the more optimistic of the EMA RTT and the live SRTT so that
-            // any path improvement visible to the QUIC stack is reflected immediately.
-            let effective_rtt_ns = live_rtt_ns.min(rtt_ns);
+            // For a freshly-initialised or stale-reset arm (ack_count==0) the QUIC
+            // stack's smoothed_rtt() may still hold the initial_rtt default (333 ms)
+            // because the path has been idle.  Using that value would make rtt_norm=4
+            // and train the arm with a terrible reward on its very first probes,
+            // preventing it from ever winning the UCB again.
+            // Instead, assume the path is as good as the best observed path (optimistic
+            // initialisation) so the exploration bonus alone decides whether to probe.
+            let fresh = self.ack_counts.get(pid).copied().unwrap_or(0) == 0;
+            let effective_rtt_ns = if fresh {
+                min_rtt_ns
+            } else {
+                live_rtt_ns.min(rtt_ns)
+            };
             let x = Self::make_context(effective_rtt_ns, min_rtt_ns, loss_rate);
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
