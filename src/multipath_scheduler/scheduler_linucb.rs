@@ -30,9 +30,10 @@ use crate::Result;
 /// Number of context features used by the bandit.
 ///
 /// Features per path:
-///   x[0] = ema_rtt / min_ema_rtt   (normalised RTT; 1.0 for best path, clamped ≤ 4.0)
-///   x[1] = lost_pkts / sent_pkts   (cumulative packet loss rate ∈ [0, 1])
-const D: usize = 2;
+///   x[0] = ema_rtt / min_ema_rtt         (normalised RTT; 1.0 for best path, clamped ≤ 4.0)
+///   x[1] = bytes_in_flight / cwnd         (congestion window utilisation ∈ [0, 1])
+///   x[2] = lost_pkts / sent_pkts          (cumulative packet loss rate ∈ [0, 1])
+const D: usize = 3;
 
 /// Per-arm (per-path) state for the LinUCB algorithm.
 struct ArmState {
@@ -167,6 +168,7 @@ impl LinUCBScheduler {
     fn make_context(
         rtt_ns: u128,
         min_rtt_ns: u128,
+        cwnd_util: f64,
         loss_rate: f64,
     ) -> [f64; D] {
         let rtt_norm = if min_rtt_ns > 0 {
@@ -174,7 +176,7 @@ impl LinUCBScheduler {
         } else {
             1.0
         };
-        [rtt_norm, loss_rate.clamp(0.0, 1.0)]
+        [rtt_norm, cwnd_util.clamp(0.0, 1.0), loss_rate.clamp(0.0, 1.0)]
     }
 
     /// Decompose the UCB score into (reward_estimate, exploration_bonus).
@@ -219,8 +221,11 @@ impl MultipathScheduler for LinUCBScheduler {
             if !path.active() || !path.recovery.can_send() {
                 continue;
             }
-            // live_rtt_ns: the most recent RTT measurement from the QUIC stack.
-            let live_rtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos().max(1);
+            // live_rtt_ns: min(srtt, latest_rtt) so the context reacts immediately
+            // when a path improves, without waiting for the slow SRTT EMA to converge.
+            let srtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos().max(1);
+            let latest_rtt_ns = path.recovery.rtt.latest_rtt().as_nanos().max(1);
+            let live_rtt_ns = srtt_ns.min(latest_rtt_ns);
             // rtt_ns: our EMA (stable, but can be stale for rarely-selected paths).
             let rtt_ns = if self.ack_counts.get(pid).copied().unwrap_or(0) > 0 {
                 self.ema_rtt_ns[pid] as u128
@@ -282,7 +287,7 @@ impl MultipathScheduler for LinUCBScheduler {
         // (pid, rtt_us, reward_est, explore_bonus, ucb, context_x)
         let mut score_rows: Vec<(usize, u64, f64, f64, f64, [f64; D])> = Vec::new();
 
-        for &(pid, rtt_ns, _, _, loss_rate, _, _, _, _, live_rtt_ns) in &raw {
+        for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, _, _, _, _, live_rtt_ns) in &raw {
             // For a freshly-initialised or stale-reset arm (ack_count==0) the QUIC
             // stack's smoothed_rtt() may still hold the initial_rtt default (333 ms)
             // because the path has been idle.  Using that value would make rtt_norm=4
@@ -296,13 +301,20 @@ impl MultipathScheduler for LinUCBScheduler {
             } else {
                 live_rtt_ns.min(rtt_ns)
             };
-            let x = Self::make_context(effective_rtt_ns, min_rtt_ns, loss_rate);
+            let cwnd_util = if cwnd > 0 {
+                (bytes_in_flight as f64 / cwnd as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let x = Self::make_context(effective_rtt_ns, min_rtt_ns, cwnd_util, loss_rate);
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
             // Dynamic alpha: 1/sqrt(n+1). Starts at 1.0 (heavy exploration),
             // decays as the arm accumulates ACKs, converges to ~0.1 after ~100 ACKs.
             let n = self.ack_counts.get(pid).copied().unwrap_or(0);
-            let alpha = 1.0_f64 / ((n + 1) as f64).sqrt();
+            // Floor at 0.15 so exploration never fully stops: even a well-known arm
+            // keeps a small bonus and switches if the other path clearly improves.
+            let alpha = (1.0_f64 / ((n + 1) as f64).sqrt()).max(0.15);
             let (est, bonus) = Self::ucb_parts(arm, x, alpha);
             let ucb = est + bonus;
             // Store context so on_ack uses the same feature vector (no mismatch).
@@ -431,7 +443,7 @@ impl MultipathScheduler for LinUCBScheduler {
                 let timestamp = self.start_unix_secs + elapsed_s;
                 // Feature / weight names in context-vector order:
                 //   x0=rtt_norm  x1=loss_rate
-                let feat_names = ["rtt_norm", "loss_rate"];
+                let feat_names = ["rtt_norm", "cwnd_util", "loss_rate"];
                 let mut jline = format!("{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s}");
                 for &(pid, rtt_us, reward_est, explore_bonus, _ucb, x) in &score_rows {
                     let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
@@ -561,7 +573,13 @@ impl MultipathScheduler for LinUCBScheduler {
                 let sent = path.recovery.stats.sent_count;
                 let lost = path.recovery.stats.lost_count;
                 let loss_rate = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
-                Self::make_context(ema_rtt_ns, self.last_min_rtt_ns, loss_rate)
+                let cwnd = path.recovery.congestion.congestion_window() as f64;
+                let cwnd_util = if cwnd > 0.0 {
+                    (path.recovery.bytes_in_flight as f64 / cwnd).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                Self::make_context(ema_rtt_ns, self.last_min_rtt_ns, cwnd_util, loss_rate)
             });
 
         // Reward: exp(-rtt_norm) * (1 - loss_rate)
@@ -601,7 +619,7 @@ impl MultipathScheduler for LinUCBScheduler {
             // Final model estimate + exploration bonus using a neutral context:
             // rtt_norm=1.0, loss_rate=0.0, bias=1.0.
             let (est_str, bonus_str) = if let Some(Some(arm)) = self.arms.get(pid) {
-                let x = [1.0_f64, 0.0_f64];
+                let x = [1.0_f64, 0.0_f64, 0.0_f64];
                 let a_inv = mat_inv(arm.a);
                 let theta = mat_vec(a_inv, arm.b);
                 let est = dot(theta, x);
