@@ -273,6 +273,12 @@ impl MultipathScheduler for LinUCBScheduler {
                 if pid < self.ema_rtt_ns.len() {
                     self.ema_rtt_ns[pid] = live_rtt_ns as f64;
                 }
+                // Stamp now so subsequent calls in the same recovery burst do not
+                // re-trigger this reset before the arm has had a chance to be selected.
+                if pid >= self.last_selected_at.len() {
+                    self.last_selected_at.resize(pid + 1, None);
+                }
+                self.last_selected_at[pid] = Some(now);
                 info!("LinUCB: path[{pid}] stale (>{STALE_SECS}s unselected), arm reset for re-exploration");
             }
         }
