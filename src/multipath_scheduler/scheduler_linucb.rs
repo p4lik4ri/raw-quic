@@ -14,6 +14,8 @@
 
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
@@ -101,6 +103,9 @@ pub struct LinUCBScheduler {
     /// Per-second JSONL metric lines buffered for wandb upload at run end.
     /// Each line is a flat JSON object with a `_step` key and per-path metrics.
     metrics_jsonl: Vec<String>,
+    /// Unix timestamp (seconds) at scheduler creation, used to compute per-step
+    /// `_timestamp` required by wandb to render time-series charts.
+    start_unix_secs: u64,
     /// Last context used when each path was scored for selection.
     /// ACK-time updates reuse this context to keep LinUCB credit assignment consistent.
     last_contexts: Vec<Option<[f64; D]>>,
@@ -109,6 +114,10 @@ pub struct LinUCBScheduler {
 impl LinUCBScheduler {
     pub fn new(_conf: &MultipathConfig) -> Self {
         let now = Instant::now();
+        let start_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         LinUCBScheduler {
             arms: Vec::new(),
             last_min_rtt_ns: 1,
@@ -124,6 +133,7 @@ impl LinUCBScheduler {
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
             metrics_jsonl: Vec::new(),
+            start_unix_secs,
             last_contexts: Vec::new(),
         }
     }
@@ -355,8 +365,9 @@ impl MultipathScheduler for LinUCBScheduler {
             // Theta:    th0..th4 = learned LinUCB weights for each feature.
             {
                 let step = self.metrics_jsonl.len() as u64;
+                let timestamp = self.start_unix_secs + elapsed_s;
                 let feat_names = ["rtt_norm", "cwnd_p", "loss_rate", "bw_norm", "bias"];
-                let mut jline = format!("{{\"_step\":{step},\"t\":{elapsed_s}");
+                let mut jline = format!("{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s}");
                 for &(pid, rtt_us, _cp, reward_est, explore_bonus, _ucb, x) in &score_rows {
                     let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
                     let pct = cnt as f64 * 100.0 / total as f64;
