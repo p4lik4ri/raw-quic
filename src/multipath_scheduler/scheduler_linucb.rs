@@ -14,8 +14,6 @@
 
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
@@ -44,6 +42,16 @@ const IDLE_FORGET_THRESHOLD_SECS: f64 = 2.0;
 /// A ratio < 1 pulls A back toward identity and shrinks b, increasing the
 /// exploration bonus. Smaller ⇒ faster forgetting.
 const IDLE_FORGET_LAMBDA: f64 = 0.92;
+
+/// EMA factor for `cwnd_pressure = bytes_in_flight / cwnd`.
+/// The raw ratio is bursty packet-by-packet; smoothing prevents the reward
+/// term `(1 - cwnd_pressure)` from oscillating on cwnd noise and producing
+/// scheduler thrash when the RTT signal saturates at its clamp ceiling.
+///
+///   ema[t] = CWND_P_EMA_ALPHA * raw[t] + (1 - CWND_P_EMA_ALPHA) * ema[t-1]
+///
+/// Smaller ⇒ more smoothing.  0.10 gives an effective window of ~10 selections.
+const CWND_P_EMA_ALPHA: f64 = 0.10;
 
 /// Per-arm (per-path) state for the LinUCB algorithm.
 struct ArmState {
@@ -132,12 +140,6 @@ pub struct LinUCBScheduler {
     /// Per-second JSONL metric lines buffered for wandb upload at run end.
     /// Each line is a flat JSON object with a `_step` key and per-path metrics.
     metrics_jsonl: Vec<String>,
-    /// Unix timestamp (seconds) at scheduler creation, used to compute per-step
-    /// `_timestamp` required by wandb to render time-series charts.
-    start_unix_secs: u64,
-    /// Cumulative sent-bytes snapshot from the previous 1-second window.
-    /// Used to compute per-second actual throughput (delta bytes × 8 / 1e6 = Mbps).
-    prev_sent_bytes: Vec<u64>,
     /// Last context used when each path was scored for selection.
     /// ACK-time updates reuse this context to keep LinUCB credit assignment consistent.
     last_contexts: Vec<Option<[f64; D]>>,
@@ -147,15 +149,25 @@ pub struct LinUCBScheduler {
     /// Timestamp of the last time the idle-forgetting decay was applied to a path.
     /// Prevents the per-call decay from being applied repeatedly within one window.
     last_forget_time: Vec<Option<Instant>>,
+    /// Per-path EMA of `bytes_in_flight / cwnd`.  Smooths bursty cwnd utilisation
+    /// so the reward term `(1 - cwnd_pressure)` is not driven by short-timescale
+    /// noise.  `None` until the first selection for the path.
+    ema_cwnd_pressure: Vec<Option<f64>>,
+    /// Cumulative count of forgetting events per path.  Incremented when either
+    /// idle-forgetting (in on_select) or RTT-jump forgetting (in on_ack) fires.
+    /// Plotted as `p{pid}.forget_count`, this is a step-function counter whose
+    /// jumps mark exactly when the model state was decayed.
+    forget_counts: Vec<u64>,
+    /// Snapshot of `path.recovery.stats.sent_count` per path at the start of
+    /// the current 1-second logging window.  Used to compute `sent_per_sec`,
+    /// `delivered_mbps`, and `traffic_share_pct` so wandb can plot the actual
+    /// traffic split (distinct from the *selection* split given by `pct`).
+    last_window_sent: Vec<u64>,
 }
 
 impl LinUCBScheduler {
     pub fn new(_conf: &MultipathConfig) -> Self {
         let now = Instant::now();
-        let start_unix_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         LinUCBScheduler {
             arms: Vec::new(),
             last_min_rtt_ns: 1,
@@ -173,11 +185,12 @@ impl LinUCBScheduler {
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
             metrics_jsonl: Vec::new(),
-            start_unix_secs,
-            prev_sent_bytes: Vec::new(),
             last_contexts: Vec::new(),
             last_select_time: Vec::new(),
             last_forget_time: Vec::new(),
+            ema_cwnd_pressure: Vec::new(),
+            forget_counts: Vec::new(),
+            last_window_sent: Vec::new(),
         }
     }
 
@@ -196,27 +209,21 @@ impl LinUCBScheduler {
     /// Arguments:
     ///   rtt_ns           — EMA RTT for this path (nanoseconds)
     ///   min_rtt_ns       — minimum EMA RTT across all active paths (nanoseconds)
-    ///   bytes_in_flight  — current bytes in flight on this path
-    ///   cwnd             — current congestion window on this path (bytes)
+    ///   cwnd_pressure    — SMOOTHED `bytes_in_flight / cwnd` ∈ [0, 1] (caller
+    ///                       must pre-clamp and EMA-smooth)
     ///   loss_rate        — cumulative lost_pkts / sent_pkts ∈ [0, 1]
     ///   pacing_rate_bps  — pacing rate in bytes/sec (0 = not available)
     ///   max_pacing_bps   — maximum pacing rate across all active paths
     fn make_context(
         rtt_ns: u128,
         min_rtt_ns: u128,
-        bytes_in_flight: usize,
-        cwnd: u64,
+        cwnd_pressure: f64,
         loss_rate: f64,
         pacing_rate_bps: u64,
         max_pacing_bps: u64,
     ) -> [f64; D] {
         let rtt_norm = if min_rtt_ns > 0 {
             (rtt_ns as f64 / min_rtt_ns as f64).clamp(1.0, 4.0)
-        } else {
-            1.0
-        };
-        let cwnd_pressure = if cwnd > 0 {
-            (bytes_in_flight as f64 / cwnd as f64).min(1.0)
         } else {
             1.0
         };
@@ -227,7 +234,8 @@ impl LinUCBScheduler {
         } else {
             1.0
         };
-        [rtt_norm, cwnd_pressure, loss_rate.clamp(0.0, 1.0), bw_norm, 1.0]
+        [rtt_norm, cwnd_pressure.clamp(0.0, 1.0),
+         loss_rate.clamp(0.0, 1.0), bw_norm, 1.0]
     }
 
     /// Apply one decay step to an arm's (A, b) toward identity / zero.
@@ -278,8 +286,9 @@ impl MultipathScheduler for LinUCBScheduler {
         // Values are extracted before mutating self.arms to satisfy the borrow checker.
         let mut min_rtt_ns: u128 = u128::MAX;
         let mut max_pacing_bps: u64 = 0;
-        // (pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps, sent_bytes)
-        let mut raw: Vec<(usize, u128, usize, u64, f64, u64, u64)> = Vec::new();
+        // (pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps,
+        //  sent_count, lost_count)
+        let mut raw: Vec<(usize, u128, usize, u64, f64, u64, u64, u64)> = Vec::new();
 
         for (pid, path) in paths.iter_mut() {
             if !path.active() || !path.recovery.can_send() {
@@ -296,14 +305,14 @@ impl MultipathScheduler for LinUCBScheduler {
             let lost = path.recovery.stats.lost_count;
             let loss_rate = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
             let pacing_bps = path.recovery.congestion.pacing_rate().unwrap_or(0);
-            let sent_bytes = path.recovery.stats.sent_bytes;
             if rtt_ns < min_rtt_ns {
                 min_rtt_ns = rtt_ns;
             }
             if pacing_bps > max_pacing_bps {
                 max_pacing_bps = pacing_bps;
             }
-            raw.push((pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, sent_bytes));
+            raw.push((pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps,
+                      sent as u64, lost as u64));
         }
 
         if raw.is_empty() {
@@ -324,8 +333,27 @@ impl MultipathScheduler for LinUCBScheduler {
         // (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb, context_x)
         let mut score_rows: Vec<(usize, u64, f64, f64, f64, f64, [f64; D])> = Vec::new();
 
-        for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, _sent_bytes) in &raw {
+        for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, _sent, _lost) in &raw {
             self.ensure_arm(pid);
+
+            // ── cwnd_pressure EMA smoothing ───────────────────────────
+            // Raw `bytes_in_flight / cwnd` is bursty packet-by-packet;
+            // smooth it per path so the reward term (1 - cwnd_p) does not
+            // drive scheduler oscillation on cwnd noise.
+            let raw_cwnd_p = if cwnd > 0 {
+                (bytes_in_flight as f64 / cwnd as f64).min(1.0)
+            } else {
+                1.0
+            };
+            if pid >= self.ema_cwnd_pressure.len() {
+                self.ema_cwnd_pressure.resize(pid + 1, None);
+            }
+            let smoothed_cwnd_p = match self.ema_cwnd_pressure[pid] {
+                Some(prev) => CWND_P_EMA_ALPHA * raw_cwnd_p
+                    + (1.0 - CWND_P_EMA_ALPHA) * prev,
+                None => raw_cwnd_p,
+            };
+            self.ema_cwnd_pressure[pid] = Some(smoothed_cwnd_p);
 
             // ── Idle-forgetting ────────────────────────────────────────
             // If this path has been idle longer than IDLE_FORGET_THRESHOLD_SECS
@@ -350,13 +378,16 @@ impl MultipathScheduler for LinUCBScheduler {
                     self.last_forget_time.resize(pid + 1, None);
                 }
                 self.last_forget_time[pid] = Some(now);
+                if pid >= self.forget_counts.len() {
+                    self.forget_counts.resize(pid + 1, 0);
+                }
+                self.forget_counts[pid] += 1;
             }
 
             let x = Self::make_context(
                 rtt_ns,
                 min_rtt_ns,
-                bytes_in_flight,
-                cwnd,
+                smoothed_cwnd_p,
                 loss_rate,
                 pacing_bps,
                 max_pacing_bps,
@@ -403,7 +434,7 @@ impl MultipathScheduler for LinUCBScheduler {
         // Cache per-path addresses for the final summary.
         // Prefer local_addr, but fall back to remote_addr when local is
         // unspecified (server bound to 0.0.0.0 / ::).
-        for &(pid, _, _, _, _, _, _) in &raw {
+        for &(pid, _, _, _, _, _, _, _) in &raw {
             if pid >= self.path_addrs.len() {
                 self.path_addrs.resize(pid + 1, None);
             }
@@ -460,8 +491,36 @@ impl MultipathScheduler for LinUCBScheduler {
             // ── wandb JSONL metric line ────────────────────────────────────────
             // Flat JSON object per second.  Metric names use "p{pid}." prefix
             // so wandb groups them by path in the UI.
-            // Features: x0=rtt_norm, x1=cwnd_p, x2=loss_rate, x3=bw_norm, x4=bias
-            // Theta:    th0..th4 = learned LinUCB weights for each feature.
+            //
+            // LinUCB internals (selection-time):
+            //   p{pid}.pct           — % selections in this 1-second window
+            //   p{pid}.rtt_ms        — EMA RTT in ms
+            //   p{pid}.reward        — reward estimate θᵀx (exploitation term)
+            //   p{pid}.bonus         — exploration bonus α√(xᵀA⁻¹x)
+            //   p{pid}.ucb_total     — reward + bonus (the score being maximised)
+            //   p{pid}.explore_ratio — bonus / |ucb_total| (0=exploit, 1=explore)
+            //   p{pid}.a_trace       — sum of A's diagonal (effective sample count;
+            //                          drops at forgetting events)
+            //   p{pid}.forget_count  — cumulative count of forgetting events
+            //                          (idle + RTT-jump); step-function counter
+            //   p{pid}.n             — cumulative ACK count for this arm
+            //   p{pid}.alpha         — current α value for this arm
+            //   p{pid}.x_*           — context features (rtt_norm, cwnd_p, loss_rate, bw_norm)
+            //                          x_bias is omitted (always 1.0).
+            //   p{pid}.th_*          — 5 learned LinUCB weights including th_bias
+            //
+            // Network state (throughput, congestion, loss):
+            //   p{pid}.pacing_mbps        — pacing rate in Mbps (CC-allowed)
+            //   p{pid}.delivered_mbps     — approx delivered Mbps this window
+            //                                (sent_per_sec × 1380 B × 8 / 1e6)
+            //   p{pid}.sent_per_sec       — packets sent in this 1-second window
+            //   p{pid}.traffic_share_pct  — % of total packets sent on this path
+            //                                in this window (actual traffic split,
+            //                                vs `pct` which is the *selection* split)
+            //   p{pid}.bif_kb             — bytes in flight (KiB)
+            //   p{pid}.cwnd_kb            — congestion window (KiB)
+            //   p{pid}.sent               — cumulative packets sent
+            //   p{pid}.lost               — cumulative packets lost
             //
             // Alpha sweep fields (for cross-run comparison):
             //   cfg.alpha_init  — the alpha_init value configured for this run
@@ -473,7 +532,6 @@ impl MultipathScheduler for LinUCBScheduler {
             //                     (100 = all traffic on one path, 0 = perfect split)
             {
                 let step = self.metrics_jsonl.len() as u64;
-                let timestamp = self.start_unix_secs + elapsed_s;
                 let feat_names = ["rtt_norm", "cwnd_p", "loss_rate", "bw_norm", "bias"];
 
                 // Compute dominant path and path_delta for the α-sweep plot.
@@ -499,8 +557,31 @@ impl MultipathScheduler for LinUCBScheduler {
                     100.0
                 };
 
+                // ── Per-window traffic deltas ──────────────────────────
+                // Compute packets sent in this 1-second window per path,
+                // and the global total, so each path's traffic share can be
+                // reported.  On a path's first appearance we treat the
+                // "previous" snapshot as the current sent count, yielding a
+                // delta of 0 (avoids reporting cumulative as instantaneous).
+                const AVG_PKT_SIZE_BYTES: f64 = 1380.0;
+                let mut path_delta_sent: Vec<u64> = Vec::new();
+                let mut total_delta_sent: u64 = 0;
+                for &(pid, _, _, _, _, _, sent_p, _) in &raw {
+                    let prev = if pid < self.last_window_sent.len() {
+                        self.last_window_sent[pid]
+                    } else {
+                        sent_p
+                    };
+                    let delta = sent_p.saturating_sub(prev);
+                    if pid >= path_delta_sent.len() {
+                        path_delta_sent.resize(pid + 1, 0);
+                    }
+                    path_delta_sent[pid] = delta;
+                    total_delta_sent = total_delta_sent.saturating_add(delta);
+                }
+
                 let mut jline = format!(
-                    "{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s},\
+                    "{{\"_step\":{step},\"t\":{elapsed_s},\
                      \"cfg.alpha_init\":{:.4},\"cfg.alpha_floor\":{:.4},\
                      \"dominant_path\":{dominant_path},\"path_delta\":{path_delta:.2}",
                     self.alpha_init, self.alpha_floor,
@@ -509,30 +590,76 @@ impl MultipathScheduler for LinUCBScheduler {
                     let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
                     let pct = cnt as f64 * 100.0 / total as f64;
                     let n = self.ack_counts.get(pid).copied().unwrap_or(0);
-                    // Per-path throughput: delta sent bytes over the last second → Mbps.
-                    let sent_now = raw.iter()
-                        .find(|&&(p, ..)| p == pid)
-                        .map(|&(_, _, _, _, _, _, s)| s)
-                        .unwrap_or(0);
-                    if pid >= self.prev_sent_bytes.len() {
-                        self.prev_sent_bytes.resize(pid + 1, 0);
-                    }
-                    let delta_bytes = sent_now.saturating_sub(self.prev_sent_bytes[pid]);
-                    let throughput_mbps = (delta_bytes as f64 * 8.0) / 1_000_000.0;
-                    self.prev_sent_bytes[pid] = sent_now;
                     let theta = if let Some(Some(arm)) = self.arms.get(pid) {
                         mat_vec(mat_inv(arm.a), arm.b)
                     } else {
                         [0.0_f64; D]
                     };
                     let alpha_logged = (self.alpha_init / ((n + 1) as f64).sqrt()).max(self.alpha_floor);
+
+                    // Look up the raw network stats for this pid (throughput/congestion/loss).
+                    let (bif_b, cwnd_b, pacing_bps_p, sent_p, lost_p) = raw
+                        .iter()
+                        .find(|r| r.0 == pid)
+                        .map(|r| (r.2 as u64, r.3, r.5, r.6, r.7))
+                        .unwrap_or((0, 0, 0, 0, 0));
+                    let pacing_mbps = pacing_bps_p as f64 * 8.0 / 1_000_000.0;
+                    let bif_kb = bif_b as f64 / 1024.0;
+                    let cwnd_kb = cwnd_b as f64 / 1024.0;
+                    let rtt_ms = rtt_us as f64 / 1000.0;
+
+                    // Composite LinUCB diagnostics.
+                    //   ucb_total     — the full score: reward_est + explore_bonus
+                    //   explore_ratio — fraction of UCB coming from exploration
+                    //                   (1.0 = pure exploration, 0.0 = pure exploit)
+                    //   a_trace       — sum of A's diagonal; effective sample count.
+                    //                   Drops sharply at forgetting events, grows with ACKs.
+                    let ucb_total = reward_est + explore_bonus;
+                    let explore_ratio = if ucb_total.abs() > 1e-12 {
+                        explore_bonus / ucb_total.abs()
+                    } else {
+                        1.0
+                    };
+                    let a_trace = if let Some(Some(arm)) = self.arms.get(pid) {
+                        (0..D).map(|i| arm.a[i][i]).sum::<f64>()
+                    } else {
+                        0.0
+                    };
+                    let forget_count = self.forget_counts.get(pid).copied().unwrap_or(0);
+
+                    // Per-window traffic.  `sent_per_sec` is packets/sec for
+                    // this 1-second window.  `delivered_mbps` approximates the
+                    // delivered Mbps assuming an average QUIC packet of 1380 B.
+                    // `traffic_share_pct` is the fraction of *bytes* (here:
+                    // packets) carried by this path in this window.
+                    let sent_per_sec = path_delta_sent.get(pid).copied().unwrap_or(0);
+                    let delivered_mbps =
+                        sent_per_sec as f64 * AVG_PKT_SIZE_BYTES * 8.0 / 1_000_000.0;
+                    let traffic_share_pct = if total_delta_sent > 0 {
+                        sent_per_sec as f64 * 100.0 / total_delta_sent as f64
+                    } else {
+                        0.0
+                    };
+
                     jline.push_str(&format!(
-                        ",\"p{pid}.pct\":{pct:.2},\"p{pid}.rtt_us\":{rtt_us},\
-                         \"p{pid}.throughput_mbps\":{throughput_mbps:.3},\
+                        ",\"p{pid}.pct\":{pct:.2},\
+                         \"p{pid}.rtt_ms\":{rtt_ms:.3},\
                          \"p{pid}.reward\":{reward_est:.4},\"p{pid}.bonus\":{explore_bonus:.4},\
-                         \"p{pid}.n\":{n},\"p{pid}.alpha\":{alpha_logged:.4}",
+                         \"p{pid}.ucb_total\":{ucb_total:.4},\
+                         \"p{pid}.explore_ratio\":{explore_ratio:.4},\
+                         \"p{pid}.a_trace\":{a_trace:.3},\
+                         \"p{pid}.forget_count\":{forget_count},\
+                         \"p{pid}.n\":{n},\"p{pid}.alpha\":{alpha_logged:.4},\
+                         \"p{pid}.pacing_mbps\":{pacing_mbps:.3},\
+                         \"p{pid}.delivered_mbps\":{delivered_mbps:.3},\
+                         \"p{pid}.sent_per_sec\":{sent_per_sec},\
+                         \"p{pid}.traffic_share_pct\":{traffic_share_pct:.2},\
+                         \"p{pid}.bif_kb\":{bif_kb:.2},\"p{pid}.cwnd_kb\":{cwnd_kb:.2},\
+                         \"p{pid}.sent\":{sent_p},\"p{pid}.lost\":{lost_p}",
                     ));
+                    // x_bias is always 1.0 (constant intercept); skip to reduce clutter.
                     for (i, xi) in x.iter().enumerate() {
+                        if feat_names[i] == "bias" { continue; }
                         jline.push_str(&format!(",\"p{pid}.x_{}\":{xi:.4}", feat_names[i]));
                     }
                     for (i, ti) in theta.iter().enumerate() {
@@ -549,6 +676,14 @@ impl MultipathScheduler for LinUCBScheduler {
                 *c = 0;
             }
             self.window_total = 0;
+            // Snapshot current `sent_count` so the next window's
+            // sent_per_sec / delivered_mbps / traffic_share_pct can be computed.
+            for &(pid, _, _, _, _, _, sent_p, _) in &raw {
+                if pid >= self.last_window_sent.len() {
+                    self.last_window_sent.resize(pid + 1, 0);
+                }
+                self.last_window_sent[pid] = sent_p;
+            }
         }
 
         Ok(best_pid)
@@ -594,6 +729,10 @@ impl MultipathScheduler for LinUCBScheduler {
                     arm.b[i] *= lambda;
                     arm.a[i][i] += 1.0 - lambda;
                 }
+                if path_id >= self.forget_counts.len() {
+                    self.forget_counts.resize(path_id + 1, 0);
+                }
+                self.forget_counts[path_id] += 1;
             }
         }
 
@@ -602,11 +741,25 @@ impl MultipathScheduler for LinUCBScheduler {
             .get(path_id)
             .and_then(|ctx| *ctx)
             .unwrap_or_else(|| {
+                // Fallback: no cached selection-time context (e.g. ACK before
+                // first on_select).  Reuse the smoothed cwnd_pressure if we have
+                // one; otherwise compute raw and skip smoothing.
+                let cwnd = path.recovery.congestion.congestion_window();
+                let bif = path.recovery.bytes_in_flight;
+                let raw_cp = if cwnd > 0 {
+                    (bif as f64 / cwnd as f64).min(1.0)
+                } else {
+                    1.0
+                };
+                let cp = self
+                    .ema_cwnd_pressure
+                    .get(path_id)
+                    .and_then(|c| *c)
+                    .unwrap_or(raw_cp);
                 Self::make_context(
                     ema_rtt_ns,
                     self.last_min_rtt_ns,
-                    path.recovery.bytes_in_flight,
-                    path.recovery.congestion.congestion_window(),
+                    cp,
                     {
                         let sent = path.recovery.stats.sent_count;
                         let lost = path.recovery.stats.lost_count;
