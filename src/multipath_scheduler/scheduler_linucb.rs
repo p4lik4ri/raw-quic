@@ -26,38 +26,38 @@ use crate::Result;
 /// Number of context features used by the bandit.
 ///
 /// Features per path:
-///   x[0] = ema_rtt / min_ema_rtt          (normalised RTT; 1.0 for best path, clamped ≤ 4.0)
-///   x[1] = bytes_in_flight / cwnd         (congestion window utilisation ∈ [0, 1])
-///   x[2] = lost_pkts / sent_pkts          (cumulative packet loss rate ∈ [0, 1])
-///   x[3] = min_pacing / pacing            (inverse throughput norm; 1.0 for fastest path)
-///   x[4] = 1.0                            (bias / intercept term)
+///   x[0] = ema_rtt / min_ema_rtt
+///   x[1] = bytes_in_flight / cwnd
+///   x[2] = lost_pkts / sent_pkts
+///   x[3] = min_pacing / pacing
+///   x[4] = 1.0 (bias)
 const D: usize = 5;
 
-/// Idle threshold (seconds) before a path is treated as quiescent.
-/// While idle, the LinUCB covariance matrix `A` is periodically decayed
-/// toward the identity, restoring uncertainty so the path is re-probed.
+/// Idle threshold before a path is considered stale.
 const IDLE_FORGET_THRESHOLD_SECS: f64 = 2.0;
 
-/// Forgetting factor applied per IDLE_FORGET_THRESHOLD_SECS of inactivity.
-/// A ratio < 1 pulls A back toward identity and shrinks b, increasing the
-/// exploration bonus. Smaller ⇒ faster forgetting.
+/// Forgetting factor for idle paths.
 const IDLE_FORGET_LAMBDA: f64 = 0.92;
 
-/// EMA factor for `cwnd_pressure = bytes_in_flight / cwnd`.
-/// The raw ratio is bursty packet-by-packet; smoothing prevents the reward
-/// term `(1 - cwnd_pressure)` from oscillating on cwnd noise and producing
-/// scheduler thrash when the RTT signal saturates at its clamp ceiling.
-///
-///   ema[t] = CWND_P_EMA_ALPHA * raw[t] + (1 - CWND_P_EMA_ALPHA) * ema[t-1]
-///
-/// Smaller ⇒ more smoothing.  0.10 gives an effective window of ~10 selections.
+/// EMA smoothing for cwnd pressure.
 const CWND_P_EMA_ALPHA: f64 = 0.10;
 
-/// Per-arm (per-path) state for the LinUCB algorithm.
+/// Exploration boost when path traffic share collapses.
+///
+/// If a path's traffic share falls below:
+///     FAIRNESS_MIN_SHARE_PCT
+///
+/// then its exploration bonus is multiplied by:
+///     FAIRNESS_BOOST
+///
+/// This prevents total path starvation while still allowing
+/// the scheduler to strongly prefer better paths.
+const FAIRNESS_MIN_SHARE_PCT: f64 = 5.0;
+const FAIRNESS_BOOST: f64 = 2.0;
+
+/// Per-arm state for LinUCB.
 struct ArmState {
-    /// A = I_d + Σ x_t xₜᵀ  — d×d positive-definite matrix.
     a: [[f64; D]; D],
-    /// b = Σ rₜ xₜ  — d-dimensional reward-weighted feature sum.
     b: [f64; D],
 }
 
@@ -65,7 +65,7 @@ impl ArmState {
     fn new() -> Self {
         let mut a = [[0.0_f64; D]; D];
         for i in 0..D {
-            a[i][i] = 1.0; // initialise as identity
+            a[i][i] = 1.0;
         }
         ArmState { a, b: [0.0; D] }
     }
@@ -102,118 +102,88 @@ impl ArmState {
 ///   0.0 allows full exploitation; setting it very high approximates
 ///   Round Robin.
 pub struct LinUCBScheduler {
-    /// Per-path arm state, indexed by path_id.
     arms: Vec<Option<ArmState>>,
-    /// Minimum srtt (nanoseconds) observed across all paths at the last
-    /// on_select call. Used as the normalisation baseline in on_ack fallback
-    /// context construction.
     last_min_rtt_ns: u128,
-    /// Last path chosen — used to detect transitions and log path changes.
+
     last_selected: Option<usize>,
-    /// Timestamp of the last periodic 1-second log.
     last_log: Option<Instant>,
-    /// Per-path selection counter for the current 1-second window.
+
     window_counts: Vec<u64>,
-    /// Total selections in the current 1-second window.
     window_total: u64,
-    /// Total selections across the entire session, indexed by path_id.
+
     total_counts: Vec<u64>,
-    /// Total selections across the entire session.
     total_selections: u64,
-    /// Per-path local address strings, populated on first selection.
+
     path_addrs: Vec<Option<String>>,
-    /// Per-second snapshot lines buffered for the final summary.
     snapshots: Vec<String>,
-    /// Connection start time for elapsed-second labels in summary.
     start_time: Instant,
-    /// Initial exploration coefficient α₀.  alpha(n) = max(alpha_floor, alpha_init/√(n+1)).
-    /// Default: 1.0.  Increase to explore more aggressively; decrease for faster exploitation.
+
     pub alpha_init: f64,
-    /// Minimum exploration coefficient (floor).  Keeps a residual probe budget per path.
-    /// Default: 0.15.  Set to 0.0 for pure exploitation; set high to approximate Round Robin.
     pub alpha_floor: f64,
-    /// Per-path exponential moving average of latest_rtt (nanoseconds).
-    /// Used in on_ack to smooth transient first-packet RTT spikes.
+
     ema_rtt_ns: Vec<f64>,
-    /// Number of ACKs received per path, used to control EMA warmup speed.
     ack_counts: Vec<u64>,
-    /// Per-second JSONL metric lines buffered for wandb upload at run end.
-    /// Each line is a flat JSON object with a `_step` key and per-path metrics.
+
     metrics_jsonl: Vec<String>,
-    /// Last context used when each path was scored for selection.
-    /// ACK-time updates reuse this context to keep LinUCB credit assignment consistent.
+
     last_contexts: Vec<Option<[f64; D]>>,
-    /// Timestamp of the last time each path was selected by on_select.
-    /// Used together with `last_forget_time` to detect path quiescence.
     last_select_time: Vec<Option<Instant>>,
-    /// Timestamp of the last time the idle-forgetting decay was applied to a path.
-    /// Prevents the per-call decay from being applied repeatedly within one window.
     last_forget_time: Vec<Option<Instant>>,
-    /// Per-path EMA of `bytes_in_flight / cwnd`.  Smooths bursty cwnd utilisation
-    /// so the reward term `(1 - cwnd_pressure)` is not driven by short-timescale
-    /// noise.  `None` until the first selection for the path.
     ema_cwnd_pressure: Vec<Option<f64>>,
-    /// Cumulative count of forgetting events per path.  Incremented when either
-    /// idle-forgetting (in on_select) or RTT-jump forgetting (in on_ack) fires.
-    /// Plotted as `p{pid}.forget_count`, this is a step-function counter whose
-    /// jumps mark exactly when the model state was decayed.
     forget_counts: Vec<u64>,
-    /// Snapshot of `path.recovery.stats.sent_count` per path at the start of
-    /// the current 1-second logging window.  Used to compute `sent_per_sec`,
-    /// `delivered_mbps`, and `traffic_share_pct` so wandb can plot the actual
-    /// traffic split (distinct from the *selection* split given by `pct`).
+
     last_window_sent: Vec<u64>,
 }
 
 impl LinUCBScheduler {
     pub fn new(_conf: &MultipathConfig) -> Self {
         let now = Instant::now();
+
         LinUCBScheduler {
             arms: Vec::new(),
             last_min_rtt_ns: 1,
+
             last_selected: None,
             last_log: None,
+
             window_counts: Vec::new(),
             window_total: 0,
+
             total_counts: Vec::new(),
             total_selections: 0,
+
             path_addrs: Vec::new(),
             snapshots: Vec::new(),
             start_time: now,
+
             alpha_init: 1.0,
             alpha_floor: 0.15,
+
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
+
             metrics_jsonl: Vec::new(),
+
             last_contexts: Vec::new(),
             last_select_time: Vec::new(),
             last_forget_time: Vec::new(),
             ema_cwnd_pressure: Vec::new(),
             forget_counts: Vec::new(),
+
             last_window_sent: Vec::new(),
         }
     }
 
-    /// Ensure an arm exists for path_id, initialising it if absent.
     fn ensure_arm(&mut self, path_id: usize) {
         if path_id >= self.arms.len() {
             self.arms.resize_with(path_id + 1, || None);
         }
+
         if self.arms[path_id].is_none() {
             self.arms[path_id] = Some(ArmState::new());
         }
     }
 
-    /// Build the context vector for a path.
-    ///
-    /// Arguments:
-    ///   rtt_ns           — EMA RTT for this path (nanoseconds)
-    ///   min_rtt_ns       — minimum EMA RTT across all active paths (nanoseconds)
-    ///   cwnd_pressure    — SMOOTHED `bytes_in_flight / cwnd` ∈ [0, 1] (caller
-    ///                       must pre-clamp and EMA-smooth)
-    ///   loss_rate        — cumulative lost_pkts / sent_pkts ∈ [0, 1]
-    ///   pacing_rate_bps  — pacing rate in bytes/sec (0 = not available)
-    ///   max_pacing_bps   — maximum pacing rate across all active paths
     fn make_context(
         rtt_ns: u128,
         min_rtt_ns: u128,
@@ -227,47 +197,57 @@ impl LinUCBScheduler {
         } else {
             1.0
         };
-        // Inverse throughput norm: 1.0 for the fastest path, >1.0 for slower.
-        // If pacing rate is unavailable (0), treat as neutral (1.0).
+
         let bw_norm = if pacing_rate_bps > 0 && max_pacing_bps > 0 {
             (max_pacing_bps as f64 / pacing_rate_bps as f64).clamp(1.0, 4.0)
         } else {
             1.0
         };
-        [rtt_norm, cwnd_pressure.clamp(0.0, 1.0),
-         loss_rate.clamp(0.0, 1.0), bw_norm, 1.0]
+
+        [
+            rtt_norm,
+            cwnd_pressure.clamp(0.0, 1.0),
+            loss_rate.clamp(0.0, 1.0),
+            bw_norm,
+            1.0,
+        ]
     }
 
-    /// Apply one decay step to an arm's (A, b) toward identity / zero.
-    /// Used to restore exploration uncertainty after a path has been idle.
     fn forget_arm(arm: &mut ArmState, lambda: f64) {
         for i in 0..D {
             for j in 0..D {
                 arm.a[i][j] *= lambda;
             }
+
             arm.a[i][i] += 1.0 - lambda;
             arm.b[i] *= lambda;
         }
     }
 
-    /// Decompose the UCB score into (reward_estimate, exploration_bonus).
     fn ucb_parts(arm: &ArmState, x: [f64; D], alpha: f64) -> (f64, f64) {
         let a_inv = mat_inv(arm.a);
+
         let theta = mat_vec(a_inv, arm.b);
+
         let reward_est = dot(theta, x);
-        let explore_bonus = alpha * quadratic(a_inv, x).max(0.0).sqrt();
+
+        let explore_bonus =
+            alpha * quadratic(a_inv, x).max(0.0).sqrt();
+
         (reward_est, explore_bonus)
     }
 
-    /// Apply a single LinUCB update to an arm.
-    fn update_arm(arm: &mut ArmState, x: [f64; D], reward: f64) {
-        // A += x xᵀ
+    fn update_arm(
+        arm: &mut ArmState,
+        x: [f64; D],
+        reward: f64,
+    ) {
         for i in 0..D {
             for j in 0..D {
                 arm.a[i][j] += x[i] * x[j];
             }
         }
-        // b += reward * x
+
         for i in 0..D {
             arm.b[i] += reward * x[i];
         }
@@ -392,19 +372,67 @@ impl MultipathScheduler for LinUCBScheduler {
                 pacing_bps,
                 max_pacing_bps,
             );
-            let arm = self.arms[pid].as_ref().unwrap();
-            // Dynamic alpha: 1/sqrt(n+1). Starts at 1.0 (heavy exploration),
-            // decays as the arm accumulates ACKs, with a floor to keep probing paths.
-            let n = self.ack_counts.get(pid).copied().unwrap_or(0);
-            let alpha = (self.alpha_init / ((n + 1) as f64).sqrt()).max(self.alpha_floor);
-            let (est, bonus) = Self::ucb_parts(arm, x, alpha);
-            let ucb = est + bonus;
-            let cwnd_pressure = x[1];
-            score_rows.push((pid, (rtt_ns / 1_000) as u64, cwnd_pressure, est, bonus, ucb, x));
-            if pid >= self.last_contexts.len() {
-                self.last_contexts.resize(pid + 1, None);
+            let arm =
+                self.arms[pid].as_ref().unwrap();
+
+            let n = self
+                .ack_counts
+                .get(pid)
+                .copied()
+                .unwrap_or(0);
+
+            let alpha = (self.alpha_init
+                / ((n + 1) as f64).sqrt())
+            .max(self.alpha_floor);
+
+            let (est, mut bonus) =
+                Self::ucb_parts(arm, x, alpha);
+
+            // ----------------------------------------------------
+            // Fairness exploration boost
+            // ----------------------------------------------------
+            // If a path has nearly vanished from traffic share,
+            // artificially boost its exploration term so it
+            // periodically gets re-sampled.
+            //
+            // This avoids permanent starvation after temporary
+            // congestion or RTT spikes.
+            // ----------------------------------------------------
+            let current_share_pct = if self.window_total > 0 {
+                self.window_counts
+                    .get(pid)
+                    .copied()
+                    .unwrap_or(0) as f64
+                    * 100.0
+                    / self.window_total as f64
+            } else {
+                100.0
+            };
+
+            if current_share_pct
+                < FAIRNESS_MIN_SHARE_PCT
+            {
+                bonus *= FAIRNESS_BOOST;
             }
+
+            let ucb = est + bonus;
+
+            score_rows.push((
+                pid,
+                (rtt_ns / 1_000) as u64,
+                x[1],
+                est,
+                bonus,
+                ucb,
+                x,
+            ));
+            if pid >= self.last_contexts.len() {
+                self.last_contexts
+                    .resize(pid + 1, None);
+            }
+
             self.last_contexts[pid] = Some(x);
+
             if ucb > best_score {
                 best_score = ucb;
                 best_pid = pid;
@@ -696,42 +724,66 @@ impl MultipathScheduler for LinUCBScheduler {
             Err(_) => return,
         };
 
-        let rtt_ns = path.recovery.rtt.latest_rtt().as_nanos().max(1);
+        let rtt_ns = path
+            .recovery
+            .rtt
+            .latest_rtt()
+            .as_nanos()
+            .max(1);
 
-        // Per-path EMA to smooth transient first-packet RTT spikes.
-        // Alpha=0.5 for the first 8 ACKs (fast warmup), then 0.2 (stable).
         if path_id >= self.ema_rtt_ns.len() {
-            self.ema_rtt_ns.resize(path_id + 1, rtt_ns as f64);
+            self.ema_rtt_ns
+                .resize(path_id + 1, rtt_ns as f64);
+
             self.ack_counts.resize(path_id + 1, 0);
         }
-        let old_ema = self.ema_rtt_ns[path_id];
-        self.ack_counts[path_id] += 1;
-        let ema_alpha = if self.ack_counts[path_id] <= 8 { 0.5_f64 } else { 0.2_f64 };
-        self.ema_rtt_ns[path_id] =
-            ema_alpha * rtt_ns as f64 + (1.0 - ema_alpha) * old_ema;
-        let ema_rtt_ns = self.ema_rtt_ns[path_id] as u128;
 
-        // ── RTT-jump adaptation ───────────────────────────────────────────────
-        // If the EMA RTT has changed by more than 30% since the previous ACK,
-        // the path quality has shifted significantly (delay added or removed).
-        // Forget stale history so the model can re-learn after changing path
-        // conditions rather than relying on old observations.
+        let old_ema = self.ema_rtt_ns[path_id];
+
+        self.ack_counts[path_id] += 1;
+
+        let ema_alpha =
+            if self.ack_counts[path_id] <= 8 {
+                0.5_f64
+            } else {
+                0.2_f64
+            };
+
+        self.ema_rtt_ns[path_id] =
+            ema_alpha * rtt_ns as f64
+                + (1.0 - ema_alpha) * old_ema;
+
+        let ema_rtt_ns =
+            self.ema_rtt_ns[path_id] as u128;
+
         self.ensure_arm(path_id);
+
         if self.ack_counts[path_id] > 8 {
-            let rtt_change = (self.ema_rtt_ns[path_id] - old_ema) / old_ema;
+            let rtt_change =
+                (self.ema_rtt_ns[path_id] - old_ema)
+                    / old_ema;
+
             if rtt_change.abs() > 0.30 {
-                let arm = self.arms[path_id].as_mut().unwrap();
+                let arm =
+                    self.arms[path_id].as_mut().unwrap();
+
                 let lambda = 0.85_f64;
+
                 for i in 0..D {
                     for j in 0..D {
                         arm.a[i][j] *= lambda;
                     }
+
                     arm.b[i] *= lambda;
+
                     arm.a[i][i] += 1.0 - lambda;
                 }
+
                 if path_id >= self.forget_counts.len() {
-                    self.forget_counts.resize(path_id + 1, 0);
+                    self.forget_counts
+                        .resize(path_id + 1, 0);
                 }
+
                 self.forget_counts[path_id] += 1;
             }
         }
@@ -741,38 +793,56 @@ impl MultipathScheduler for LinUCBScheduler {
             .get(path_id)
             .and_then(|ctx| *ctx)
             .unwrap_or_else(|| {
-                // Fallback: no cached selection-time context (e.g. ACK before
-                // first on_select).  Reuse the smoothed cwnd_pressure if we have
-                // one; otherwise compute raw and skip smoothing.
-                let cwnd = path.recovery.congestion.congestion_window();
-                let bif = path.recovery.bytes_in_flight;
+                let cwnd =
+                    path.recovery.congestion.congestion_window();
+
+                let bif =
+                    path.recovery.bytes_in_flight;
+
                 let raw_cp = if cwnd > 0 {
-                    (bif as f64 / cwnd as f64).min(1.0)
+                    (bif as f64 / cwnd as f64)
+                        .min(1.0)
                 } else {
                     1.0
                 };
+
                 let cp = self
                     .ema_cwnd_pressure
                     .get(path_id)
                     .and_then(|c| *c)
                     .unwrap_or(raw_cp);
+
                 Self::make_context(
                     ema_rtt_ns,
                     self.last_min_rtt_ns,
                     cp,
                     {
-                        let sent = path.recovery.stats.sent_count;
-                        let lost = path.recovery.stats.lost_count;
-                        if sent > 0 { lost as f64 / sent as f64 } else { 0.0 }
+                        let sent =
+                            path.recovery.stats.sent_count;
+
+                        let lost =
+                            path.recovery.stats.lost_count;
+
+                        if sent > 0 {
+                            lost as f64 / sent as f64
+                        } else {
+                            0.0
+                        }
                     },
-                    path.recovery.congestion.pacing_rate().unwrap_or(0),
+                    path.recovery
+                        .congestion
+                        .pacing_rate()
+                        .unwrap_or(0),
                     0,
                 )
             });
 
-        let reward = (-x[0]).exp() * (1.0 - x[1]);
+        let reward =
+            (-x[0]).exp() * (1.0 - x[1]);
 
-        let arm = self.arms[path_id].as_mut().unwrap();
+        let arm =
+            self.arms[path_id].as_mut().unwrap();
+
         Self::update_arm(arm, x, reward);
     }
 
@@ -835,16 +905,9 @@ impl MultipathScheduler for LinUCBScheduler {
     }
 }
 
-// ─── D×D linear algebra helpers ──────────────────────────────────────────────
-//
-// Generic implementations that work for any const D.
-// mat_inv uses Gauss-Jordan elimination with partial pivoting.
-
-/// Compute the inverse of a D×D matrix using Gauss-Jordan elimination.
-///
-/// Returns the identity matrix when the matrix is (near-)singular to avoid
-/// numerical blow-up during early exploration.
-fn mat_inv(m: [[f64; D]; D]) -> [[f64; D]; D] {
+fn mat_inv(
+    m: [[f64; D]; D],
+) -> [[f64; D]; D] {
     let mut a = m;
     let mut inv = [[0.0_f64; D]; D];
     for i in 0..D {
@@ -891,8 +954,10 @@ fn mat_inv(m: [[f64; D]; D]) -> [[f64; D]; D] {
     inv
 }
 
-/// Multiply a D×D matrix by a D-vector.
-fn mat_vec(m: [[f64; D]; D], v: [f64; D]) -> [f64; D] {
+fn mat_vec(
+    m: [[f64; D]; D],
+    v: [f64; D],
+) -> [f64; D] {
     let mut r = [0.0_f64; D];
     for i in 0..D {
         for j in 0..D {
@@ -902,7 +967,6 @@ fn mat_vec(m: [[f64; D]; D], v: [f64; D]) -> [f64; D] {
     r
 }
 
-/// Dot product of two D-vectors.
 fn dot(a: [f64; D], b: [f64; D]) -> f64 {
     let mut s = 0.0_f64;
     for i in 0..D {
@@ -911,8 +975,10 @@ fn dot(a: [f64; D], b: [f64; D]) -> f64 {
     s
 }
 
-/// Quadratic form xᵀ M x for a D×D matrix M and D-vector x.
-fn quadratic(m: [[f64; D]; D], x: [f64; D]) -> f64 {
+fn quadratic(
+    m: [[f64; D]; D],
+    x: [f64; D],
+) -> f64 {
     dot(x, mat_vec(m, x))
 }
 
@@ -924,37 +990,71 @@ mod tests {
     #[test]
     fn linucb_single_path() -> Result<()> {
         let mut t = MultipathTester::new()?;
-        let mut s = LinUCBScheduler::new(&Default::default());
-        // Should always select the only available path.
-        assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 0);
+
+        let mut s =
+            LinUCBScheduler::new(&Default::default());
+
+        assert_eq!(
+            s.on_select(
+                &mut t.paths,
+                &mut t.spaces,
+                &mut t.streams
+            )?,
+            0
+        );
+
         Ok(())
     }
 
     #[test]
     fn linucb_multi_path_selects_valid() -> Result<()> {
         let mut t = MultipathTester::new()?;
-        t.add_path("127.0.0.1:443", "127.0.0.2:8443", 50)?;
-        t.add_path("127.0.0.1:443", "127.0.0.3:8443", 150)?;
 
-        let mut s = LinUCBScheduler::new(&Default::default());
-        let pid = s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?;
-        // Result must be one of the active paths (0, 1, or 2).
+        t.add_path(
+            "127.0.0.1:443",
+            "127.0.0.2:8443",
+            50,
+        )?;
+
+        t.add_path(
+            "127.0.0.1:443",
+            "127.0.0.3:8443",
+            150,
+        )?;
+
+        let mut s =
+            LinUCBScheduler::new(&Default::default());
+
+        let pid = s.on_select(
+            &mut t.paths,
+            &mut t.spaces,
+            &mut t.streams,
+        )?;
+
         assert!(pid <= 2);
+
         Ok(())
     }
 
     #[test]
     fn mat_inv_identity() {
-        // Build a D×D identity and verify inversion returns identity.
         let mut id = [[0.0_f64; D]; D];
+
         for i in 0..D {
             id[i][i] = 1.0;
         }
+
         let inv = mat_inv(id);
+
         for i in 0..D {
             for j in 0..D {
-                let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((inv[i][j] - expected).abs() < 1e-10);
+                let expected =
+                    if i == j { 1.0 } else { 0.0 };
+
+                assert!(
+                    (inv[i][j] - expected).abs()
+                        < 1e-10
+                );
             }
         }
     }
