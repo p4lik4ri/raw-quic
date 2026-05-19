@@ -279,10 +279,14 @@ pub async fn last_json_result(
         state.last_client.lock().await.clone()
     };
 
-    // Remove the internal interval_end key before returning.
+    // Remove the internal interval_end key before returning,
+    // and rename throughput → total_throughput.
     for sample in samples.iter_mut() {
         if let Some(obj) = sample.as_object_mut() {
             obj.remove("interval_end");
+            if let Some(t) = obj.remove("throughput") {
+                obj.insert("total_throughput".to_string(), t);
+            }
         }
     }
 
