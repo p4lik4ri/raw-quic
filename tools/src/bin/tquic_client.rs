@@ -407,7 +407,7 @@ impl Client {
                 last_path0 = cur_path0;
                 last_path1 = cur_path1;
                 let path_suffix = if d_path0 + d_path1 > 0 {
-                    format!("  #path5G={:.2} Mbps,pathSat={:.2} Mbps",
+                    format!("  #path5G={:.2}Mbps,pathSat={:.2}Mbps",
                         d_path0 as f64 * 8.0 / 1e6,
                         d_path1 as f64 * 8.0 / 1e6)
                 } else {

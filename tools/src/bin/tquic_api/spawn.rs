@@ -73,19 +73,19 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
 
-    // Parse optional per-path throughput suffix: #path5G=XX.XX Mbps,pathSat=YY.YY Mbps
+    // Parse optional per-path throughput suffix: #path5G=XX.XXMbps,pathSat=YY.YYMbps
     let mut path5g_mbps: Option<f64> = None;
     let mut pathsat_mbps: Option<f64> = None;
     for part in &parts {
         if let Some(rest) = part.strip_prefix("#path5G=") {
-            // rest = "XX.XX Mbps,pathSat=YY.YY Mbps"
+            // rest = "XX.XXMbps,pathSat=YY.YYMbps" (no spaces — single whitespace token)
             let mut split = rest.splitn(2, ',');
             path5g_mbps = split.next()
-                .map(|s| s.trim_end_matches(" Mbps").trim())
+                .map(|s| s.trim_end_matches("Mbps"))
                 .and_then(|s| s.parse().ok());
             pathsat_mbps = split.next()
                 .and_then(|s| s.strip_prefix("pathSat="))
-                .map(|s| s.trim_end_matches(" Mbps").trim())
+                .map(|s| s.trim_end_matches("Mbps"))
                 .and_then(|s| s.parse().ok());
         }
     }
