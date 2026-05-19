@@ -308,9 +308,9 @@ struct Client {
     expiry_sent: Arc<AtomicU64>,
     /// Cumulative lost packet count snapped at duration-expiry across all connections.
     expiry_lost: Arc<AtomicU64>,
-    /// Cumulative bytes received/sent on path 0 (first local address, e.g. satellite).
+    /// Cumulative bytes received/sent on path 0 (first local address, 5G).
     live_path0_bytes: Arc<AtomicU64>,
-    /// Cumulative bytes received/sent on path 1 (second local address, e.g. 5G).
+    /// Cumulative bytes received/sent on path 1 (second local address, satellite).
     live_path1_bytes: Arc<AtomicU64>,
 }
 
@@ -407,7 +407,7 @@ impl Client {
                 last_path0 = cur_path0;
                 last_path1 = cur_path1;
                 let path_suffix = if d_path0 + d_path1 > 0 {
-                    format!("  #path0={:.2},path1={:.2}",
+                    format!("  #path5G={:.2} Mbps,pathSat={:.2} Mbps",
                         d_path0 as f64 * 8.0 / 1e6,
                         d_path1 as f64 * 8.0 / 1e6)
                 } else {

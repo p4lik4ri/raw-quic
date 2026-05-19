@@ -73,16 +73,19 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
 
-    // Parse optional per-path throughput suffix: #path0=XX.XX,path1=YY.YY
-    let mut path0_mbps: Option<f64> = None;
-    let mut path1_mbps: Option<f64> = None;
+    // Parse optional per-path throughput suffix: #path5G=XX.XX Mbps,pathSat=YY.YY Mbps
+    let mut path5g_mbps: Option<f64> = None;
+    let mut pathsat_mbps: Option<f64> = None;
     for part in &parts {
-        if let Some(rest) = part.strip_prefix("#path0=") {
-            // rest = "XX.XX,path1=YY.YY"
+        if let Some(rest) = part.strip_prefix("#path5G=") {
+            // rest = "XX.XX Mbps,pathSat=YY.YY Mbps"
             let mut split = rest.splitn(2, ',');
-            path0_mbps = split.next().and_then(|s| s.parse().ok());
-            path1_mbps = split.next()
-                .and_then(|s| s.strip_prefix("path1="))
+            path5g_mbps = split.next()
+                .map(|s| s.trim_end_matches(" Mbps").trim())
+                .and_then(|s| s.parse().ok());
+            pathsat_mbps = split.next()
+                .and_then(|s| s.strip_prefix("pathSat="))
+                .map(|s| s.trim_end_matches(" Mbps").trim())
                 .and_then(|s| s.parse().ok());
         }
     }
@@ -99,11 +102,11 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         "jitter":       jitter_ms,
         "packetLoss":   loss_pct,
     });
-    if let Some(p0) = path0_mbps {
-        sample["satellite_throughput"] = serde_json::json!(p0);
+    if let Some(p) = path5g_mbps {
+        sample["5g_throughput"] = serde_json::json!(p);
     }
-    if let Some(p1) = path1_mbps {
-        sample["5g_throughput"] = serde_json::json!(p1);
+    if let Some(p) = pathsat_mbps {
+        sample["satellite_throughput"] = serde_json::json!(p);
     }
     Some(sample)
 }
