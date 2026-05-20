@@ -136,6 +136,11 @@ pub struct ClientStartRequest {
 
     pub multipath_algor: Option<String>,
 
+    /// LinUCB exploration weight α [default: 1.0].
+    /// Higher = more exploration; lower = exploit the best-known path.
+    /// Only used with LinUCB.
+    pub linucb_alpha: Option<f64>,
+
     /// Maximum outgoing UDP payload size in bytes [default: 1200].
     /// Lower this (e.g. 1100) when packets are dropped through intermediate VMs/NATs.
     pub send_udp_payload_size: Option<u64>,

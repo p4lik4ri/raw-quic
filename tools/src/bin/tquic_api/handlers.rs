@@ -135,6 +135,7 @@ pub async fn client_start(
         if let Some(algor) = &req.multipath_algor {
             cmd.args(["--multipath-algor", algor]);
         }
+        if let Some(v) = req.linucb_alpha { cmd.args(["--linucb-alpha", &v.to_string()]); }
     }
     if req.disable_encryption { cmd.arg("--disable-encryption"); }
     if let Some(keylog) = &req.keylog_file { cmd.args(["--keylog-file", keylog]); }

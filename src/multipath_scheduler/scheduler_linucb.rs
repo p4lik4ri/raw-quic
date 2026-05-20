@@ -136,7 +136,7 @@ pub struct LinUCBScheduler {
 }
 
 impl LinUCBScheduler {
-    pub fn new(_conf: &MultipathConfig) -> Self {
+    pub fn new(conf: &MultipathConfig) -> Self {
         let now = Instant::now();
 
         LinUCBScheduler {
@@ -156,7 +156,7 @@ impl LinUCBScheduler {
             snapshots: Vec::new(),
             start_time: now,
 
-            alpha_init: 1.0,
+            alpha_init: conf.linucb_alpha,
             alpha_floor: 0.15,
 
             ema_rtt_ns: Vec::new(),

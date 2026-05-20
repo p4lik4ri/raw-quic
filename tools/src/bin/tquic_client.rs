@@ -160,6 +160,12 @@ pub struct ClientOpt {
     #[clap(long, default_value = "MINRTT", help_heading = "Protocol")]
     pub multipath_algor: MultipathAlgorithm,
 
+    /// LinUCB exploration weight α [default: 1.0].
+    /// Higher = more exploration; lower = exploit the best-known path.
+    /// Only used when --multipath-algor=LinUCB.
+    #[clap(long, default_value = "1.0", value_name = "FLOAT", help_heading = "Protocol")]
+    pub linucb_alpha: f64,
+
     /// Set active_connection_id_limit transport parameter.
     #[clap(long, default_value = "2", value_name = "NUM", help_heading = "Protocol")]
     pub active_cid_limit: u64,
@@ -839,6 +845,7 @@ impl Worker {
         config.set_min_congestion_window(option.min_congestion_window);
         config.enable_multipath(option.enable_multipath);
         config.set_multipath_algorithm(option.multipath_algor);
+        config.set_linucb_alpha(option.linucb_alpha);
         config.set_active_connection_id_limit(option.active_cid_limit);
         config.enable_encryption(!option.disable_encryption);
 
