@@ -103,10 +103,10 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         "packetLoss":   loss_pct,
     });
     if let Some(p) = path5g_mbps {
-        sample["5g_throughput"] = serde_json::json!(p);
+        sample["5G_throughput"] = serde_json::json!(p);
     }
     if let Some(p) = pathsat_mbps {
-        sample["satellite_throughput"] = serde_json::json!(p);
+        sample["sat_throughput"] = serde_json::json!(p);
     }
     Some(sample)
 }
