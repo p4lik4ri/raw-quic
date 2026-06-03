@@ -208,7 +208,15 @@ impl LinUCBScheduler {
         max_pacing_bps: u64,
     ) -> [f64; D] {
         let rtt_norm = if min_rtt_ns > 0 {
-            (rtt_ns as f64 / min_rtt_ns as f64).clamp(1.0, 4.0)
+            // Clamp raised from 4.0 to 20.0: satellite RTT (~600 ms) vs 5G
+            // RTT (~30 ms) is a ~20x ratio.  The old cap of 4.0 compressed
+            // both paths into the same range, making them look similar to the
+            // model.  20.0 lets the reward exp(-(rtt_norm-1)) fully separate
+            // high-latency from low-latency paths: 5G → rtt_norm≈1.0 → reward≈1.0,
+            // satellite → rtt_norm≈20.0 → reward≈exp(-19)≈~5e-9 before the
+            // clamp kicks in — so the cap is still needed but now it correctly
+            // distinguishes a 2x-worse path (rtt_norm=2) from a 20x-worse one.
+            (rtt_ns as f64 / min_rtt_ns as f64).clamp(1.0, 20.0)
         } else {
             1.0
         };
