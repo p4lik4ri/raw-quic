@@ -925,6 +925,7 @@ impl Server {
         config.enable_multipath(option.enable_multipath);
         config.set_multipath_algorithm(option.multipath_algor);
         config.set_active_connection_id_limit(option.active_cid_limit);
+        config.enable_dplpmtud(false);
         config.enable_encryption(!option.disable_encryption);
 
         if let Some(ak) = &option.address_token_key {
