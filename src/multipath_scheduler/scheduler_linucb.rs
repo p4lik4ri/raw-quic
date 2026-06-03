@@ -725,15 +725,12 @@ impl MultipathScheduler for LinUCBScheduler {
             // sent_per_sec / delivered_mbps / traffic_share_pct and windowed loss
             // rate can be computed.
             for &(pid, _, _, _, _, _, sent_p, lost_p) in &raw {
-                if pid >= self.last_window_sent.len() {
-                    self.last_window_sent.resize(pid + 1, 0);
-                }
-                self.last_window_sent[pid] = sent_p;
+                // Read previous snapshots BEFORE overwriting them.
+                let prev_sent = if pid < self.last_window_sent.len() { self.last_window_sent[pid] } else { sent_p };
+                let prev_lost = if pid < self.last_window_lost.len() { self.last_window_lost[pid] } else { lost_p };
 
                 // Windowed loss rate: fraction of packets lost in this 1-second window,
                 // EMA-smoothed (α=0.5) to dampen statistical noise from short bursts.
-                let prev_sent = if pid < self.last_window_sent.len() { self.last_window_sent[pid] } else { sent_p };
-                let prev_lost = if pid < self.last_window_lost.len() { self.last_window_lost[pid] } else { lost_p };
                 let d_sent = sent_p.saturating_sub(prev_sent);
                 let d_lost = lost_p.saturating_sub(prev_lost);
                 let window_loss = if d_sent > 0 { (d_lost as f64 / d_sent as f64).min(1.0) } else { 0.0 };
@@ -742,6 +739,11 @@ impl MultipathScheduler for LinUCBScheduler {
                 }
                 self.ema_loss_rate[pid] = 0.5 * window_loss + 0.5 * self.ema_loss_rate[pid];
 
+                // Now update the snapshots for next window.
+                if pid >= self.last_window_sent.len() {
+                    self.last_window_sent.resize(pid + 1, 0);
+                }
+                self.last_window_sent[pid] = sent_p;
                 if pid >= self.last_window_lost.len() {
                     self.last_window_lost.resize(pid + 1, 0);
                 }
