@@ -96,11 +96,9 @@ impl ArmState {
 /// - `alpha_init`  — initial exploration weight (default 1.0). Higher values
 ///   cause the scheduler to explore undersampled paths more aggressively at
 ///   the start. Setting this very large approximates Round Robin.
-/// - `alpha_floor` — minimum exploration weight (default 0.15). Prevents
-///   the scheduler from converging to pure exploitation even after many
-///   samples, keeping a residual probe budget on each path. Setting this to
-///   0.0 allows full exploitation; setting it very high approximates
-///   Round Robin.
+/// - `alpha_floor` — minimum exploration weight, derived as `alpha_init * 0.15`.
+///   Scales with alpha_init so that raising --linucb-alpha increases both the
+///   initial burst of exploration and the steady-state probe budget.
 pub struct LinUCBScheduler {
     arms: Vec<Option<ArmState>>,
     last_min_rtt_ns: u128,
@@ -157,7 +155,7 @@ impl LinUCBScheduler {
             start_time: now,
 
             alpha_init: conf.linucb_alpha,
-            alpha_floor: 0.15,
+            alpha_floor: conf.linucb_alpha * 0.15,
 
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
