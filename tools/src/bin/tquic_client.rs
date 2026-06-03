@@ -847,6 +847,7 @@ impl Worker {
         config.set_multipath_algorithm(option.multipath_algor);
         config.set_linucb_alpha(option.linucb_alpha);
         config.set_active_connection_id_limit(option.active_cid_limit);
+        config.enable_dplpmtud(false);
         config.enable_encryption(!option.disable_encryption);
 
         let mut tls = TlsConfig::new_client_config(
