@@ -40,7 +40,9 @@ const IDLE_FORGET_THRESHOLD_SECS: f64 = 2.0;
 const IDLE_FORGET_LAMBDA: f64 = 0.92;
 
 /// EMA smoothing for cwnd pressure.
-const CWND_P_EMA_ALPHA: f64 = 0.10;
+/// 0.30 reacts to congestion roughly 3× faster than the previous 0.10,
+/// so the model sees real-time path quality rather than a heavily lagged average.
+const CWND_P_EMA_ALPHA: f64 = 0.30;
 
 /// Exploration boost when path traffic share collapses.
 ///
@@ -134,6 +136,12 @@ pub struct LinUCBScheduler {
     forget_counts: Vec<u64>,
 
     last_window_sent: Vec<u64>,
+    /// Snapshot of `lost_count` at each per-second window boundary, used to
+    /// compute a windowed (non-cumulative) loss rate.
+    last_window_lost: Vec<u64>,
+    /// EMA-smoothed per-path loss rate computed from the last 1-second window.
+    /// Updated once per second alongside `last_window_sent`.
+    ema_loss_rate: Vec<f64>,
 }
 
 impl LinUCBScheduler {
@@ -158,7 +166,11 @@ impl LinUCBScheduler {
             start_time: now,
 
             alpha_init: conf.linucb_alpha,
-            alpha_floor: conf.linucb_alpha * 0.15,
+            // 0.05× gives a very small steady-state probe budget so that
+            // low alpha_linucb → near-pure exploitation (5G dominant) and
+            // high alpha_linucb → significant exploration (satellite sampled).
+            // The 2× fairness boost below 5% share still prevents total starvation.
+            alpha_floor: conf.linucb_alpha * 0.05,
 
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
@@ -172,6 +184,8 @@ impl LinUCBScheduler {
             forget_counts: Vec::new(),
 
             last_window_sent: Vec::new(),
+            last_window_lost: Vec::new(),
+            ema_loss_rate:    Vec::new(),
         }
     }
 
@@ -369,7 +383,9 @@ impl MultipathScheduler for LinUCBScheduler {
                 rtt_ns,
                 min_rtt_ns,
                 smoothed_cwnd_p,
-                loss_rate,
+                // Use the windowed EMA loss rate when available; fall back to the
+                // cumulative rate for the first second before any snapshot exists.
+                self.ema_loss_rate.get(pid).copied().unwrap_or(loss_rate),
                 pacing_bps,
                 max_pacing_bps,
             );
@@ -705,13 +721,31 @@ impl MultipathScheduler for LinUCBScheduler {
                 *c = 0;
             }
             self.window_total = 0;
-            // Snapshot current `sent_count` so the next window's
-            // sent_per_sec / delivered_mbps / traffic_share_pct can be computed.
-            for &(pid, _, _, _, _, _, sent_p, _) in &raw {
+            // Snapshot current `sent_count` and `lost_count` so the next window's
+            // sent_per_sec / delivered_mbps / traffic_share_pct and windowed loss
+            // rate can be computed.
+            for &(pid, _, _, _, _, _, sent_p, lost_p) in &raw {
                 if pid >= self.last_window_sent.len() {
                     self.last_window_sent.resize(pid + 1, 0);
                 }
                 self.last_window_sent[pid] = sent_p;
+
+                // Windowed loss rate: fraction of packets lost in this 1-second window,
+                // EMA-smoothed (α=0.5) to dampen statistical noise from short bursts.
+                let prev_sent = if pid < self.last_window_sent.len() { self.last_window_sent[pid] } else { sent_p };
+                let prev_lost = if pid < self.last_window_lost.len() { self.last_window_lost[pid] } else { lost_p };
+                let d_sent = sent_p.saturating_sub(prev_sent);
+                let d_lost = lost_p.saturating_sub(prev_lost);
+                let window_loss = if d_sent > 0 { (d_lost as f64 / d_sent as f64).min(1.0) } else { 0.0 };
+                if pid >= self.ema_loss_rate.len() {
+                    self.ema_loss_rate.resize(pid + 1, 0.0);
+                }
+                self.ema_loss_rate[pid] = 0.5 * window_loss + 0.5 * self.ema_loss_rate[pid];
+
+                if pid >= self.last_window_lost.len() {
+                    self.last_window_lost.resize(pid + 1, 0);
+                }
+                self.last_window_lost[pid] = lost_p;
             }
         }
 
@@ -838,10 +872,12 @@ impl MultipathScheduler for LinUCBScheduler {
                 )
             });
 
-        // Pure RTT reward: exp(-rtt_norm). Removing the (1 - cwnd_pressure)
-        // factor prevents fast-RTT paths (small BDP, small cwnd) from being
-        // penalised when their cwnd fills under load.
-        let reward = (-x[0]).exp();
+        // Shifted RTT reward: exp(-(rtt_norm - 1)).
+        // The best path (rtt_norm=1.0) now earns reward 1.0 instead of
+        // exp(-1)≈0.37.  This ~3× stronger signal makes θ diverge faster
+        // between paths, so even a small change in alpha_linucb produces a
+        // visible shift in the exploitation/exploration balance.
+        let reward = (-(x[0] - 1.0)).exp();
 
         let arm =
             self.arms[path_id].as_mut().unwrap();

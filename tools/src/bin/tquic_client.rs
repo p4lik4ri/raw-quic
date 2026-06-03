@@ -1192,9 +1192,9 @@ struct WorkerHandler {
     /// immediately before calling endpoint.recv(), so on_stream_readable can read
     /// the accurate OS-level arrival time for the current QUIC packet.
     current_pkt_recv_us: Arc<AtomicU64>,
-    /// Cumulative bytes on path 0 (first local address, e.g. satellite).
+    /// Cumulative bytes on path 0 (first local address, e.g. 5G).
     live_path0_bytes: Arc<AtomicU64>,
-    /// Cumulative bytes on path 1 (second local address, e.g. 5G).
+    /// Cumulative bytes on path 1 (second local address, e.g. satellite).
     live_path1_bytes: Arc<AtomicU64>,
     /// wandb API key, consumed on the first connection that has LinUCB metrics.
     /// Keeping just the key (not a live run) avoids creating empty wandb runs
