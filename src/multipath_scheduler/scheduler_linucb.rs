@@ -29,7 +29,7 @@ use crate::Result;
 ///   x[0] = ema_rtt / min_ema_rtt
 ///   x[1] = bytes_in_flight / cwnd
 ///   x[2] = lost_pkts / sent_pkts
-///   x[3] = min_pacing / pacing
+///   x[3] = 1.0 (was bandwidth ratio; removed to prevent pacing feedback loop)
 ///   x[4] = 1.0 (bias)
 const D: usize = 5;
 
@@ -87,7 +87,10 @@ impl ArmState {
 /// After each ACK arrives on a path, the model is updated:
 ///   Aₚ ← Aₚ + xₚ xₚᵀ
 ///   bₚ ← bₚ + rₚ xₚ
-/// where the reward rₚ = exp(-rtt_norm) × (1 - cwnd_util).
+/// where the reward rₚ = exp(-rtt_norm).
+/// cwnd_pressure is kept as a context feature so the model can learn its
+/// correlation with path quality, but excluded from the reward label to
+/// prevent the small-BDP starvation loop on fast-RTT paths.
 ///
 /// # Exploration parameters
 ///
@@ -196,11 +199,11 @@ impl LinUCBScheduler {
             1.0
         };
 
-        let bw_norm = if pacing_rate_bps > 0 && max_pacing_bps > 0 {
-            (max_pacing_bps as f64 / pacing_rate_bps as f64).clamp(1.0, 4.0)
-        } else {
-            1.0
-        };
+        // bw_norm is fixed at 1.0 (neutral) to break the pacing feedback loop:
+        // previously, starving a path caused its BBR pacing estimate to drop,
+        // raising bw_norm, making the model rank it as worse — a self-reinforcing
+        // starvation cycle. RTT and loss_rate are sufficient quality signals.
+        let bw_norm = 1.0_f64;
 
         [
             rtt_norm,
@@ -531,8 +534,8 @@ impl MultipathScheduler for LinUCBScheduler {
             //                          (idle + RTT-jump); step-function counter
             //   p{pid}.n             — cumulative ACK count for this arm
             //   p{pid}.alpha         — current α value for this arm
-            //   p{pid}.x_*           — context features (rtt_norm, cwnd_p, loss_rate, bw_norm)
-            //                          x_bias is omitted (always 1.0).
+            //   p{pid}.x_*           — context features (rtt_norm, cwnd_p, loss_rate)
+            //                          x_bias and x_bw_norm are always 1.0; omitted.
             //   p{pid}.th_*          — 5 learned LinUCB weights including th_bias
             //
             // Network state (throughput, congestion, loss):
@@ -835,8 +838,10 @@ impl MultipathScheduler for LinUCBScheduler {
                 )
             });
 
-        let reward =
-            (-x[0]).exp() * (1.0 - x[1]);
+        // Pure RTT reward: exp(-rtt_norm). Removing the (1 - cwnd_pressure)
+        // factor prevents fast-RTT paths (small BDP, small cwnd) from being
+        // penalised when their cwnd fills under load.
+        let reward = (-x[0]).exp();
 
         let arm =
             self.arms[path_id].as_mut().unwrap();
