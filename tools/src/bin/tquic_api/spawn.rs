@@ -94,7 +94,7 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-
+    
     let mut sample = serde_json::json!({
         "timestamp":    ts,
         "interval_end": interval_end,
