@@ -57,6 +57,14 @@ const CWND_P_EMA_ALPHA: f64 = 0.30;
 const FAIRNESS_MIN_SHARE_PCT: f64 = 5.0;
 const FAIRNESS_BOOST: f64 = 2.0;
 
+/// If a path's smoothed RTT exceeds this multiple of its all-time min RTT,
+/// the path is considered genuinely degraded (not just CUBIC-bloated).
+/// CUBIC bufferbloat typically inflates RTT by 10–12×; genuine degradation
+/// (e.g. netem 600ms on a 26ms path = 24×) comfortably exceeds this.
+/// When triggered, smoothed_rtt is used instead of min_rtt so the reward
+/// reflects the real path quality and the scheduler shifts to a better path.
+const DEGRADATION_RATIO: u128 = 20;
+
 /// Per-arm state for LinUCB.
 struct ArmState {
     a: [[f64; D]; D],
@@ -101,7 +109,7 @@ impl ArmState {
 /// - `alpha_init`  — initial exploration weight (default 1.0). Higher values
 ///   cause the scheduler to explore undersampled paths more aggressively at
 ///   the start. Setting this very large approximates Round Robin.
-/// - `alpha_floor` — minimum exploration weight, derived as `alpha_init * 0.15`.
+/// - `alpha_floor` — minimum exploration weight, derived as `alpha_init * 0.20`.
 ///   Scales with alpha_init so that raising --linucb-alpha increases both the
 ///   initial burst of exploration and the steady-state probe budget.
 pub struct LinUCBScheduler {
@@ -177,11 +185,11 @@ impl LinUCBScheduler {
             start_time: now,
 
             alpha_init: conf.linucb_alpha,
-            // 0.05× gives a very small steady-state probe budget so that
-            // low alpha_linucb → near-pure exploitation (5G dominant) and
-            // high alpha_linucb → significant exploration (satellite sampled).
+            // 0.20× gives a steady-state probe budget that scales with alpha:
+            // low alpha  → near-pure exploitation (5G dominant, few sat probes)
+            // high alpha → significant exploration (meaningful sat traffic share).
             // The 2× fairness boost below 5% share still prevents total starvation.
-            alpha_floor: conf.linucb_alpha * 0.05,
+            alpha_floor: conf.linucb_alpha * 0.20,
 
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
@@ -328,11 +336,22 @@ impl MultipathScheduler for LinUCBScheduler {
             if rtt_ns < min_rtt_ns {
                 min_rtt_ns = rtt_ns;
             }
-            // Propagation-delay floor: all-time minimum RTT for this path,
-            // unaffected by CUBIC-induced queue buildup.
+            // Propagation-delay floor: normally the all-time min RTT per path
+            // (unaffected by CUBIC-induced queue buildup).  If smoothed RTT has
+            // risen far above min RTT the path is genuinely degraded — use
+            // smoothed RTT so the reward denominator reflects real path quality
+            // and the scheduler can shift toward a better path at runtime.
             let prop_rtt_ns = path.recovery.rtt.min_rtt().as_nanos();
-            if prop_rtt_ns < min_prop_rtt_ns {
-                min_prop_rtt_ns = prop_rtt_ns;
+            let srtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos();
+            let effective_prop_rtt_ns = if prop_rtt_ns > 0
+                && srtt_ns > prop_rtt_ns * DEGRADATION_RATIO
+            {
+                srtt_ns
+            } else {
+                prop_rtt_ns
+            };
+            if effective_prop_rtt_ns < min_prop_rtt_ns {
+                min_prop_rtt_ns = effective_prop_rtt_ns;
             }
             // Only paths that can currently send are candidates for selection.
             if !path.recovery.can_send() {
@@ -952,8 +971,16 @@ impl MultipathScheduler for LinUCBScheduler {
         // rtt_norm=300/26=11.5, reward=exp(-10.5)≈0), making both paths
         // look identical to the model and forcing round-robin selection.
         let path_min_rtt_ns = path.recovery.rtt.min_rtt().as_nanos().max(1);
+        let path_srtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos().max(1);
+        // Use smoothed RTT as the effective floor when the path is genuinely
+        // degraded (not just CUBIC-bloated): same threshold as on_select.
+        let effective_rtt_ns = if path_srtt_ns > path_min_rtt_ns * DEGRADATION_RATIO as u128 {
+            path_srtt_ns
+        } else {
+            path_min_rtt_ns
+        };
         let current_rtt_norm = if self.last_min_prop_rtt_ns > 0 {
-            (path_min_rtt_ns as f64 / self.last_min_prop_rtt_ns as f64).clamp(1.0, 20.0)
+            (effective_rtt_ns as f64 / self.last_min_prop_rtt_ns as f64).clamp(1.0, 20.0)
         } else {
             1.0
         };
