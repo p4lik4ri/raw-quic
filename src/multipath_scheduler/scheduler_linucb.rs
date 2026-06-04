@@ -882,12 +882,25 @@ impl MultipathScheduler for LinUCBScheduler {
                 )
             });
 
-        // Shifted RTT reward: exp(-(rtt_norm - 1)).
-        // The best path (rtt_norm=1.0) now earns reward 1.0 instead of
-        // exp(-1)≈0.37.  This ~3× stronger signal makes θ diverge faster
-        // between paths, so even a small change in alpha_linucb produces a
-        // visible shift in the exploitation/exploration balance.
-        let reward = (-(x[0] - 1.0)).exp();
+        // Compute reward from the CURRENT measured RTT, not from x[0] in the
+        // saved context.  The saved context may have been captured during the
+        // warm-up window (ack_counts=0) when a newly-added path inherits the
+        // connection's existing smoothed_rtt (~29 ms for 5G) instead of its
+        // true RTT (~520 ms for satellite).  During that window the context
+        // records rtt_norm=1.0, so using x[0] would give reward=1.0 and
+        // permanently poison theta_sat with large positive weights — causing
+        // the model to prefer satellite forever via extrapolation once the real
+        // RTT is revealed.
+        //
+        // Using ema_rtt_ns / last_min_rtt_ns instead gives the correct reward
+        // (≈0 for satellite) even on the first ACK, ensuring the model learns
+        // the true path quality rather than an artefact of the init phase.
+        let current_rtt_norm = if self.last_min_rtt_ns > 0 {
+            (ema_rtt_ns as f64 / self.last_min_rtt_ns as f64).clamp(1.0, 20.0)
+        } else {
+            1.0
+        };
+        let reward = (-(current_rtt_norm - 1.0)).exp();
 
         let arm =
             self.arms[path_id].as_mut().unwrap();
