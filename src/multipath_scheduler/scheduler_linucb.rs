@@ -774,7 +774,7 @@ impl MultipathScheduler for LinUCBScheduler {
             // Snapshot current `sent_count` and `lost_count` so the next window's
             // sent_per_sec / delivered_mbps / traffic_share_pct and windowed loss
             // rate can be computed.
-            for &(pid, _, _, _, _, _, sent_p, lost_p) in &raw {
+            for &(pid, rtt_ns, _, _, _, _, sent_p, lost_p) in &raw {
                 // Read previous snapshots BEFORE overwriting them.
                 let prev_sent = if pid < self.last_window_sent.len() { self.last_window_sent[pid] } else { sent_p };
                 let prev_lost = if pid < self.last_window_lost.len() { self.last_window_lost[pid] } else { lost_p };
@@ -792,15 +792,20 @@ impl MultipathScheduler for LinUCBScheduler {
                 // Update soft minimum RTT: drops instantly to new lows, rises 10%/s
                 // toward EMA RTT under sustained degradation (~30s to converge).
                 const SOFT_MIN_RISE_ALPHA: f64 = 0.10;
+                // Use ema_rtt_ns if available (after first ACK), otherwise use current rtt_ns.
+                let current_rtt = if pid < self.ema_rtt_ns.len() {
+                    self.ema_rtt_ns[pid]
+                } else {
+                    rtt_ns as f64
+                };
                 if pid >= self.soft_min_rtt_ns.len() {
-                    self.soft_min_rtt_ns.resize(pid + 1, self.ema_rtt_ns[pid]);
+                    self.soft_min_rtt_ns.resize(pid + 1, current_rtt);
                 }
-                let ema_rtt = self.ema_rtt_ns[pid];
-                if ema_rtt <= self.soft_min_rtt_ns[pid] || self.soft_min_rtt_ns[pid] == 0.0 {
-                    self.soft_min_rtt_ns[pid] = ema_rtt;
+                if current_rtt <= self.soft_min_rtt_ns[pid] || self.soft_min_rtt_ns[pid] == 0.0 {
+                    self.soft_min_rtt_ns[pid] = current_rtt;
                 } else {
                     self.soft_min_rtt_ns[pid] = (1.0 - SOFT_MIN_RISE_ALPHA) * self.soft_min_rtt_ns[pid]
-                        + SOFT_MIN_RISE_ALPHA * ema_rtt;
+                        + SOFT_MIN_RISE_ALPHA * current_rtt;
                 }
 
                 // Now update the snapshots for next window.
