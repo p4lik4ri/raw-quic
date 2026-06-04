@@ -29,7 +29,8 @@ use crate::Result;
 ///   x[0] = ema_rtt / min_ema_rtt
 ///   x[1] = bytes_in_flight / cwnd
 ///   x[2] = lost_pkts / sent_pkts
-///   x[3] = min_pacing / pacing
+///   x[3] = max_pacing / pacing
+///         (1.0 = best available pacing, larger means slower path)
 ///   x[4] = 1.0 (bias)
 const D: usize = 5;
 
@@ -838,7 +839,7 @@ impl MultipathScheduler for LinUCBScheduler {
             });
 
         let reward =
-            (-x[0]).exp() * (1.0 - x[1]);
+            (-x[0]).exp() * (1.0 - x[1]) * (1.0 / x[3]);
 
         let arm =
             self.arms[path_id].as_mut().unwrap();
@@ -1057,5 +1058,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn linucb_reward_prefers_higher_bandwidth() {
+        let x_fast = LinUCBScheduler::make_context(
+            100,
+            100,
+            0.0,
+            0.0,
+            1000,
+            1000,
+        );
+        let x_slow = LinUCBScheduler::make_context(
+            100,
+            100,
+            0.0,
+            0.0,
+            500,
+            1000,
+        );
+
+        let reward_fast = (-x_fast[0]).exp() * (1.0 - x_fast[1]) * (1.0 / x_fast[3]);
+        let reward_slow = (-x_slow[0]).exp() * (1.0 - x_slow[1]) * (1.0 / x_slow[3]);
+
+        assert!(reward_fast > reward_slow);
     }
 }
