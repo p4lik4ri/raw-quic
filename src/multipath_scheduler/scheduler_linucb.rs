@@ -145,6 +145,13 @@ pub struct LinUCBScheduler {
     /// Updated once per second alongside `last_window_sent`.
     ema_loss_rate: Vec<f64>,
 
+    /// Per-path soft minimum RTT (nanoseconds, as f64).
+    /// Drops instantly when a new all-time low is observed; rises 10%/s toward
+    /// the current EMA RTT under persistent degradation. Used ONLY in the reward
+    /// formula so genuine sustained degradation (e.g., 5G outage) is reflected in
+    /// rewards, while transient CUBIC bufferbloat is ignored.
+    soft_min_rtt_ns: Vec<f64>,
+
     /// Running sum of rewards and count of on_ack calls per path, used to
     /// display the average reward in the scheduler summary for diagnostics.
     sum_rewards: Vec<f64>,
@@ -197,6 +204,8 @@ impl LinUCBScheduler {
             last_window_sent: Vec::new(),
             last_window_lost: Vec::new(),
             ema_loss_rate:    Vec::new(),
+
+            soft_min_rtt_ns: Vec::new(),
         }
     }
 
@@ -780,6 +789,20 @@ impl MultipathScheduler for LinUCBScheduler {
                 }
                 self.ema_loss_rate[pid] = 0.5 * window_loss + 0.5 * self.ema_loss_rate[pid];
 
+                // Update soft minimum RTT: drops instantly to new lows, rises 10%/s
+                // toward EMA RTT under sustained degradation (~30s to converge).
+                const SOFT_MIN_RISE_ALPHA: f64 = 0.10;
+                if pid >= self.soft_min_rtt_ns.len() {
+                    self.soft_min_rtt_ns.resize(pid + 1, self.ema_rtt_ns[pid]);
+                }
+                let ema_rtt = self.ema_rtt_ns[pid];
+                if ema_rtt <= self.soft_min_rtt_ns[pid] || self.soft_min_rtt_ns[pid] == 0.0 {
+                    self.soft_min_rtt_ns[pid] = ema_rtt;
+                } else {
+                    self.soft_min_rtt_ns[pid] = (1.0 - SOFT_MIN_RISE_ALPHA) * self.soft_min_rtt_ns[pid]
+                        + SOFT_MIN_RISE_ALPHA * ema_rtt;
+                }
+
                 // Now update the snapshots for next window.
                 if pid >= self.last_window_sent.len() {
                     self.last_window_sent.resize(pid + 1, 0);
@@ -915,21 +938,22 @@ impl MultipathScheduler for LinUCBScheduler {
                 )
             });
 
-        // Reward = exp(-(min_rtt / best_min_rtt - 1)).
-        // Using min_rtt (not EMA RTT) makes the reward immune to CUBIC bufferbloat:
-        //   5G:        min_rtt=26ms  / 26ms  = 1.0 → reward=1.0 always
-        //   satellite: min_rtt=528ms / 26ms  = 20.3 (clamped to 20) → reward≈0 always
+        // Reward = exp(-(soft_min_rtt / best_min_rtt - 1)).
+        // Using soft_min_rtt (not all-time min_rtt) allows the scheduler to detect
+        // genuine path degradation over ~30 seconds while remaining immune to transient
+        // CUBIC bufferbloat:
+        //   Normal:      5G soft_min≈26ms, sat≈528ms → 5G reward=1.0, sat≈0
+        //   5G degraded: 5G soft_min rises to ~600ms over 30s → 5G reward drops to ~0
+        //                → model learns satellite is now better
         //
-        // Exploration is driven purely by alpha_floor = alpha_init × 0.20.
-        // Higher alpha → larger explore_bonus → more satellite probing at runtime.
-        // No need to manipulate the reward signal to achieve this.
-        // Reward is based on propagation delay (all-time min RTT), not EMA RTT.
-        // This keeps 5G reward=1.0 even under CUBIC bufferbloat, and satellite
-        // reward≈0 always. Higher alpha_floor drives more satellite probing via
-        // a larger explore_bonus, not by corrupting the reward signal.
-        let path_min_rtt_ns = path.recovery.rtt.min_rtt().as_nanos().max(1);
+        // Higher alpha → larger explore_bonus → more satellite probing → faster shift.
+        let path_soft_min = if path_id < self.soft_min_rtt_ns.len() && self.soft_min_rtt_ns[path_id] > 0.0 {
+            self.soft_min_rtt_ns[path_id] as u128
+        } else {
+            path.recovery.rtt.min_rtt().as_nanos()
+        }.max(1);
         let current_rtt_norm = if self.last_min_prop_rtt_ns > 0 {
-            (path_min_rtt_ns as f64 / self.last_min_prop_rtt_ns as f64).clamp(1.0, 20.0)
+            (path_soft_min as f64 / self.last_min_prop_rtt_ns as f64).clamp(1.0, 20.0)
         } else {
             1.0
         };
