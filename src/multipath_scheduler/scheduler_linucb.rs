@@ -142,6 +142,11 @@ pub struct LinUCBScheduler {
     /// EMA-smoothed per-path loss rate computed from the last 1-second window.
     /// Updated once per second alongside `last_window_sent`.
     ema_loss_rate: Vec<f64>,
+
+    /// Running sum of rewards and count of on_ack calls per path, used to
+    /// display the average reward in the scheduler summary for diagnostics.
+    sum_rewards: Vec<f64>,
+    n_rewards: Vec<u64>,
 }
 
 impl LinUCBScheduler {
@@ -174,6 +179,9 @@ impl LinUCBScheduler {
 
             ema_rtt_ns: Vec::new(),
             ack_counts: Vec::new(),
+
+            sum_rewards: Vec::new(),
+            n_rewards: Vec::new(),
 
             metrics_jsonl: Vec::new(),
 
@@ -902,6 +910,14 @@ impl MultipathScheduler for LinUCBScheduler {
         };
         let reward = (-(current_rtt_norm - 1.0)).exp();
 
+        // Track average reward per path for diagnostic display in summary.
+        if path_id >= self.sum_rewards.len() {
+            self.sum_rewards.resize(path_id + 1, 0.0);
+            self.n_rewards.resize(path_id + 1, 0);
+        }
+        self.sum_rewards[path_id] += reward;
+        self.n_rewards[path_id] += 1;
+
         let arm =
             self.arms[path_id].as_mut().unwrap();
 
@@ -945,8 +961,13 @@ impl MultipathScheduler for LinUCBScheduler {
             } else {
                 ("n/a".into(), "n/a".into())
             };
+            let avg_reward_str = {
+                let sum = self.sum_rewards.get(pid).copied().unwrap_or(0.0);
+                let n = self.n_rewards.get(pid).copied().unwrap_or(0);
+                if n > 0 { format!("{:.4}", sum / n as f64) } else { "n/a".into() }
+            };
             out.push_str(&format!(
-                "    path[{pid}] {addr}  selections={cnt} ({pct}%)  est(neutral)={est_str}  explore_bonus={bonus_str}\n"
+                "    path[{pid}] {addr}  selections={cnt} ({pct}%)  est(neutral)={est_str}  explore_bonus={bonus_str}  avg_reward={avg_reward_str}\n"
             ));
         }
 
