@@ -107,6 +107,11 @@ impl ArmState {
 pub struct LinUCBScheduler {
     arms: Vec<Option<ArmState>>,
     last_min_rtt_ns: u128,
+    /// Minimum of path.recovery.rtt.min_rtt() across all active paths.
+    /// Tracks the propagation-delay floor (unaffected by CUBIC bufferbloat),
+    /// used exclusively in the reward formula so queuing on the best path
+    /// cannot inflate the denominator and give satellite a false non-zero reward.
+    last_min_prop_rtt_ns: u128,
 
     last_selected: Option<usize>,
     last_log: Option<Instant>,
@@ -156,6 +161,7 @@ impl LinUCBScheduler {
         LinUCBScheduler {
             arms: Vec::new(),
             last_min_rtt_ns: 1,
+            last_min_prop_rtt_ns: 1,
 
             last_selected: None,
             last_log: None,
@@ -296,6 +302,11 @@ impl MultipathScheduler for LinUCBScheduler {
         // Collect per-path stats via iter_mut (can_send() takes &mut self).
         // Values are extracted before mutating self.arms to satisfy the borrow checker.
         let mut min_rtt_ns: u128 = u128::MAX;
+        // Minimum of path.recovery.rtt.min_rtt() — the all-time observed minimum
+        // per path, which approximates the propagation delay (no queuing).
+        // Kept separate from min_rtt_ns so the reward denominator is stable
+        // even when CUBIC inflates the EMA RTT of all paths simultaneously.
+        let mut min_prop_rtt_ns: u128 = u128::MAX;
         let mut max_pacing_bps: u64 = 0;
         // (pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps,
         //  sent_count, lost_count)
@@ -316,6 +327,12 @@ impl MultipathScheduler for LinUCBScheduler {
             // exclude it from the min, collapsing the reward signal).
             if rtt_ns < min_rtt_ns {
                 min_rtt_ns = rtt_ns;
+            }
+            // Propagation-delay floor: all-time minimum RTT for this path,
+            // unaffected by CUBIC-induced queue buildup.
+            let prop_rtt_ns = path.recovery.rtt.min_rtt().as_nanos();
+            if prop_rtt_ns < min_prop_rtt_ns {
+                min_prop_rtt_ns = prop_rtt_ns;
             }
             // Only paths that can currently send are candidates for selection.
             if !path.recovery.can_send() {
@@ -340,6 +357,7 @@ impl MultipathScheduler for LinUCBScheduler {
 
         let min_rtt_ns = min_rtt_ns.max(1);
         self.last_min_rtt_ns = min_rtt_ns;
+        self.last_min_prop_rtt_ns = min_prop_rtt_ns.max(1);
 
         // Capture a single timestamp used for idle-forgetting checks (below)
         // and for the per-second logging snapshot.
@@ -911,8 +929,16 @@ impl MultipathScheduler for LinUCBScheduler {
         // Using ema_rtt_ns / last_min_rtt_ns instead gives the correct reward
         // (≈0 for satellite) even on the first ACK, ensuring the model learns
         // the true path quality rather than an artefact of the init phase.
-        let current_rtt_norm = if self.last_min_rtt_ns > 0 {
-            (ema_rtt_ns as f64 / self.last_min_rtt_ns as f64).clamp(1.0, 20.0)
+        // Use the propagation-delay floor (all-time min RTT across active paths)
+        // as the denominator.  This is immune to CUBIC bufferbloat: even when
+        // 5G's EMA RTT rises to 450 ms from queue buildup, min_prop_rtt stays at
+        // ~20 ms (the actual propagation delay), so satellite always sees
+        // rtt_norm = 520ms/20ms = 26 → clamped to 20 → reward ≈ 0.
+        // Previously, using the EMA-based min let CUBIC queuing inflate the
+        // denominator to 450 ms, making satellite look decent (rtt_norm≈1.6,
+        // reward≈0.5) and permanently allocating ~25% traffic to it.
+        let current_rtt_norm = if self.last_min_prop_rtt_ns > 0 {
+            (ema_rtt_ns as f64 / self.last_min_prop_rtt_ns as f64).clamp(1.0, 20.0)
         } else {
             1.0
         };
