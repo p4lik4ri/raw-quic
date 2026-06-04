@@ -3862,6 +3862,7 @@ impl Connection {
                     remote: p.remote_addr(),
                 })
                 .collect(),
+            index: 0,
         }
     }
 

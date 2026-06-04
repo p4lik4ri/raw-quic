@@ -278,6 +278,8 @@ pub struct FourTuple {
 #[derive(Default)]
 pub struct FourTupleIter {
     pub(crate) addrs: Vec<FourTuple>,
+    /// Current position; advances forward so path[0] = lowest Slab key.
+    index: usize,
 }
 
 impl Iterator for FourTupleIter {
@@ -285,14 +287,18 @@ impl Iterator for FourTupleIter {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.addrs.pop()
+        let item = self.addrs.get(self.index).copied();
+        if item.is_some() {
+            self.index += 1;
+        }
+        item
     }
 }
 
 impl ExactSizeIterator for FourTupleIter {
     #[inline]
     fn len(&self) -> usize {
-        self.addrs.len()
+        self.addrs.len().saturating_sub(self.index)
     }
 }
 
