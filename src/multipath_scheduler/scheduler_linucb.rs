@@ -302,7 +302,7 @@ impl MultipathScheduler for LinUCBScheduler {
         let mut raw: Vec<(usize, u128, usize, u64, f64, u64, u64, u64)> = Vec::new();
 
         for (pid, path) in paths.iter_mut() {
-            if !path.active() || !path.recovery.can_send() {
+            if !path.active() {
                 continue;
             }
             let rtt_ns = if self.ack_counts.get(pid).copied().unwrap_or(0) > 0 {
@@ -310,15 +310,23 @@ impl MultipathScheduler for LinUCBScheduler {
             } else {
                 path.recovery.rtt.smoothed_rtt().as_nanos()
             };
+            // Always update min_rtt across ALL active paths so that
+            // last_min_rtt_ns is never inflated by a slow path dominating
+            // traffic (which would push the fast path out of can_send() and
+            // exclude it from the min, collapsing the reward signal).
+            if rtt_ns < min_rtt_ns {
+                min_rtt_ns = rtt_ns;
+            }
+            // Only paths that can currently send are candidates for selection.
+            if !path.recovery.can_send() {
+                continue;
+            }
             let bytes_in_flight = path.recovery.bytes_in_flight;
             let cwnd = path.recovery.congestion.congestion_window();
             let sent = path.recovery.stats.sent_count;
             let lost = path.recovery.stats.lost_count;
             let loss_rate = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
             let pacing_bps = path.recovery.congestion.pacing_rate().unwrap_or(0);
-            if rtt_ns < min_rtt_ns {
-                min_rtt_ns = rtt_ns;
-            }
             if pacing_bps > max_pacing_bps {
                 max_pacing_bps = pacing_bps;
             }
