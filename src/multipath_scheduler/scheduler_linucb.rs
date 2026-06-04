@@ -88,7 +88,8 @@ impl ArmState {
 /// After each ACK arrives on a path, the model is updated:
 ///   Aₚ ← Aₚ + xₚ xₚᵀ
 ///   bₚ ← bₚ + rₚ xₚ
-/// where the reward rₚ = exp(-rtt_norm) × (1 - cwnd_util).
+/// where the reward rₚ = exp(-rtt_norm) × (1 - cwnd_util) × (1 / bw_norm)
+/// (lower RTT, lower congestion, and higher bandwidth all increase reward).
 ///
 /// # Exploration parameters
 ///
@@ -132,6 +133,7 @@ pub struct LinUCBScheduler {
     last_forget_time: Vec<Option<Instant>>,
     ema_cwnd_pressure: Vec<Option<f64>>,
     forget_counts: Vec<u64>,
+    last_max_pacing_bps: u64,
 
     last_window_sent: Vec<u64>,
 }
@@ -170,6 +172,7 @@ impl LinUCBScheduler {
             last_forget_time: Vec::new(),
             ema_cwnd_pressure: Vec::new(),
             forget_counts: Vec::new(),
+            last_max_pacing_bps: 0,
 
             last_window_sent: Vec::new(),
         }
@@ -302,6 +305,7 @@ impl MultipathScheduler for LinUCBScheduler {
 
         let min_rtt_ns = min_rtt_ns.max(1);
         self.last_min_rtt_ns = min_rtt_ns;
+        self.last_max_pacing_bps = max_pacing_bps;
 
         // Capture a single timestamp used for idle-forgetting checks (below)
         // and for the per-second logging snapshot.
@@ -834,7 +838,7 @@ impl MultipathScheduler for LinUCBScheduler {
                         .congestion
                         .pacing_rate()
                         .unwrap_or(0),
-                    0,
+                    self.last_max_pacing_bps,
                 )
             });
 
