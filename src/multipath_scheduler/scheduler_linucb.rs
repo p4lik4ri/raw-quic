@@ -46,24 +46,13 @@ const CWND_P_EMA_ALPHA: f64 = 0.30;
 
 /// Exploration boost when path traffic share collapses.
 ///
-/// If a path's traffic share falls below:
-///     FAIRNESS_MIN_SHARE_PCT
+/// If a path's traffic share falls below FAIRNESS_MIN_SHARE_PCT,
+/// its exploration bonus is multiplied by FAIRNESS_BOOST.
 ///
-/// then its exploration bonus is multiplied by:
-///     FAIRNESS_BOOST
-///
-/// This prevents total path starvation while still allowing
-/// the scheduler to strongly prefer better paths.
-const FAIRNESS_MIN_SHARE_PCT: f64 = 5.0;
-const FAIRNESS_BOOST: f64 = 2.0;
-
-/// If a path's smoothed RTT exceeds this multiple of its all-time min RTT,
-/// the path is considered genuinely degraded (not just CUBIC-bloated).
-/// CUBIC bufferbloat typically inflates RTT by 10–12×; genuine degradation
-/// (e.g. netem 600ms on a 26ms path = 24×) comfortably exceeds this.
-/// When triggered, smoothed_rtt is used instead of min_rtt so the reward
-/// reflects the real path quality and the scheduler shifts to a better path.
-const DEGRADATION_RATIO: u128 = 20;
+/// Scaled with alpha_init so that higher alpha drives more satellite
+/// probing at runtime, not just at startup.
+const FAIRNESS_MIN_SHARE_PCT: f64 = 10.0;
+const FAIRNESS_BOOST: f64 = 3.0;
 
 /// Per-arm state for LinUCB.
 struct ArmState {
@@ -336,22 +325,13 @@ impl MultipathScheduler for LinUCBScheduler {
             if rtt_ns < min_rtt_ns {
                 min_rtt_ns = rtt_ns;
             }
-            // Propagation-delay floor: normally the all-time min RTT per path
-            // (unaffected by CUBIC-induced queue buildup).  If smoothed RTT has
-            // risen far above min RTT the path is genuinely degraded — use
-            // smoothed RTT so the reward denominator reflects real path quality
-            // and the scheduler can shift toward a better path at runtime.
+            // Propagation-delay floor: the all-time min RTT per path,
+            // unaffected by CUBIC-induced queue buildup.
+            // Used as the reward denominator so queuing on the best path
+            // cannot inflate the denominator and corrupt the reward signal.
             let prop_rtt_ns = path.recovery.rtt.min_rtt().as_nanos();
-            let srtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos();
-            let effective_prop_rtt_ns = if prop_rtt_ns > 0
-                && srtt_ns > prop_rtt_ns * DEGRADATION_RATIO
-            {
-                srtt_ns
-            } else {
-                prop_rtt_ns
-            };
-            if effective_prop_rtt_ns < min_prop_rtt_ns {
-                min_prop_rtt_ns = effective_prop_rtt_ns;
+            if prop_rtt_ns < min_prop_rtt_ns {
+                min_prop_rtt_ns = prop_rtt_ns;
             }
             // Only paths that can currently send are candidates for selection.
             if !path.recovery.can_send() {
@@ -935,52 +915,21 @@ impl MultipathScheduler for LinUCBScheduler {
                 )
             });
 
-        // Compute reward from the CURRENT measured RTT, not from x[0] in the
-        // saved context.  The saved context may have been captured during the
-        // warm-up window (ack_counts=0) when a newly-added path inherits the
-        // connection's existing smoothed_rtt (~29 ms for 5G) instead of its
-        // true RTT (~520 ms for satellite).  During that window the context
-        // records rtt_norm=1.0, so using x[0] would give reward=1.0 and
-        // permanently poison theta_sat with large positive weights — causing
-        // the model to prefer satellite forever via extrapolation once the real
-        // RTT is revealed.
+        // Reward = exp(-(min_rtt / best_min_rtt - 1)).
+        // Using min_rtt (not EMA RTT) makes the reward immune to CUBIC bufferbloat:
+        //   5G:        min_rtt=26ms  / 26ms  = 1.0 → reward=1.0 always
+        //   satellite: min_rtt=528ms / 26ms  = 20.3 (clamped to 20) → reward≈0 always
         //
-        // Using ema_rtt_ns / last_min_rtt_ns instead gives the correct reward
-        // (≈0 for satellite) even on the first ACK, ensuring the model learns
-        // the true path quality rather than an artefact of the init phase.
-        // Reward is based on PROPAGATION DELAY (all-time min RTT per path),
-        // not the EMA RTT.  This cleanly separates two concerns:
-        //
-        //   • Reward  → "how good is this path's fundamental quality?"
-        //               = min_rtt(path) / min_prop_rtt_across_all_paths
-        //               Immune to CUBIC bufferbloat: even when 5G's EMA RTT
-        //               rises to 300 ms, min_rtt(5G) stays at ~26 ms.
-        //               → 5G reward = 26/26 = 1.0 always
-        //               → satellite reward = 628/26 = 24 (clamped) → ≈0 always
-        //
-        //   • Can-send → "can this path accept data right now?"
-        //               = CWND vs bytes-in-flight gate in on_select().
-        //               Handles current congestion without corrupting the reward.
-        //
-        //   • Context  → cwnd_pressure and rtt_norm features let the model
-        //               learn PATTERNS (e.g. avoid paths with high cwnd
-        //               pressure), but the reward label stays clean.
-        //
-        // Using ema_rtt_ns in the numerator (previous approach) caused 5G's
-        // reward to collapse to ≈0 under CUBIC bufferbloat (EMA=300ms,
-        // rtt_norm=300/26=11.5, reward=exp(-10.5)≈0), making both paths
-        // look identical to the model and forcing round-robin selection.
+        // Exploration is driven purely by alpha_floor = alpha_init × 0.20.
+        // Higher alpha → larger explore_bonus → more satellite probing at runtime.
+        // No need to manipulate the reward signal to achieve this.
+        // Reward is based on propagation delay (all-time min RTT), not EMA RTT.
+        // This keeps 5G reward=1.0 even under CUBIC bufferbloat, and satellite
+        // reward≈0 always. Higher alpha_floor drives more satellite probing via
+        // a larger explore_bonus, not by corrupting the reward signal.
         let path_min_rtt_ns = path.recovery.rtt.min_rtt().as_nanos().max(1);
-        let path_srtt_ns = path.recovery.rtt.smoothed_rtt().as_nanos().max(1);
-        // Use smoothed RTT as the effective floor when the path is genuinely
-        // degraded (not just CUBIC-bloated): same threshold as on_select.
-        let effective_rtt_ns = if path_srtt_ns > path_min_rtt_ns * DEGRADATION_RATIO as u128 {
-            path_srtt_ns
-        } else {
-            path_min_rtt_ns
-        };
         let current_rtt_norm = if self.last_min_prop_rtt_ns > 0 {
-            (effective_rtt_ns as f64 / self.last_min_prop_rtt_ns as f64).clamp(1.0, 20.0)
+            (path_min_rtt_ns as f64 / self.last_min_prop_rtt_ns as f64).clamp(1.0, 20.0)
         } else {
             1.0
         };
