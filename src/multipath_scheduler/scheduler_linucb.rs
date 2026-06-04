@@ -929,16 +929,31 @@ impl MultipathScheduler for LinUCBScheduler {
         // Using ema_rtt_ns / last_min_rtt_ns instead gives the correct reward
         // (≈0 for satellite) even on the first ACK, ensuring the model learns
         // the true path quality rather than an artefact of the init phase.
-        // Use the propagation-delay floor (all-time min RTT across active paths)
-        // as the denominator.  This is immune to CUBIC bufferbloat: even when
-        // 5G's EMA RTT rises to 450 ms from queue buildup, min_prop_rtt stays at
-        // ~20 ms (the actual propagation delay), so satellite always sees
-        // rtt_norm = 520ms/20ms = 26 → clamped to 20 → reward ≈ 0.
-        // Previously, using the EMA-based min let CUBIC queuing inflate the
-        // denominator to 450 ms, making satellite look decent (rtt_norm≈1.6,
-        // reward≈0.5) and permanently allocating ~25% traffic to it.
+        // Reward is based on PROPAGATION DELAY (all-time min RTT per path),
+        // not the EMA RTT.  This cleanly separates two concerns:
+        //
+        //   • Reward  → "how good is this path's fundamental quality?"
+        //               = min_rtt(path) / min_prop_rtt_across_all_paths
+        //               Immune to CUBIC bufferbloat: even when 5G's EMA RTT
+        //               rises to 300 ms, min_rtt(5G) stays at ~26 ms.
+        //               → 5G reward = 26/26 = 1.0 always
+        //               → satellite reward = 628/26 = 24 (clamped) → ≈0 always
+        //
+        //   • Can-send → "can this path accept data right now?"
+        //               = CWND vs bytes-in-flight gate in on_select().
+        //               Handles current congestion without corrupting the reward.
+        //
+        //   • Context  → cwnd_pressure and rtt_norm features let the model
+        //               learn PATTERNS (e.g. avoid paths with high cwnd
+        //               pressure), but the reward label stays clean.
+        //
+        // Using ema_rtt_ns in the numerator (previous approach) caused 5G's
+        // reward to collapse to ≈0 under CUBIC bufferbloat (EMA=300ms,
+        // rtt_norm=300/26=11.5, reward=exp(-10.5)≈0), making both paths
+        // look identical to the model and forcing round-robin selection.
+        let path_min_rtt_ns = path.recovery.rtt.min_rtt().as_nanos().max(1);
         let current_rtt_norm = if self.last_min_prop_rtt_ns > 0 {
-            (ema_rtt_ns as f64 / self.last_min_prop_rtt_ns as f64).clamp(1.0, 20.0)
+            (path_min_rtt_ns as f64 / self.last_min_prop_rtt_ns as f64).clamp(1.0, 20.0)
         } else {
             1.0
         };
