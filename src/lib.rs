@@ -635,6 +635,13 @@ impl Config {
         self.multipath.multipath_algorithm = v;
     }
 
+    /// Set the LinUCB exploration weight alpha (default 1.0).
+    /// Higher means more exploration; lower means exploit the best-known path.
+    /// Only used when the multipath algorithm is LinUCB.
+    pub fn set_linucb_alpha(&mut self, v: f64) {
+        self.multipath.linucb_alpha = v;
+    }
+
     /// Set the maximum size of the connection flow control window.
     /// The default value is MAX_CONNECTION_WINDOW (15 MB).
     pub fn set_max_connection_window(&mut self, v: u64) {
@@ -893,12 +900,17 @@ impl Default for RecoveryConfig {
 pub struct MultipathConfig {
     /// Multipath scheduling algorithm.
     multipath_algorithm: MultipathAlgorithm,
+
+    /// LinUCB exploration weight alpha (default 1.0).
+    /// Higher means more exploration; lower means exploit the best-known path.
+    pub linucb_alpha: f64,
 }
 
 impl Default for MultipathConfig {
     fn default() -> MultipathConfig {
         MultipathConfig {
             multipath_algorithm: MultipathAlgorithm::MinRtt,
+            linucb_alpha: 1.0,
         }
     }
 }

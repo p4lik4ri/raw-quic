@@ -91,7 +91,7 @@ mod tests {
     fn minrtt_single_available_path() -> Result<()> {
         let mut t = MultipathTester::new()?;
 
-        let mut s = MinRttScheduler {};
+        let mut s = MinRttScheduler::new(&Default::default());
         assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 0);
         assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 0);
         Ok(())
@@ -104,7 +104,7 @@ mod tests {
         t.add_path("127.0.0.1:443", "127.0.0.3:8443", 150)?;
         t.add_path("127.0.0.1:443", "127.0.0.4:8443", 100)?;
 
-        let mut s = MinRttScheduler {};
+        let mut s = MinRttScheduler::new(&Default::default());
         assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 1);
 
         t.set_path_active(1, false)?;
@@ -118,7 +118,7 @@ mod tests {
         let mut t = MultipathTester::new()?;
         t.set_path_active(0, false)?;
 
-        let mut s = MinRttScheduler {};
+        let mut s = MinRttScheduler::new(&Default::default());
         assert_eq!(
             s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams),
             Err(Error::Done)

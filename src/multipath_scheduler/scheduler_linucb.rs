@@ -533,6 +533,7 @@ impl MultipathScheduler for LinUCBScheduler {
                     let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
                     let pct = cnt as f64 * 100.0 / total as f64;
                     let n = self.total_counts.get(pid).copied().unwrap_or(0);
+                    let alpha = Self::selection_alpha(n);
                     let theta = if let Some(Some(arm)) = self.arms.get(pid) {
                         mat_vec(mat_inv(arm.a), arm.b)
                     } else {
@@ -561,6 +562,22 @@ impl MultipathScheduler for LinUCBScheduler {
                     let cwnd_kb        = cwnd as f64 / 1024.0;
                     let inflight_kb    = bytes_in_flight as f64 / 1024.0;
                     let rtt_ms         = rtt_us as f64 / 1000.0;
+                    // Throughput-branch compatible aliases.
+                    let rtt_norm = if x[0] > 1e-12 { (1.0 / x[0]).clamp(1.0, 20.0) } else { 20.0 };
+                    let cwnd_p = (1.0 - x[1]).clamp(0.0, 1.0);
+                    let loss_rate = (1.0 - x[2]).clamp(0.0, 1.0);
+                    let bw_norm = x[3].clamp(0.0, 1.0);
+                    let ucb_total = reward_est + explore_bonus;
+                    let explore_ratio = if ucb_total.abs() > 1e-12 {
+                        explore_bonus / ucb_total.abs()
+                    } else {
+                        1.0
+                    };
+                    let a_trace = if let Some(Some(arm)) = self.arms.get(pid) {
+                        (0..D).map(|i| arm.a[i][i]).sum::<f64>()
+                    } else {
+                        0.0
+                    };
                     // traffic / latency / throughput
                     jline.push_str(&format!(
                         ",\"traffic/path{pid}_pct\":{pct:.2}\
@@ -583,6 +600,39 @@ impl MultipathScheduler for LinUCBScheduler {
                         ",\"linucb/path{pid}_reward\":{reward_est:.4}\
                          ,\"linucb/path{pid}_explore_bonus\":{explore_bonus:.4}\
                          ,\"linucb/path{pid}_samples\":{n}",
+                    ));
+                    // throughput-branch schema aliases (p{pid}.*)
+                    jline.push_str(&format!(
+                        ",\"p{pid}.pct\":{pct:.2}\
+                         ,\"p{pid}.rtt_us\":{rtt_us}\
+                         ,\"p{pid}.rtt_ms\":{rtt_ms:.3}\
+                         ,\"p{pid}.reward\":{reward_est:.4}\
+                         ,\"p{pid}.bonus\":{explore_bonus:.4}\
+                         ,\"p{pid}.ucb_total\":{ucb_total:.4}\
+                         ,\"p{pid}.explore_ratio\":{explore_ratio:.4}\
+                         ,\"p{pid}.a_trace\":{a_trace:.3}\
+                         ,\"p{pid}.forget_count\":0\
+                         ,\"p{pid}.n\":{n}\
+                         ,\"p{pid}.alpha\":{alpha:.4}\
+                         ,\"p{pid}.pacing_mbps\":{pacing_mbps:.3}\
+                         ,\"p{pid}.delivered_mbps\":{throughput_mbps:.3}\
+                         ,\"p{pid}.sent_per_sec\":0\
+                         ,\"p{pid}.traffic_share_pct\":{pct:.2}\
+                         ,\"p{pid}.bif_kb\":{inflight_kb:.2}\
+                         ,\"p{pid}.cwnd_kb\":{cwnd_kb:.2}\
+                         ,\"p{pid}.sent\":{sent_total}\
+                         ,\"p{pid}.lost\":{lost_total}\
+                         ,\"p{pid}.x_rtt_norm\":{rtt_norm:.4}\
+                         ,\"p{pid}.x_cwnd_p\":{cwnd_p:.4}\
+                         ,\"p{pid}.x_loss_rate\":{loss_rate:.4}\
+                         ,\"p{pid}.x_bw_norm\":{bw_norm:.4}\
+                         ,\"p{pid}.x_bias\":1.0000\
+                         ,\"p{pid}.th_rtt_norm\":{:.4}\
+                         ,\"p{pid}.th_cwnd_p\":{:.4}\
+                         ,\"p{pid}.th_loss_rate\":{:.4}\
+                         ,\"p{pid}.th_bw_norm\":{:.4}\
+                         ,\"p{pid}.th_bias\":{:.4}",
+                        theta[0], theta[1], theta[2], theta[3], theta[4],
                     ));
                     // context features (x vector)
                     for (i, xi) in x.iter().enumerate() {
