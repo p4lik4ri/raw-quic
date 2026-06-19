@@ -54,6 +54,12 @@ const CWND_P_EMA_ALPHA: f64 = 0.30;
 const FAIRNESS_MIN_SHARE_PCT: f64 = 10.0;
 const FAIRNESS_BOOST: f64 = 3.0;
 
+/// Raw per-path stats tuple: (pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, sent, lost)
+type RawPathStat = (usize, u128, usize, u64, f64, u64, u64, u64);
+
+/// Per-path score row: (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb, context_x)
+type ScoreRow = (usize, u64, f64, f64, f64, f64, [f64; D]);
+
 /// Per-arm state for LinUCB.
 struct ArmState {
     a: [[f64; D]; D],
@@ -63,8 +69,8 @@ struct ArmState {
 impl ArmState {
     fn new() -> Self {
         let mut a = [[0.0_f64; D]; D];
-        for i in 0..D {
-            a[i][i] = 1.0;
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = 1.0;
         }
         ArmState { a, b: [0.0; D] }
     }
@@ -291,8 +297,8 @@ impl LinUCBScheduler {
             }
         }
 
-        for i in 0..D {
-            arm.b[i] += reward * x[i];
+        for (i, &xi) in x.iter().enumerate() {
+            arm.b[i] += reward * xi;
         }
     }
 }
@@ -316,7 +322,7 @@ impl MultipathScheduler for LinUCBScheduler {
         let mut max_pacing_bps: u64 = 0;
         // (pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_rate_bps,
         //  sent_count, lost_count)
-        let mut raw: Vec<(usize, u128, usize, u64, f64, u64, u64, u64)> = Vec::new();
+        let mut raw: Vec<RawPathStat> = Vec::new();
 
         for (pid, path) in paths.iter_mut() {
             if !path.active() {
@@ -356,7 +362,7 @@ impl MultipathScheduler for LinUCBScheduler {
                 max_pacing_bps = pacing_bps;
             }
             raw.push((pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps,
-                      sent as u64, lost as u64));
+                      sent, lost));
         }
 
         if raw.is_empty() {
@@ -376,7 +382,7 @@ impl MultipathScheduler for LinUCBScheduler {
         let mut best_pid = raw[0].0;
         let mut best_score = f64::NEG_INFINITY;
         // (pid, rtt_us, cwnd_pressure, reward_est, explore_bonus, ucb, context_x)
-        let mut score_rows: Vec<(usize, u64, f64, f64, f64, f64, [f64; D])> = Vec::new();
+        let mut score_rows: Vec<ScoreRow> = Vec::new();
 
         for &(pid, rtt_ns, bytes_in_flight, cwnd, loss_rate, pacing_bps, _sent, _lost) in &raw {
             self.ensure_arm(pid);
@@ -1047,24 +1053,24 @@ fn mat_inv(
 ) -> [[f64; D]; D] {
     let mut a = m;
     let mut inv = [[0.0_f64; D]; D];
-    for i in 0..D {
-        inv[i][i] = 1.0;
+    for (i, row) in inv.iter_mut().enumerate() {
+        row[i] = 1.0;
     }
     for col in 0..D {
         // Partial pivoting: find row with largest absolute value in this column.
         let mut max_row = col;
         let mut max_val = a[col][col].abs();
-        for row in (col + 1)..D {
-            if a[row][col].abs() > max_val {
-                max_val = a[row][col].abs();
+        for (row, a_row) in a.iter().enumerate().skip(col + 1) {
+            if a_row[col].abs() > max_val {
+                max_val = a_row[col].abs();
                 max_row = row;
             }
         }
         if max_val < 1e-15 {
             // Singular — return identity to avoid blowing up.
             let mut r = [[0.0_f64; D]; D];
-            for i in 0..D {
-                r[i][i] = 1.0;
+            for (i, row) in r.iter_mut().enumerate() {
+                row[i] = 1.0;
             }
             return r;
         }
@@ -1097,8 +1103,8 @@ fn mat_vec(
 ) -> [f64; D] {
     let mut r = [0.0_f64; D];
     for i in 0..D {
-        for j in 0..D {
-            r[i] += m[i][j] * v[j];
+        for (j, &vj) in v.iter().enumerate() {
+            r[i] += m[i][j] * vj;
         }
     }
     r
