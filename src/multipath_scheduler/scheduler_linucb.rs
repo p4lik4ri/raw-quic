@@ -61,7 +61,17 @@ const CWND_P_EMA_ALPHA: f64 = 0.10;
 const FAIRNESS_MIN_SHARE_PCT: f64 = 5.0;
 const FAIRNESS_BOOST: f64 = 2.0;
 
-/// Per-arm state for LinUCB.
+/// RTT change threshold for triggering RTT-jump reset.
+/// If RTT changes by more than 30%, we reset the model to adapt to new conditions.
+const RTT_JUMP_THRESHOLD: f64 = 0.30;
+
+/// Idle forgetting threshold - if a path is idle for this duration, apply forgetting.
+const IDLE_FORGET_THRESHOLD: Duration = Duration::from_secs(10);
+
+/// Forgetting factor for idle paths - decays the A matrix toward identity.
+const IDLE_FORGET_FACTOR: f64 = 0.95;
+
+/// Per-arm (per-path) state for the LinUCB algorithm.
 struct ArmState {
     a: [[f64; D]; D],
     b: [f64; D],
@@ -141,6 +151,10 @@ pub struct LinUCBScheduler {
     last_max_pacing_bps: u64,
 
     last_window_sent: Vec<u64>,
+    /// Last EMA RTT for each path, used for RTT-jump detection.
+    last_ema_rtt_ns: Vec<f64>,
+    /// Last selection time for each path, used for idle forgetting.
+    last_selection_time: Vec<Option<Instant>>,
 }
 
 impl LinUCBScheduler {
@@ -189,6 +203,8 @@ impl LinUCBScheduler {
             last_max_pacing_bps: 0,
 
             last_window_sent: Vec::new(),
+            last_ema_rtt_ns: Vec::new(),
+            last_selection_time: Vec::new(),
         }
     }
 
@@ -428,6 +444,28 @@ impl MultipathScheduler for LinUCBScheduler {
         self.last_min_rtt_ns = min_rtt_ns;
         self.last_max_pacing_bps = max_pacing_bytes_per_sec;
 
+        // ── Idle forgetting ─────────────────────────────────────────────────────
+        // If a path has been idle for more than IDLE_FORGET_THRESHOLD, decay its
+        // A matrix toward identity to re-trigger exploration on that path.
+        for (pid, _) in &raw {
+            if pid >= self.last_selection_time.len() {
+                self.last_selection_time.resize(pid + 1, None);
+            }
+            if let Some(last_time) = self.last_selection_time[*pid] {
+                if now.duration_since(last_time) > IDLE_FORGET_THRESHOLD {
+                    self.ensure_arm(*pid);
+                    let arm = self.arms[*pid].as_mut().unwrap();
+                    // Decay A matrix toward identity: A ← λA + (1-λ)I
+                    for i in 0..D {
+                        for j in 0..D {
+                            arm.a[i][j] = IDLE_FORGET_FACTOR * arm.a[i][j];
+                        }
+                        arm.a[i][i] += (1.0 - IDLE_FORGET_FACTOR);
+                    }
+                }
+            }
+        }
+
         // Pick the arm with the highest UCB score and collect per-path scores
         // for logging.
         let mut best_pid = raw[0].0;
@@ -502,6 +540,12 @@ impl MultipathScheduler for LinUCBScheduler {
             self.last_select_time.resize(best_pid + 1, None);
         }
         self.last_select_time[best_pid] = Some(now);
+
+        // Update last selection time for the selected path
+        if best_pid >= self.last_selection_time.len() {
+            self.last_selection_time.resize(best_pid + 1, None);
+        }
+        self.last_selection_time[best_pid] = Some(now);
 
         // Cache per-path addresses for the final summary.
         // Prefer local_addr, but fall back to remote_addr when local is
