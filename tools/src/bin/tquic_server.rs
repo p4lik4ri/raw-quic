@@ -743,13 +743,14 @@ impl TransportHandler for ServerHandler {
             for (i, four_tuple) in paths.iter().enumerate() {
                 if let Ok(ps) = conn.get_path_stats(four_tuple.local, four_tuple.remote) {
                     info!(
-                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  srtt={} µs  latest_rtt={} µs",
+                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  min_rtt={} µs  srtt={} µs  latest_rtt={} µs",
                         i,
                         four_tuple.local,
                         four_tuple.remote,
                         ps.recv_bytes, ps.recv_count,
                         ps.sent_bytes, ps.sent_count,
                         ps.lost_bytes,
+                        ps.min_rtt,
                         ps.srtt,
                         ps.latest_rtt,
                     );

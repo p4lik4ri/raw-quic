@@ -685,7 +685,7 @@ impl MultipathScheduler for LinUCBScheduler {
                     total_delta_sent = total_delta_sent.saturating_add(delta);
                 }
 
-                for &(pid, rtt_us, _cp, reward_est, explore_bonus, _ucb, x) in &score_rows {
+                for &(pid, _rtt_us, _cp, reward_est, explore_bonus, _ucb, x) in &score_rows {
                     let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
                     let pct = cnt as f64 * 100.0 / total as f64;
                     let n = self.total_counts.get(pid).copied().unwrap_or(0);
@@ -714,7 +714,16 @@ impl MultipathScheduler for LinUCBScheduler {
                     let pacing_mbps = pacing_rate_bytes_per_sec as f64 * 8.0 / 1_000_000.0;
                     let cwnd_kb = cwnd as f64 / 1024.0;
                     let inflight_kb = bytes_in_flight as f64 / 1024.0;
-                    let rtt_ms = rtt_us as f64 / 1000.0;
+                    // Report baseline path RTT (close to ping) using min_rtt,
+                    // and keep latest RTT as a separate metric for queueing spikes.
+                    let (rtt_ms, latest_rtt_ms) = if let Ok(path) = paths.get(pid) {
+                        (
+                            path.recovery.rtt.min_rtt().as_micros() as f64 / 1000.0,
+                            path.recovery.rtt.latest_rtt().as_micros() as f64 / 1000.0,
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    };
                     // Throughput-branch compatible aliases.
                     let rtt_norm = if x[0] > 1e-12 { (1.0 / x[0]).clamp(1.0, 20.0) } else { 20.0 };
                     let cwnd_p = (1.0 - x[1]).clamp(0.0, 1.0);
@@ -735,6 +744,7 @@ impl MultipathScheduler for LinUCBScheduler {
                     jline.push_str(&format!(
                         ",\"traffic/path{pid}_pct\":{pct:.2}\
                          ,\"latency/path{pid}_rtt_ms\":{rtt_ms:.3}\
+                        ,\"latency/path{pid}_latest_rtt_ms\":{latest_rtt_ms:.3}\
                          ,\"throughput/path{pid}_mbps\":{throughput_mbps:.3}",
                     ));
                     // congestion control
@@ -755,6 +765,7 @@ impl MultipathScheduler for LinUCBScheduler {
                          ,\"linucb/path{pid}_samples\":{n}",
                     ));
                     // throughput-branch schema aliases (p{pid}.*)
+                    let rtt_us = (rtt_ms * 1000.0) as u64;
                     jline.push_str(&format!(
                         ",\"p{pid}.pct\":{pct:.2}\
                          ,\"p{pid}.rtt_us\":{rtt_us}\
