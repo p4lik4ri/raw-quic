@@ -447,14 +447,14 @@ impl MultipathScheduler for LinUCBScheduler {
         // ── Idle forgetting ─────────────────────────────────────────────────────
         // If a path has been idle for more than IDLE_FORGET_THRESHOLD, decay its
         // A matrix toward identity to re-trigger exploration on that path.
-        for (pid, _) in &raw {
+        for &(pid, ..) in &raw {
             if pid >= self.last_selection_time.len() {
                 self.last_selection_time.resize(pid + 1, None);
             }
-            if let Some(last_time) = self.last_selection_time[*pid] {
+            if let Some(last_time) = self.last_selection_time[pid] {
                 if now.duration_since(last_time) > IDLE_FORGET_THRESHOLD {
-                    self.ensure_arm(*pid);
-                    let arm = self.arms[*pid].as_mut().unwrap();
+                    self.ensure_arm(pid);
+                    let arm = self.arms[pid].as_mut().unwrap();
                     // Decay A matrix toward identity: A ← λA + (1-λ)I
                     for i in 0..D {
                         for j in 0..D {
@@ -550,7 +550,7 @@ impl MultipathScheduler for LinUCBScheduler {
         // Cache per-path addresses for the final summary.
         // Prefer local_addr, but fall back to remote_addr when local is
         // unspecified (server bound to 0.0.0.0 / ::).
-        for &(pid, _, _, _, _, _, _, _) in &raw {
+        for &(pid, ..) in &raw {
             if pid >= self.path_addrs.len() {
                 self.path_addrs.resize(pid + 1, None);
             }
@@ -671,7 +671,7 @@ impl MultipathScheduler for LinUCBScheduler {
                 // delta of 0 (avoids reporting cumulative as instantaneous).
                 let mut path_delta_sent: Vec<u64> = Vec::new();
                 let mut total_delta_sent: u64 = 0;
-                for &(pid, _, _, _, _, _, sent_bytes_p, _) in &raw {
+                for &(pid, _, _, _, _, _, sent_bytes_p, _, _) in &raw {
                     let prev = if pid < self.prev_sent_bytes.len() {
                         self.prev_sent_bytes[pid]
                     } else {
@@ -814,7 +814,7 @@ impl MultipathScheduler for LinUCBScheduler {
             self.window_total = 0;
             // Snapshot current `sent_bytes` so the next window's
             // throughput_mbps can be computed.
-            for &(pid, _, _, _, _, _, sent_bytes_p, _) in &raw {
+            for &(pid, _, _, _, _, _, sent_bytes_p, _, _) in &raw {
                 if pid >= self.prev_sent_bytes.len() {
                     self.prev_sent_bytes.resize(pid + 1, 0);
                 }
