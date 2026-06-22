@@ -460,7 +460,7 @@ impl MultipathScheduler for LinUCBScheduler {
                         for j in 0..D {
                             arm.a[i][j] = IDLE_FORGET_FACTOR * arm.a[i][j];
                         }
-                        arm.a[i][i] += (1.0 - IDLE_FORGET_FACTOR);
+                        arm.a[i][i] += 1.0 - IDLE_FORGET_FACTOR;
                     }
                 }
             }
