@@ -354,8 +354,32 @@ pub async fn last_json_result(
         }
         srv
     } else {
-        // In downlink the client is the receiver.
-        state.last_client.lock().await.clone()
+        // In downlink the client is the receiver (authoritative throughput/jitter/loss).
+        // Also merge sender-side per-interval loss from server intervals.
+        let mut cli = state.last_client.lock().await.clone();
+        let srv = get_server_samples(&state).await;
+        if !cli.is_empty() && !srv.is_empty() {
+            let mut sender_loss_map: std::collections::HashMap<u64, f64> =
+                std::collections::HashMap::new();
+            for ss in &srv {
+                if let (Some(ie), Some(pl)) = (
+                    ss["interval_end"].as_f64().map(|v| v.to_bits()),
+                    ss.get("packetLoss").and_then(|v| v.as_f64()),
+                ) {
+                    sender_loss_map.insert(ie, pl);
+                }
+            }
+            for sample in cli.iter_mut() {
+                if let Some(bits) = sample["interval_end"].as_f64().map(|v| v.to_bits()) {
+                    if let Some(pl) = sender_loss_map.get(&bits) {
+                        if let Some(obj) = sample.as_object_mut() {
+                            obj.insert("sender_packetLoss".to_string(), serde_json::json!(pl));
+                        }
+                    }
+                }
+            }
+        }
+        cli
     };
 
     // Remove the internal interval_end key before returning,
