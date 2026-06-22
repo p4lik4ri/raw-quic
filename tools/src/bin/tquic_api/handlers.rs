@@ -326,25 +326,27 @@ pub async fn last_json_result(
         // and we match by interval_end (relative seconds) which is clock-agnostic.
         let client_samples = state.last_client.lock().await.clone();
         if !client_samples.is_empty() {
-            // Build a lookup: interval_end → (5g_throughput, satellite_throughput)
-            let mut path_map: std::collections::HashMap<u64, (Option<f64>, Option<f64>)> =
+            // Build a lookup: interval_end → (5g_throughput, satellite_throughput, packetLoss)
+            let mut path_map: std::collections::HashMap<u64, (Option<f64>, Option<f64>, Option<f64>)> =
                 std::collections::HashMap::new();
             for cs in &client_samples {
                 // interval_end is stored as f64; use bits as hash key for exact match.
                 let ie_bits = cs["interval_end"].as_f64().map(|v| v.to_bits());
                 let p0 = cs.get("5G_throughput").and_then(|v| v.as_f64());
                 let p1 = cs.get("sat_throughput").and_then(|v| v.as_f64());
-                if let (Some(bits), true) = (ie_bits, p0.is_some() || p1.is_some()) {
-                    path_map.insert(bits, (p0, p1));
+                let pl = cs.get("packetLoss").and_then(|v| v.as_f64());
+                if let Some(bits) = ie_bits {
+                    path_map.insert(bits, (p0, p1, pl));
                 }
             }
             for sample in srv.iter_mut() {
                 let ie_bits = sample["interval_end"].as_f64().map(|v| v.to_bits());
                 if let Some(bits) = ie_bits {
-                    if let Some((p0, p1)) = path_map.get(&bits) {
+                    if let Some((p0, p1, pl)) = path_map.get(&bits) {
                         if let Some(obj) = sample.as_object_mut() {
                             if let Some(v) = p0 { obj.insert("5g_throughput".to_string(), serde_json::json!(v)); }
                             if let Some(v) = p1 { obj.insert("satellite_throughput".to_string(), serde_json::json!(v)); }
+                            if let Some(v) = pl { obj.insert("packetLoss".to_string(), serde_json::json!(v)); }
                         }
                     }
                 }
