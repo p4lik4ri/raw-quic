@@ -6,6 +6,7 @@
 //! a `ProcessStatus` snapshot including the last 1 000 lines of combined output.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::State;
@@ -100,9 +101,22 @@ pub async fn client_start(
 ) -> Json<serde_json::Value> {
     let mut proc = state.client.lock().await;
     if proc.is_running() {
-        return Json(serde_json::json!({
-            "ok": false, "error": "client already running", "pid": proc.pid
-        }));
+        // In looped experiments, callers may start the next run a bit early.
+        // Wait a short grace period for the previous run to finish so loop N+1
+        // can start without requiring explicit polling in the caller.
+        let wait_start = Instant::now();
+        let wait_deadline = wait_start + Duration::from_secs(20);
+        while proc.is_running() && Instant::now() < wait_deadline {
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        if proc.is_running() {
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": "client still running; wait for /client/status running=false before starting next loop",
+                "pid": proc.pid,
+            }));
+        }
     }
 
     let bin = state.bin_dir.join("tquic_client");
