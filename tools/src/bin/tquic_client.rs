@@ -1463,9 +1463,12 @@ impl TransportHandler for WorkerHandler {
                         tquic::MultipathAlgorithm::Redundant  => "redundant",
                         tquic::MultipathAlgorithm::LinUCB     => "linucb",
                     };
-                    if let Some(wb) = WandbLogger::new(&key, "quic", sched) {
-                        wb.upload_history(&metrics);
-                    }
+                    let sched = sched.to_string();
+                    std::thread::spawn(move || {
+                        if let Some(wb) = WandbLogger::new(&key, "quic", &sched) {
+                            wb.upload_history(&metrics);
+                        }
+                    });
                 }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());

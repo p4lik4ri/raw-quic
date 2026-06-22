@@ -734,9 +734,12 @@ impl TransportHandler for ServerHandler {
             let metrics = conn.multipath_scheduler_metrics_jsonl();
             if !metrics.is_empty() && !self.is_uplink.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(key) = self.wandb_key.take() {
-                    if let Some(wb) = WandbLogger::new(&key, "quic", &self.scheduler_name) {
-                        wb.upload_history(&metrics);
-                    }
+                    let scheduler_name = self.scheduler_name.clone();
+                    std::thread::spawn(move || {
+                        if let Some(wb) = WandbLogger::new(&key, "quic", &scheduler_name) {
+                            wb.upload_history(&metrics);
+                        }
+                    });
                 }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
