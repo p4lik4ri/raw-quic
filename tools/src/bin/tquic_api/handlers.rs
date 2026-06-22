@@ -373,7 +373,7 @@ pub async fn last_json_result(
                 if let Some(bits) = sample["interval_end"].as_f64().map(|v| v.to_bits()) {
                     if let Some(pl) = sender_loss_map.get(&bits) {
                         if let Some(obj) = sample.as_object_mut() {
-                            obj.insert("sender_packetLoss".to_string(), serde_json::json!(pl));
+                            obj.insert("packetLoss".to_string(), serde_json::json!(pl));
                         }
                     }
                 }
