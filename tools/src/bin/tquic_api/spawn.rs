@@ -30,11 +30,12 @@ pub fn fmt_float(v: f64) -> String {
 // ─────────────────────────────────── line parser ──────────────────────────────
 
 /// Parse a per-second interval line into a
-/// `{timestamp, throughput, jitter, packetLoss, packetLoss_lost, packetLoss_total}` sample.
+/// `{timestamp, throughput, jitter, packetLoss}` sample.
 ///
 /// Accepted formats:
 ///   Client/server sender row:  `0.00-1.00 s  59.60 MB  500.00 Mbits/sec  52051`
 ///   Client/server receiver row: `0.00-1.00 s  59.60 MB  500.00 Mbits/sec  0.009 ms  0/52106 (0%)`
+///   Client/server sender row with loss: `0.00-1.00 s  59.60 MB  500.00 Mbits/sec  0/52106 (0%)`
 ///
 /// Summary rows (last token = "sender"/"receiver") are rejected.
 pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
@@ -55,19 +56,19 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
 
     let bitrate_mbps: f64 = parts[4].parse().ok()?;
 
-    // Receiver row has jitter at [6], loss counters at [8], and percentage at [9]:
-    // `... 0.009 ms  0/52106 (0%)`
-    let (jitter_ms, loss_pct, loss_lost, loss_total) = if parts.len() >= 10 && parts[7] == "ms" {
+    // Row with jitter: `... <jitter> ms <lost>/<total> (<pct>%)`
+    // Row without jitter: `... <lost>/<total> (<pct>%)`
+    let (jitter_ms, loss_pct) = if parts.len() >= 10 && parts[7] == "ms" {
         let jitter: f64 = parts[6].parse().ok()?;
-        let (lost, total) = parts[8]
-            .split_once('/')
-            .and_then(|(l, t)| Some((l.parse::<u64>().ok()?, t.parse::<u64>().ok()?)))
-            .unwrap_or((0, 0));
         let pct_s = parts[9].trim_matches(|c: char| c == '(' || c == ')' || c == '%');
         let pct: f64   = pct_s.parse().unwrap_or(0.0);
-        (jitter, pct, lost, total)
+        (jitter, pct)
+    } else if parts.len() >= 8 && parts[6].contains('/') {
+        let pct_s = parts[7].trim_matches(|c: char| c == '(' || c == ')' || c == '%');
+        let pct: f64 = pct_s.parse().unwrap_or(0.0);
+        (0.0_f64, pct)
     } else {
-        (0.0_f64, 0.0_f64, 0_u64, 0_u64)
+        (0.0_f64, 0.0_f64)
     };
 
     // Parse the interval-end second from "N.NN-M.MM" so both client and
@@ -107,8 +108,6 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         "throughput":   bitrate_mbps,
         "jitter":       jitter_ms,
         "packetLoss":   loss_pct,
-        "packetLoss_lost":  loss_lost,
-        "packetLoss_total": loss_total,
     });
     if let Some(p) = path5g_mbps {
         sample["5G_throughput"] = serde_json::json!(p);
@@ -203,13 +202,11 @@ mod tests {
     use super::*;
 
     // Helper: extract only the deterministic fields from a parsed sample.
-    fn fields(v: &serde_json::Value) -> (f64, f64, f64, u64, u64) {
+    fn fields(v: &serde_json::Value) -> (f64, f64, f64) {
         (
             v["throughput"].as_f64().unwrap(),
             v["jitter"].as_f64().unwrap(),
             v["packetLoss"].as_f64().unwrap(),
-            v["packetLoss_lost"].as_u64().unwrap(),
-            v["packetLoss_total"].as_u64().unwrap(),
         )
     }
 
@@ -219,24 +216,20 @@ mod tests {
     fn parse_receiver_row() {
         let line = "  0.00-1.00 s    59.60 MB  500.00 Mbits/sec       0.009 ms  0/52106 (0%)";
         let v = parse_interval_line(line).expect("should parse");
-        let (tp, jitter, loss, loss_lost, loss_total) = fields(&v);
+        let (tp, jitter, loss) = fields(&v);
         assert!((tp - 500.0).abs() < 1e-6);
         assert!((jitter - 0.009).abs() < 1e-9);
         assert_eq!(loss, 0.0);
-        assert_eq!(loss_lost, 0);
-        assert_eq!(loss_total, 52106);
     }
 
     #[test]
     fn parse_receiver_row_with_loss() {
         let line = "  1.00-2.00 s   100.48 MB  803.84 Mbits/sec       0.038 ms  4266/68274 (6%)";
         let v = parse_interval_line(line).expect("should parse");
-        let (tp, jitter, loss, loss_lost, loss_total) = fields(&v);
+        let (tp, jitter, loss) = fields(&v);
         assert!((tp - 803.84).abs() < 1e-4);
         assert!((jitter - 0.038).abs() < 1e-9);
         assert_eq!(loss, 6.0);
-        assert_eq!(loss_lost, 4266);
-        assert_eq!(loss_total, 68274);
     }
 
     // ── Valid sender row (uplink): no jitter / loss columns ──────────────────
@@ -245,12 +238,20 @@ mod tests {
     fn parse_sender_row() {
         let line = "  0.00-1.00 s   113.62 MB  908.94 Mbits/sec  77252";
         let v = parse_interval_line(line).expect("should parse");
-        let (tp, jitter, loss, loss_lost, loss_total) = fields(&v);
+        let (tp, jitter, loss) = fields(&v);
         assert!((tp - 908.94).abs() < 1e-4);
         assert_eq!(jitter, 0.0);
         assert_eq!(loss,   0.0);
-        assert_eq!(loss_lost, 0);
-        assert_eq!(loss_total, 0);
+    }
+
+    #[test]
+    fn parse_sender_row_with_loss_columns() {
+        let line = "  1.00-2.00 s    4.38 MB  35.04 Mbits/sec  54/3129 (1.73%)  #path5G=7.86Mbps,pathSat=28.81Mbps";
+        let v = parse_interval_line(line).expect("should parse");
+        let (tp, jitter, loss) = fields(&v);
+        assert!((tp - 35.04).abs() < 1e-4);
+        assert_eq!(jitter, 0.0);
+        assert!((loss - 1.73).abs() < 1e-9);
     }
 
     // ── Summary rows must be rejected ────────────────────────────────────────
