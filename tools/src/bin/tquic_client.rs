@@ -1464,11 +1464,16 @@ impl TransportHandler for WorkerHandler {
                         tquic::MultipathAlgorithm::LinUCB     => "linucb",
                     };
                     let sched = sched.to_string();
+                    let (tx, rx) = std::sync::mpsc::channel::<()>();
                     std::thread::spawn(move || {
                         if let Some(wb) = WandbLogger::new(&key, "quic", &sched) {
                             wb.upload_history(&metrics);
                         }
+                        let _ = tx.send(());
                     });
+                    // Allow wandb upload a short bounded window so the process
+                    // can still terminate promptly between experiment loops.
+                    let _ = rx.recv_timeout(Duration::from_millis(1500));
                 }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());

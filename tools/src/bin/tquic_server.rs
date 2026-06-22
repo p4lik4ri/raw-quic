@@ -735,11 +735,16 @@ impl TransportHandler for ServerHandler {
             if !metrics.is_empty() && !self.is_uplink.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(key) = self.wandb_key.take() {
                     let scheduler_name = self.scheduler_name.clone();
+                    let (tx, rx) = std::sync::mpsc::channel::<()>();
                     std::thread::spawn(move || {
                         if let Some(wb) = WandbLogger::new(&key, "quic", &scheduler_name) {
                             wb.upload_history(&metrics);
                         }
+                        let _ = tx.send(());
                     });
+                    // Allow wandb upload a short bounded window so the server
+                    // remains responsive for the next loop.
+                    let _ = rx.recv_timeout(Duration::from_millis(1500));
                 }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
