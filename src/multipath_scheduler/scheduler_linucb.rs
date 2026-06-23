@@ -116,10 +116,12 @@ pub struct LinUCBScheduler {
     pending_context: Vec<Option<[f64; D]>>,
     /// Time each pending context was selected.
     pending_since: Vec<Option<Instant>>,
+    /// LinUCB exploration coefficient (alpha). Higher values increase exploration.
+    linucb_alpha: f64,
 }
 
 impl LinUCBScheduler {
-    pub fn new(_conf: &MultipathConfig) -> Self {
+    pub fn new(conf: &MultipathConfig) -> Self {
         let now = Instant::now();
         let start_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -143,6 +145,7 @@ impl LinUCBScheduler {
             prev_sent_bytes: Vec::new(),
             pending_context: Vec::new(),
             pending_since: Vec::new(),
+            linucb_alpha: conf.linucb_alpha,
         }
     }
 
@@ -203,8 +206,9 @@ impl LinUCBScheduler {
     }
 
     /// Dynamic exploration coefficient based on selections, not ACKs.
-    fn selection_alpha(selection_count: u64) -> f64 {
-        1.0_f64 / ((selection_count + 1) as f64).sqrt()
+    /// Scales the configured linucb_alpha by a decay factor 1/sqrt(n+1).
+    fn selection_alpha(&self, selection_count: u64) -> f64 {
+        self.linucb_alpha / ((selection_count + 1) as f64).sqrt()
     }
 
     /// Reward used for ACK feedback.
@@ -401,11 +405,11 @@ impl MultipathScheduler for LinUCBScheduler {
             );
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
-            // Dynamic alpha: 1/sqrt(n+1). Starts at 1.0 (heavy exploration),
+            // Dynamic alpha: linucb_alpha / sqrt(n+1). Starts high (heavy exploration),
             // decays as the arm is selected, so slow-ACKing bad paths do not
             // keep high exploration forever.
             let n = self.total_counts.get(pid).copied().unwrap_or(0);
-            let alpha = Self::selection_alpha(n);
+            let alpha = self.selection_alpha(n);
             let (est, bonus) = Self::ucb_parts(arm, x, alpha);
             let ucb = est + bonus;
             let cwnd_headroom_score = x[1];
@@ -533,7 +537,7 @@ impl MultipathScheduler for LinUCBScheduler {
                     let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
                     let pct = cnt as f64 * 100.0 / total as f64;
                     let n = self.total_counts.get(pid).copied().unwrap_or(0);
-                    let alpha = Self::selection_alpha(n);
+                    let alpha = self.selection_alpha(n);
                     let theta = if let Some(Some(arm)) = self.arms.get(pid) {
                         mat_vec(mat_inv(arm.a), arm.b)
                     } else {
@@ -758,7 +762,7 @@ impl MultipathScheduler for LinUCBScheduler {
                 let theta = mat_vec(a_inv, arm.b);
                 let est = dot(theta, x);
                 let n = self.total_counts.get(pid).copied().unwrap_or(0);
-                let alpha = Self::selection_alpha(n);
+                let alpha = self.selection_alpha(n);
                 let bonus = alpha * quadratic(a_inv, x).max(0.0).sqrt();
                 (format!("{est:+.3}"), format!("{bonus:.3} (n={n})"))
             } else {
@@ -976,8 +980,8 @@ mod tests {
         s.ack_counts.resize(1, 0);
         s.total_counts.resize(1, 99);
 
-        let high_exploration = LinUCBScheduler::selection_alpha(0);
-        let decayed_exploration = LinUCBScheduler::selection_alpha(s.total_counts[0]);
+        let high_exploration = s.selection_alpha(0);
+        let decayed_exploration = s.selection_alpha(s.total_counts[0]);
 
         assert_eq!(s.ack_counts[0], 0);
         assert!(decayed_exploration < high_exploration);
