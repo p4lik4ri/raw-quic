@@ -430,7 +430,7 @@ impl EpsilonGreedyScheduler {
         // inject uncertainty by increasing the effective learning rate.
         let old_ema = arm.last_ema_rtt_ns;
         arm.last_ema_rtt_ns = LOSS_EWMA_ALPHA * rtt_ns as f64 + (1.0 - LOSS_EWMA_ALPHA) * old_ema;
-        if arm.samples > 8 {
+        if arm.samples > 8 && old_ema > 0.0 {
             let rtt_change = (arm.last_ema_rtt_ns - old_ema) / old_ema;
             if rtt_change.abs() > RTT_JUMP_THRESHOLD {
                 // Increase learning rate temporarily by resetting samples count
@@ -621,6 +621,7 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
             let timestamp = self.metrics.start_unix_secs + elapsed_s;
             let step = self.metrics_jsonl.len() as u64;
             let total = self.window_total.max(1);
+            let epsilon = self.effective_epsilon();
 
             let mut jline = format!(
                 "{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s},\
