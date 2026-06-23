@@ -73,9 +73,6 @@ const L2_REG: f64 = 0.0001;
 /// Smoothing factor for recent loss used as a selection-time feature.
 const LOSS_EWMA_ALPHA: f64 = 0.20;
 
-/// RTT change threshold that triggers uncertainty injection.
-const RTT_JUMP_THRESHOLD: f64 = 0.30;
-
 #[derive(Clone)]
 struct ArmState {
     theta: [f64; D],
@@ -107,7 +104,6 @@ struct ArmState {
     base_rtt_ns: u128,
     loss_ewma: f64,
     loss_ewma_init: bool,
-    last_ema_rtt_ns: f64,
 }
 
 impl ArmState {
@@ -134,7 +130,6 @@ impl ArmState {
             base_rtt_ns: 0,
             loss_ewma: 0.0,
             loss_ewma_init: false,
-            last_ema_rtt_ns: 0.0,
         }
     }
 
@@ -191,10 +186,18 @@ pub struct EpsilonGreedyScheduler {
     arms: Vec<Option<ArmState>>,
     last_min_rtt_ns: u128,
     metrics: TrafficMetricsCollector,
-    window_counts: Vec<u64>,
-    window_total: u64,
-    last_log: Option<Instant>,
-    metrics_jsonl: Vec<String>,
+
+    /// Per-path selection counts accumulated between internal log snapshots.
+    selection_window_counts: Vec<u64>,
+
+    /// Total selections accumulated between internal log snapshots.
+    selection_window_total: u64,
+
+    /// Last time a selection snapshot was emitted.
+    last_internal_log: Option<Instant>,
+
+    /// Extra JSONL records used to document scheduler experiments.
+    internal_metrics_jsonl: Vec<String>,
 }
 
 impl EpsilonGreedyScheduler {
@@ -203,10 +206,10 @@ impl EpsilonGreedyScheduler {
             arms: Vec::new(),
             last_min_rtt_ns: 1,
             metrics: TrafficMetricsCollector::new(),
-            window_counts: Vec::new(),
-            window_total: 0,
-            last_log: None,
-            metrics_jsonl: Vec::new(),
+            selection_window_counts: Vec::new(),
+            selection_window_total: 0,
+            last_internal_log: None,
+            internal_metrics_jsonl: Vec::new(),
         }
     }
 
@@ -373,7 +376,6 @@ impl EpsilonGreedyScheduler {
             if arm.base_rtt_ns == 0 || rtt_ns < arm.base_rtt_ns {
                 arm.base_rtt_ns = rtt_ns;
             }
-            arm.last_ema_rtt_ns = rtt_ns as f64;
             arm.counters_initialized = true;
             return None;
         }
@@ -408,19 +410,6 @@ impl EpsilonGreedyScheduler {
         arm.window_acked_bytes = arm.window_acked_bytes.saturating_add(delta_acked_bytes);
         arm.window_lost_bytes = arm.window_lost_bytes.saturating_add(delta_lost_bytes);
         Self::update_loss_ewma(arm, delta_acked_pkts, delta_lost_pkts);
-
-        // ── RTT-jump reset ────────────────────────────────────────────────────
-        // If the EMA RTT has changed by more than 30% since the previous ACK,
-        // inject uncertainty by increasing the effective learning rate.
-        let old_ema = arm.last_ema_rtt_ns;
-        arm.last_ema_rtt_ns = LOSS_EWMA_ALPHA * rtt_ns as f64 + (1.0 - LOSS_EWMA_ALPHA) * old_ema;
-        if arm.samples > 8 && old_ema > 0.0 {
-            let rtt_change = (arm.last_ema_rtt_ns - old_ema) / old_ema;
-            if rtt_change.abs() > RTT_JUMP_THRESHOLD {
-                // Increase learning rate temporarily by resetting samples count
-                arm.samples = arm.samples.saturating_sub(10);
-            }
-        }
 
         let window_outcomes = arm.window_acked_pkts.saturating_add(arm.window_lost_pkts);
         let window_old_enough = arm
@@ -471,20 +460,167 @@ impl EpsilonGreedyScheduler {
     }
 
     fn train_stale_pending_decisions(&mut self, now: Instant) {
-        for arm in self.arms.iter_mut().filter_map(|arm| arm.as_mut()) {
-            let is_stale = arm
-                .pending_since
-                .map(|since| now.duration_since(since) > STALE_DECISION_TIMEOUT)
-                .unwrap_or(false);
-            if !is_stale {
-                continue;
-            }
+        for path_id in 0..self.arms.len() {
+            let stale_update = {
+                let Some(arm) = self.arms[path_id].as_mut() else {
+                    continue;
+                };
 
-            if let Some(x) = arm.take_pending_context() {
-                Self::update_arm(arm, x, 0.0);
+                let is_stale = arm
+                    .pending_since
+                    .map(|since| now.duration_since(since) > STALE_DECISION_TIMEOUT)
+                    .unwrap_or(false);
+                if !is_stale {
+                    continue;
+                }
+
+                let x = arm.take_pending_context();
+                if let Some(x) = x {
+                    Self::update_arm(arm, x, 0.0);
+                    arm.reset_feedback_window(now);
+                    Some(x)
+                } else {
+                    arm.reset_feedback_window(now);
+                    None
+                }
+            };
+
+            if let Some(x) = stale_update {
+                self.log_model_update(now, path_id, x, 0.0, "stale_timeout");
             }
-            arm.reset_feedback_window(now);
         }
+    }
+
+    fn log_selection_snapshot(
+        &mut self,
+        now: Instant,
+        selected_pid: usize,
+        candidates: &[Candidate],
+    ) {
+        let do_log = self
+            .last_internal_log
+            .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+            .unwrap_or(true);
+
+        if !do_log {
+            return;
+        }
+
+        let elapsed_s = now.duration_since(self.metrics.start_time).as_secs();
+        let timestamp = self.metrics.start_unix_secs + elapsed_s;
+        let step = self.internal_metrics_jsonl.len() as u64;
+        let total = self.selection_window_total.max(1);
+        let epsilon = self.effective_epsilon();
+
+        let mut jline = format!(
+            "{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s},\
+             \"epsilon_greedy/event\":\"selection_snapshot\",\
+             \"epsilon_greedy/selected_path\":{selected_pid},\
+             \"epsilon_greedy/epsilon\":{epsilon:.6}"
+        );
+
+        for c in candidates {
+            let pid = c.pid;
+            let arm = self.arms[pid].as_ref().unwrap();
+            let cnt = self.selection_window_counts.get(pid).copied().unwrap_or(0);
+            let pct = cnt as f64 * 100.0 / total as f64;
+
+            jline.push_str(&format!(
+                ",\"epsilon_greedy/path{pid}_selection_pct\":{pct:.2}\
+                 ,\"epsilon_greedy/path{pid}_prediction\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_samples\":{}\
+                 ,\"epsilon_greedy/path{pid}_selections\":{}\
+                 ,\"epsilon_greedy/path{pid}_pending\":{}\
+                 ,\"epsilon_greedy/path{pid}_loss_ewma\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_x_latency\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_x_cwnd\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_x_reliability\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_x_pacing\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_theta_latency\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_theta_cwnd\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_theta_reliability\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_theta_pacing\":{:.6}\
+                 ,\"epsilon_greedy/path{pid}_theta_bias\":{:.6}",
+                c.prediction,
+                arm.samples,
+                arm.selections,
+                arm.pending_decisions,
+                arm.loss_ewma,
+                c.x[0],
+                c.x[1],
+                c.x[2],
+                c.x[3],
+                arm.theta[0],
+                arm.theta[1],
+                arm.theta[2],
+                arm.theta[3],
+                arm.theta[4],
+            ));
+        }
+
+        jline.push('}');
+        self.internal_metrics_jsonl.push(jline);
+
+        self.last_internal_log = Some(now);
+        for c in &mut self.selection_window_counts {
+            *c = 0;
+        }
+        self.selection_window_total = 0;
+    }
+
+    fn log_model_update(
+        &mut self,
+        now: Instant,
+        path_id: usize,
+        x: [f64; D],
+        reward: f64,
+        source: &str,
+    ) {
+        let Some(arm) = self.arms[path_id].as_ref() else {
+            return;
+        };
+
+        let elapsed_s = now.duration_since(self.metrics.start_time).as_secs();
+        let timestamp = self.metrics.start_unix_secs + elapsed_s;
+        let step = self.internal_metrics_jsonl.len() as u64;
+        let epsilon = self.effective_epsilon();
+
+        self.internal_metrics_jsonl.push(format!(
+            "{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s},\
+             \"epsilon_greedy/event\":\"model_update\",\
+             \"epsilon_greedy/update_source\":\"{source}\",\
+             \"epsilon_greedy/path\":{path_id},\
+             \"epsilon_greedy/reward\":{reward:.6},\
+             \"epsilon_greedy/epsilon\":{epsilon:.6},\
+             \"epsilon_greedy/x_latency\":{:.6},\
+             \"epsilon_greedy/x_cwnd\":{:.6},\
+             \"epsilon_greedy/x_reliability\":{:.6},\
+             \"epsilon_greedy/x_pacing\":{:.6},\
+             \"epsilon_greedy/x_bias\":{:.6},\
+             \"epsilon_greedy/samples\":{},\
+             \"epsilon_greedy/selections\":{},\
+             \"epsilon_greedy/pending\":{},\
+             \"epsilon_greedy/loss_ewma\":{:.6},\
+             \"epsilon_greedy/theta_latency\":{:.6},\
+             \"epsilon_greedy/theta_cwnd\":{:.6},\
+             \"epsilon_greedy/theta_reliability\":{:.6},\
+             \"epsilon_greedy/theta_pacing\":{:.6},\
+             \"epsilon_greedy/theta_bias\":{:.6}}}",
+            x[0],
+            x[1],
+            x[2],
+            x[3],
+            x[4],
+            arm.samples,
+            arm.selections,
+            arm.pending_decisions,
+            arm.loss_ewma,
+            arm.theta[0],
+            arm.theta[1],
+            arm.theta[2],
+            arm.theta[3],
+            arm.theta[4],
+        ));
     }
 }
 
@@ -587,71 +723,14 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
         let arm = self.arms[selected.pid].as_mut().unwrap();
         arm.push_pending_context(selected.x);
 
-        // Update window counters
-        if selected.pid >= self.window_counts.len() {
-            self.window_counts.resize(selected.pid + 1, 0);
+        if selected.pid >= self.selection_window_counts.len() {
+            self.selection_window_counts.resize(selected.pid + 1, 0);
         }
-        self.window_counts[selected.pid] += 1;
-        self.window_total += 1;
+        self.selection_window_counts[selected.pid] += 1;
+        self.selection_window_total += 1;
 
-        // Log internals once per second
         let now = Instant::now();
-        let do_log = self
-            .last_log
-            .map(|t| now.duration_since(t) >= Duration::from_secs(1))
-            .unwrap_or(true);
-        if do_log {
-            let elapsed_s = now.duration_since(self.metrics.start_time).as_secs();
-            let timestamp = self.metrics.start_unix_secs + elapsed_s;
-            let step = self.metrics_jsonl.len() as u64;
-            let total = self.window_total.max(1);
-            let epsilon = self.effective_epsilon();
-
-            let mut jline = format!(
-                "{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s},\
-                 \"epsilon_greedy/epsilon\":{:.4}",
-                epsilon
-            );
-
-            for c in &candidates {
-                let arm = self.arms[c.pid].as_ref().unwrap();
-                let cnt = self.window_counts.get(c.pid).copied().unwrap_or(0);
-                let pct = cnt as f64 * 100.0 / total as f64;
-
-                jline.push_str(&format!(
-                    ",\"epsilon_greedy/path{c.pid}_prediction\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_samples\":{}\
-                     ,\"epsilon_greedy/path{c.pid}_selections\":{}\
-                     ,\"epsilon_greedy/path{c.pid}_pending\":{}\
-                     ,\"epsilon_greedy/path{c.pid}_loss_ewma\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_latency\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_cwnd\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_reliability\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_pacing\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_bias\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_pct\":{pct:.2}",
-                    c.prediction,
-                    arm.samples,
-                    arm.selections,
-                    arm.pending_decisions,
-                    arm.loss_ewma,
-                    arm.theta[0],
-                    arm.theta[1],
-                    arm.theta[2],
-                    arm.theta[3],
-                    arm.theta[4],
-                ));
-            }
-
-            jline.push('}');
-            self.metrics_jsonl.push(jline);
-
-            self.last_log = Some(now);
-            for c in &mut self.window_counts {
-                *c = 0;
-            }
-            self.window_total = 0;
-        }
+        self.log_selection_snapshot(now, selected.pid, &candidates);
 
         self.metrics.record(selected.pid, paths);
         Ok(selected.pid)
@@ -722,8 +801,12 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
         };
 
         if let Some((x, reward)) = update {
-            let arm = self.arms[path_id].as_mut().unwrap();
-            Self::update_arm(arm, x, reward);
+            {
+                let arm = self.arms[path_id].as_mut().unwrap();
+                Self::update_arm(arm, x, reward);
+            }
+
+            self.log_model_update(now, path_id, x, reward, "ack_feedback");
         }
     }
 
@@ -765,7 +848,7 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
 
     fn scheduler_metrics_jsonl(&self) -> Vec<String> {
         let mut metrics = self.metrics.metrics.clone();
-        metrics.extend(self.metrics_jsonl.clone());
+        metrics.extend(self.internal_metrics_jsonl.clone());
         metrics
     }
 }
