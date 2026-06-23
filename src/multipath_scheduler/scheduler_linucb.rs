@@ -39,28 +39,6 @@ const D: usize = 5;
 /// as failed decisions and trained once with zero reward.
 const STALE_DECISION_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Idle threshold before a path is considered stale.
-const IDLE_FORGET_THRESHOLD_SECS: f64 = 2.0;
-
-/// Forgetting factor for idle paths.
-const IDLE_FORGET_LAMBDA: f64 = 0.92;
-
-/// EMA smoothing for cwnd pressure.
-const CWND_P_EMA_ALPHA: f64 = 0.10;
-
-/// Exploration boost when path traffic share collapses.
-///
-/// If a path's traffic share falls below:
-///     FAIRNESS_MIN_SHARE_PCT
-///
-/// then its exploration bonus is multiplied by:
-///     FAIRNESS_BOOST
-///
-/// This prevents total path starvation while still allowing
-/// the scheduler to strongly prefer better paths.
-const FAIRNESS_MIN_SHARE_PCT: f64 = 5.0;
-const FAIRNESS_BOOST: f64 = 2.0;
-
 /// RTT change threshold for triggering RTT-jump reset.
 /// If RTT changes by more than 30%, we reset the model to adapt to new conditions.
 const RTT_JUMP_THRESHOLD: f64 = 0.30;
@@ -143,14 +121,8 @@ pub struct LinUCBScheduler {
     /// Time each pending context was selected.
     pending_since: Vec<Option<Instant>>,
 
-    last_contexts: Vec<Option<[f64; D]>>,
-    last_select_time: Vec<Option<Instant>>,
-    last_forget_time: Vec<Option<Instant>>,
-    ema_cwnd_pressure: Vec<Option<f64>>,
-    forget_counts: Vec<u64>,
-    last_max_pacing_bps: u64,
-
     last_window_sent: Vec<u64>,
+    last_max_pacing_bps: u64,
     /// Last EMA RTT for each path, used for RTT-jump detection.
     last_ema_rtt_ns: Vec<f64>,
     /// Last selection time for each path, used for idle forgetting.
@@ -201,14 +173,8 @@ impl LinUCBScheduler {
             pending_context: Vec::new(),
             pending_since: Vec::new(),
 
-            last_contexts: Vec::new(),
-            last_select_time: Vec::new(),
-            last_forget_time: Vec::new(),
-            ema_cwnd_pressure: Vec::new(),
-            forget_counts: Vec::new(),
-            last_max_pacing_bps: 0,
-
             last_window_sent: Vec::new(),
+            last_max_pacing_bps: 0,
             last_ema_rtt_ns: Vec::new(),
             last_selection_time: Vec::new(),
             prev_acked_count: Vec::new(),
@@ -559,13 +525,7 @@ impl MultipathScheduler for LinUCBScheduler {
             self.mark_pending_context(best_pid, *x, now);
         }
 
-        // Record the selection timestamp for quiescence on future on_select calls.
-        if best_pid >= self.last_select_time.len() {
-            self.last_select_time.resize(best_pid + 1, None);
-        }
-        self.last_select_time[best_pid] = Some(now);
-
-        // Update last selection time for the selected path
+        // Update last selection time for the selected path (used for idle forgetting)
         if best_pid >= self.last_selection_time.len() {
             self.last_selection_time.resize(best_pid + 1, None);
         }
@@ -898,9 +858,9 @@ impl MultipathScheduler for LinUCBScheduler {
         // i.e. the arm behaves as if it has only ~10 recent observations,
         // regardless of how many ACKs it has accumulated.
         self.ensure_arm(path_id);
-        if self.ack_counts[path_id] > 8 {
+        if self.ack_counts[path_id] > 8 && old_ema > 0.0 {
             let rtt_change = (self.ema_rtt_ns[path_id] - old_ema) / old_ema;
-            if rtt_change.abs() > 0.30 {
+            if rtt_change.abs() > RTT_JUMP_THRESHOLD {
                 let arm = self.arms[path_id].as_mut().unwrap();
                 for i in 0..D {
                     arm.a[i][i] += 10.0;
