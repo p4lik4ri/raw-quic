@@ -155,6 +155,12 @@ pub struct LinUCBScheduler {
     last_ema_rtt_ns: Vec<f64>,
     /// Last selection time for each path, used for idle forgetting.
     last_selection_time: Vec<Option<Instant>>,
+    /// Last observed `acked_count` per path, used to compute per-ACK delta
+    /// delivery score in `observed_reward`. Without this the cumulative
+    /// ratio saturates and the reward stops reflecting recent feedback.
+    prev_acked_count: Vec<u64>,
+    /// Last observed `sent_count` per path (paired with `prev_acked_count`).
+    prev_sent_count: Vec<u64>,
 }
 
 impl LinUCBScheduler {
@@ -205,6 +211,8 @@ impl LinUCBScheduler {
             last_window_sent: Vec::new(),
             last_ema_rtt_ns: Vec::new(),
             last_selection_time: Vec::new(),
+            prev_acked_count: Vec::new(),
+            prev_sent_count: Vec::new(),
         }
     }
 
@@ -295,20 +303,30 @@ impl LinUCBScheduler {
     }
 
     /// Dynamic exploration coefficient based on selections, not ACKs.
-    fn selection_alpha(selection_count: u64) -> f64 {
-        1.0_f64 / ((selection_count + 1) as f64).sqrt()
+    /// Decays with selection count from `alpha_init` and is clamped above by
+    /// `alpha_floor` so the exploration bonus never collapses entirely.
+    fn selection_alpha(&self, selection_count: u64) -> f64 {
+        let decayed = self.alpha_init / ((selection_count + 1) as f64).sqrt();
+        decayed.max(self.alpha_floor)
     }
 
     /// Reward used for ACK feedback.
     ///
-    /// Context features are higher-is-better. Delivery uses observed cumulative
-    /// ACK/sent packet ratio when available, falling back to relative pacing.
-    fn observed_reward(x: [f64; D], acked_count: u64, sent_count: u64) -> f64 {
+    /// Context features are higher-is-better. Delivery uses the *delta*
+    /// ACK/sent packet ratio since the previous ACK so the signal keeps
+    /// reacting to recent feedback. When no new packets were sent in the
+    /// interval we fall back to the relative pacing feature instead of the
+    /// (now stale) cumulative ratio.
+    fn observed_reward(
+        x: [f64; D],
+        delta_acked: u64,
+        delta_sent: u64,
+    ) -> f64 {
         let latency_score = x[0].clamp(0.0, 1.0);
         let cwnd_headroom_score = x[1].clamp(0.0, 1.0);
         let reliability_score = x[2].clamp(0.0, 1.0);
-        let delivery_score = if sent_count > 0 {
-            (acked_count as f64 / sent_count as f64).clamp(0.0, 1.0)
+        let delivery_score = if delta_sent > 0 {
+            (delta_acked as f64 / delta_sent as f64).clamp(0.0, 1.0)
         } else {
             x[3].clamp(0.0, 1.0)
         };
@@ -331,8 +349,14 @@ impl LinUCBScheduler {
 
     fn mark_pending_context(&mut self, path_id: usize, x: [f64; D], now: Instant) {
         self.ensure_pending_state(path_id);
-        if self.pending_context[path_id].is_none() {
-            self.pending_context[path_id] = Some(x);
+        // Always overwrite with the latest selection context so that the next
+        // ACK trains on the most recent decision basis. Previously, repeated
+        // selections of the same path before an ACK arrived would drop the
+        // newer contexts, causing many decisions to never be trained.
+        self.pending_context[path_id] = Some(x);
+        // Only refresh the pending timestamp on the first selection; otherwise
+        // a busy path could indefinitely defer the stale-decision timeout.
+        if self.pending_since[path_id].is_none() {
             self.pending_since[path_id] = Some(now);
         }
     }
@@ -498,7 +522,7 @@ impl MultipathScheduler for LinUCBScheduler {
             // decays as the arm is selected, so slow-ACKing bad paths do not
             // keep high exploration forever.
             let n = self.total_counts.get(pid).copied().unwrap_or(0);
-            let alpha = Self::selection_alpha(n);
+            let alpha = self.selection_alpha(n);
             let (est, bonus) = Self::ucb_parts(arm, x, alpha);
             let ucb = est + bonus;
             let cwnd_headroom_score = x[1];
@@ -689,7 +713,7 @@ impl MultipathScheduler for LinUCBScheduler {
                     let cnt = self.window_counts.get(pid).copied().unwrap_or(0);
                     let pct = cnt as f64 * 100.0 / total as f64;
                     let n = self.total_counts.get(pid).copied().unwrap_or(0);
-                    let alpha = Self::selection_alpha(n);
+                    let alpha = self.selection_alpha(n);
                     let theta = if let Some(Some(arm)) = self.arms.get(pid) {
                         mat_vec(mat_inv(arm.a), arm.b)
                     } else {
@@ -891,11 +915,23 @@ impl MultipathScheduler for LinUCBScheduler {
             None => return,
         };
 
-        let reward = Self::observed_reward(
-            x,
-            path.recovery.stats.acked_count,
-            path.recovery.stats.sent_count,
-        );
+        // Delta-based delivery score: compare against the previous on_ack
+        // snapshot so the signal stays responsive instead of saturating on
+        // cumulative ratios.
+        let acked_total = path.recovery.stats.acked_count;
+        let sent_total = path.recovery.stats.sent_count;
+        if path_id >= self.prev_acked_count.len() {
+            self.prev_acked_count.resize(path_id + 1, 0);
+        }
+        if path_id >= self.prev_sent_count.len() {
+            self.prev_sent_count.resize(path_id + 1, 0);
+        }
+        let delta_acked = acked_total.saturating_sub(self.prev_acked_count[path_id]);
+        let delta_sent = sent_total.saturating_sub(self.prev_sent_count[path_id]);
+        self.prev_acked_count[path_id] = acked_total;
+        self.prev_sent_count[path_id] = sent_total;
+
+        let reward = Self::observed_reward(x, delta_acked, delta_sent);
 
         let arm = self.arms[path_id].as_mut().unwrap();
         Self::update_arm(arm, x, reward);
@@ -932,7 +968,7 @@ impl MultipathScheduler for LinUCBScheduler {
                 let theta = mat_vec(a_inv, arm.b);
                 let est = dot(theta, x);
                 let n = self.total_counts.get(pid).copied().unwrap_or(0);
-                let alpha = Self::selection_alpha(n);
+                let alpha = self.selection_alpha(n);
                 let bonus = alpha * quadratic(a_inv, x).max(0.0).sqrt();
                 (format!("{est:+.3}"), format!("{bonus:.3} (n={n})"))
             } else {
@@ -1142,12 +1178,13 @@ mod tests {
         s.ack_counts.resize(1, 0);
         s.total_counts.resize(1, 99);
 
-        let high_exploration = LinUCBScheduler::selection_alpha(0);
-        let decayed_exploration = LinUCBScheduler::selection_alpha(s.total_counts[0]);
+        let high_exploration = s.selection_alpha(0);
+        let decayed_exploration = s.selection_alpha(s.total_counts[0]);
 
         assert_eq!(s.ack_counts[0], 0);
-        assert!(decayed_exploration < high_exploration);
-        assert!((decayed_exploration - 0.1).abs() < 1e-12);
+        assert!(decayed_exploration <= high_exploration);
+        // Floor (alpha_floor = 0.15) kicks in well before n=99.
+        assert!((decayed_exploration - s.alpha_floor).abs() < 1e-12);
     }
 
     #[test]
