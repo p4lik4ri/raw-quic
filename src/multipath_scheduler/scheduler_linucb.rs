@@ -127,12 +127,6 @@ pub struct LinUCBScheduler {
     last_ema_rtt_ns: Vec<f64>,
     /// Last selection time for each path, used for idle forgetting.
     last_selection_time: Vec<Option<Instant>>,
-    /// Last observed `acked_count` per path, used to compute per-ACK delta
-    /// delivery score in `observed_reward`. Without this the cumulative
-    /// ratio saturates and the reward stops reflecting recent feedback.
-    prev_acked_count: Vec<u64>,
-    /// Last observed `sent_count` per path (paired with `prev_acked_count`).
-    prev_sent_count: Vec<u64>,
 }
 
 impl LinUCBScheduler {
@@ -177,8 +171,6 @@ impl LinUCBScheduler {
             last_max_pacing_bps: 0,
             last_ema_rtt_ns: Vec::new(),
             last_selection_time: Vec::new(),
-            prev_acked_count: Vec::new(),
-            prev_sent_count: Vec::new(),
         }
     }
 
@@ -278,30 +270,27 @@ impl LinUCBScheduler {
 
     /// Reward used for ACK feedback.
     ///
-    /// Context features are higher-is-better. Delivery uses the *delta*
-    /// ACK/sent packet ratio since the previous ACK so the signal keeps
-    /// reacting to recent feedback. When no new packets were sent in the
-    /// interval we fall back to the relative pacing feature instead of the
-    /// (now stale) cumulative ratio.
-    fn observed_reward(
-        x: [f64; D],
-        delta_acked: u64,
-        delta_sent: u64,
-    ) -> f64 {
-        let latency_score = x[0].clamp(0.0, 1.0);
-        let cwnd_headroom_score = x[1].clamp(0.0, 1.0);
-        let reliability_score = x[2].clamp(0.0, 1.0);
-        let delivery_score = if delta_sent > 0 {
-            (delta_acked as f64 / delta_sent as f64).clamp(0.0, 1.0)
+    /// r = exp(-(rtt_norm - 1)) × (1 - cwnd_pressure)
+    ///
+    /// Uses only live post-selection network statistics — no context features —
+    /// eliminating the circular dependency between reward and context vector.
+    fn observed_reward(ema_rtt_ns: f64, min_rtt_ns: u128, bif: usize, cwnd: u64) -> f64 {
+        // r = exp(-(rtt_norm - 1)) * (1 - cwnd_pressure)
+        //
+        // rtt_norm = ema_rtt / min_rtt  ∈ [1, 4]
+        //   - 1.0 for the best path (same as global minimum)
+        //   - 4.0 for a path with 4× the minimum RTT
+        //
+        // Normalised so the best possible path scores 1.0:
+        //   exp(-(1 - 1)) * 1 = 1.0
+        // and a path with 4× RTT and full cwnd scores near 0.
+        let rtt_norm = (ema_rtt_ns / min_rtt_ns.max(1) as f64).clamp(1.0, 4.0);
+        let cwnd_pressure = if cwnd > 0 {
+            (bif as f64 / cwnd as f64).clamp(0.0, 1.0)
         } else {
-            x[3].clamp(0.0, 1.0)
+            1.0
         };
-
-        (0.40 * latency_score
-            + 0.30 * reliability_score
-            + 0.20 * delivery_score
-            + 0.10 * cwnd_headroom_score)
-            .clamp(0.0, 1.0)
+        ((-( rtt_norm - 1.0)).exp() * (1.0 - cwnd_pressure)).clamp(0.0, 1.0)
     }
 
     fn ensure_pending_state(&mut self, path_id: usize) {
@@ -875,23 +864,12 @@ impl MultipathScheduler for LinUCBScheduler {
             None => return,
         };
 
-        // Delta-based delivery score: compare against the previous on_ack
-        // snapshot so the signal stays responsive instead of saturating on
-        // cumulative ratios.
-        let acked_total = path.recovery.stats.acked_count;
-        let sent_total = path.recovery.stats.sent_count;
-        if path_id >= self.prev_acked_count.len() {
-            self.prev_acked_count.resize(path_id + 1, 0);
-        }
-        if path_id >= self.prev_sent_count.len() {
-            self.prev_sent_count.resize(path_id + 1, 0);
-        }
-        let delta_acked = acked_total.saturating_sub(self.prev_acked_count[path_id]);
-        let delta_sent = sent_total.saturating_sub(self.prev_sent_count[path_id]);
-        self.prev_acked_count[path_id] = acked_total;
-        self.prev_sent_count[path_id] = sent_total;
-
-        let reward = Self::observed_reward(x, delta_acked, delta_sent);
+        let reward = Self::observed_reward(
+            self.ema_rtt_ns[path_id],
+            self.last_min_rtt_ns,
+            path.recovery.bytes_in_flight,
+            path.recovery.congestion.congestion_window(),
+        );
 
         let arm = self.arms[path_id].as_mut().unwrap();
         Self::update_arm(arm, x, reward);
