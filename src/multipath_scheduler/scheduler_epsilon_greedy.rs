@@ -73,24 +73,8 @@ const L2_REG: f64 = 0.0001;
 /// Smoothing factor for recent loss used as a selection-time feature.
 const LOSS_EWMA_ALPHA: f64 = 0.20;
 
-/// Exploration boost when path traffic share collapses.
-///
-/// If a path's traffic share falls below:
-///     FAIRNESS_MIN_SHARE_PCT
-///
-/// then its exploration probability is multiplied by:
-///     FAIRNESS_BOOST
-///
-/// This prevents total path starvation while still allowing
-/// the scheduler to strongly prefer better paths.
-const FAIRNESS_MIN_SHARE_PCT: f64 = 5.0;
-const FAIRNESS_BOOST: f64 = 2.0;
-
 /// RTT change threshold that triggers uncertainty injection.
 const RTT_JUMP_THRESHOLD: f64 = 0.30;
-
-/// Uncertainty injection magnitude after RTT jump.
-const RTT_JUMP_INJECTION: f64 = 10.0;
 
 #[derive(Clone)]
 struct ArmState {
