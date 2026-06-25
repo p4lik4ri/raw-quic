@@ -538,23 +538,6 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
         let min_rtt_ns = min_rtt_ns.max(1);
         self.last_min_rtt_ns = min_rtt_ns;
 
-        // Per-second bytes sent per path for traffic_share_pct.
-        // delta_bytes_map holds actual bytes-sent delta per path this window.
-        let mut delta_bytes_map: std::collections::HashMap<usize, u64> =
-            std::collections::HashMap::new();
-        let mut total_delta_sent: u64 = 0;
-        for &(pid, .., sent_bytes, _) in &raw {
-            let prev = self.prev_sent_bytes_log.get(pid).copied().unwrap_or(sent_bytes);
-            let delta = sent_bytes.saturating_sub(prev);
-            delta_bytes_map.insert(pid, delta);
-            total_delta_sent = total_delta_sent.saturating_add(delta);
-            // Update snapshot for next window
-            if pid >= self.prev_sent_bytes_log.len() {
-                self.prev_sent_bytes_log.resize(pid + 1, 0);
-            }
-            self.prev_sent_bytes_log[pid] = sent_bytes;
-        }
-
         // Build per-path lookup maps for logging before raw is consumed.
         let mut rtt_ms_map: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
         let mut sent_map: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
@@ -641,6 +624,21 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
             let step = self.metrics_jsonl.len() as u64;
             let total = self.window_total.max(1);
             let epsilon = self.effective_epsilon();
+
+            // Bytes-based traffic share: compute delta since last log window.
+            let mut delta_bytes_map: std::collections::HashMap<usize, u64> =
+                std::collections::HashMap::new();
+            let mut total_delta_sent: u64 = 0;
+            for &(pid, .., sent_bytes, _) in &raw {
+                let prev = self.prev_sent_bytes_log.get(pid).copied().unwrap_or(sent_bytes);
+                let delta = sent_bytes.saturating_sub(prev);
+                delta_bytes_map.insert(pid, delta);
+                total_delta_sent = total_delta_sent.saturating_add(delta);
+                if pid >= self.prev_sent_bytes_log.len() {
+                    self.prev_sent_bytes_log.resize(pid + 1, 0);
+                }
+                self.prev_sent_bytes_log[pid] = sent_bytes;
+            }
 
             let mut jline = format!(
                 "{{\"_step\":{step},\"_timestamp\":{timestamp},\"t\":{elapsed_s},\
