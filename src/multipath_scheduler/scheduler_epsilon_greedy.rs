@@ -195,6 +195,7 @@ pub struct EpsilonGreedyScheduler {
     window_total: u64,
     last_log: Option<Instant>,
     metrics_jsonl: Vec<String>,
+    prev_sent_bytes_log: Vec<u64>,
 }
 
 impl EpsilonGreedyScheduler {
@@ -207,6 +208,7 @@ impl EpsilonGreedyScheduler {
             window_total: 0,
             last_log: None,
             metrics_jsonl: Vec::new(),
+            prev_sent_bytes_log: Vec::new(),
         }
     }
 
@@ -510,6 +512,9 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
             let bytes_in_flight = path.recovery.bytes_in_flight;
             let cwnd = path.recovery.congestion.congestion_window();
             let pacing_rate_bytes_per_sec = path.recovery.congestion.pacing_rate().unwrap_or(0);
+            let sent_count = path.recovery.stats.sent_count;
+            let sent_bytes = path.recovery.stats.sent_bytes;
+            let lost_count = path.recovery.stats.lost_count;
 
             min_rtt_ns = min_rtt_ns.min(rtt_ns);
             max_pacing_rate_bytes_per_sec =
@@ -520,6 +525,9 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                 bytes_in_flight,
                 cwnd,
                 pacing_rate_bytes_per_sec,
+                sent_count,
+                sent_bytes,
+                lost_count,
             ));
         }
 
@@ -530,8 +538,35 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
         let min_rtt_ns = min_rtt_ns.max(1);
         self.last_min_rtt_ns = min_rtt_ns;
 
+        // Per-second bytes sent per path for traffic_share_pct.
+        // delta_bytes_map holds actual bytes-sent delta per path this window.
+        let mut delta_bytes_map: std::collections::HashMap<usize, u64> =
+            std::collections::HashMap::new();
+        let mut total_delta_sent: u64 = 0;
+        for &(pid, .., sent_bytes, _) in &raw {
+            let prev = self.prev_sent_bytes_log.get(pid).copied().unwrap_or(sent_bytes);
+            let delta = sent_bytes.saturating_sub(prev);
+            delta_bytes_map.insert(pid, delta);
+            total_delta_sent = total_delta_sent.saturating_add(delta);
+            // Update snapshot for next window
+            if pid >= self.prev_sent_bytes_log.len() {
+                self.prev_sent_bytes_log.resize(pid + 1, 0);
+            }
+            self.prev_sent_bytes_log[pid] = sent_bytes;
+        }
+
+        // Build per-path lookup maps for logging before raw is consumed.
+        let mut rtt_ms_map: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+        let mut sent_map: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        let mut lost_map: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        for &(pid, rtt_ns, _, _, _, sent_count, _, lost_count) in &raw {
+            rtt_ms_map.insert(pid, rtt_ns as f64 / 1_000_000.0);
+            sent_map.insert(pid, sent_count);
+            lost_map.insert(pid, lost_count);
+        }
+
         let mut candidates = Vec::with_capacity(raw.len());
-        for (pid, rtt_ns, bytes_in_flight, cwnd, pacing_rate_bytes_per_sec) in raw {
+        for (pid, rtt_ns, bytes_in_flight, cwnd, pacing_rate_bytes_per_sec, ..) in raw {
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
             let x = Self::make_context(
@@ -617,9 +652,20 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                 let arm = self.arms[c.pid].as_ref().unwrap();
                 let cnt = self.window_counts.get(c.pid).copied().unwrap_or(0);
                 let pct = cnt as f64 * 100.0 / total as f64;
+                // Bytes-based traffic share
+                let delta_bytes = delta_bytes_map.get(&c.pid).copied().unwrap_or(0);
+                let traffic_share_pct = if total_delta_sent > 0 {
+                    delta_bytes as f64 * 100.0 / total_delta_sent as f64
+                } else {
+                    0.0
+                };
+                let rtt_ms = rtt_ms_map.get(&c.pid).copied().unwrap_or(0.0);
+                let sent_total = sent_map.get(&c.pid).copied().unwrap_or(0);
+                let lost_total = lost_map.get(&c.pid).copied().unwrap_or(0);
+                let prediction_log = c.prediction.max(0.0);
 
                 jline.push_str(&format!(
-                    ",\"epsilon_greedy/path{c.pid}_prediction\":{:.4}\
+                    ",\"epsilon_greedy/path{c.pid}_prediction\":{prediction_log:.4}\
                      ,\"epsilon_greedy/path{c.pid}_samples\":{}\
                      ,\"epsilon_greedy/path{c.pid}_selections\":{}\
                      ,\"epsilon_greedy/path{c.pid}_pending\":{}\
@@ -629,8 +675,14 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                      ,\"epsilon_greedy/path{c.pid}_theta_reliability\":{:.4}\
                      ,\"epsilon_greedy/path{c.pid}_theta_pacing\":{:.4}\
                      ,\"epsilon_greedy/path{c.pid}_theta_bias\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_pct\":{pct:.2}",
-                    c.prediction,
+                     ,\"epsilon_greedy/path{c.pid}_pct\":{pct:.2}\
+                     ,\"p{pid}.pct\":{pct:.2}\
+                     ,\"p{pid}.rtt_ms\":{rtt_ms:.3}\
+                     ,\"p{pid}.reward\":{prediction_log:.4}\
+                     ,\"p{pid}.explore_ratio\":{epsilon:.4}\
+                     ,\"p{pid}.traffic_share_pct\":{traffic_share_pct:.2}\
+                     ,\"p{pid}.sent\":{sent_total}\
+                     ,\"p{pid}.lost\":{lost_total}",
                     arm.samples,
                     arm.selections,
                     arm.pending_decisions,
@@ -640,6 +692,7 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                     arm.theta[2],
                     arm.theta[3],
                     arm.theta[4],
+                    pid = c.pid,
                 ));
             }
 
