@@ -719,11 +719,11 @@ impl MultipathScheduler for LinUCBScheduler {
                     let loss_rate = (1.0 - x[2]).clamp(0.0, 1.0);
                     let bw_norm = x[3].clamp(0.0, 1.0);
                     let ucb_total = reward_est + explore_bonus;
-                    let explore_ratio = if ucb_total.abs() > 1e-12 {
-                        explore_bonus / ucb_total.abs()
-                    } else {
-                        1.0
-                    };
+                    // Normalize by alpha_init so the ratio decays from 1.0 at
+                    // the start to alpha_floor/alpha_init at steady state.
+                    // This keeps the floor visible in plots rather than
+                    // collapsing near 0 when reward_est dominates ucb_total.
+                    let explore_ratio = (explore_bonus / (self.alpha_init + 1e-12)).clamp(0.0, 1.0);
                     let a_trace = if let Some(Some(arm)) = self.arms.get(pid) {
                         (0..D).map(|i| arm.a[i][i]).sum::<f64>()
                     } else {
