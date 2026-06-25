@@ -131,6 +131,12 @@ pub struct LinUCBScheduler {
     prev_acked_count: Vec<u64>,
     /// Last observed `sent_count` per path, paired with `prev_acked_count`.
     prev_sent_count: Vec<u64>,
+    /// Last observed `lost_count` per path, used for loss EWMA update.
+    prev_lost_count: Vec<u64>,
+    /// Per-path exponential moving average of recent loss rate (alpha=0.2).
+    /// Used in make_context instead of cumulative loss_rate so the reliability
+    /// feature reacts quickly to injected loss and recovery.
+    loss_ewma: Vec<f64>,
 }
 
 impl LinUCBScheduler {
@@ -177,6 +183,8 @@ impl LinUCBScheduler {
             last_selection_time: Vec::new(),
             prev_acked_count: Vec::new(),
             prev_sent_count: Vec::new(),
+            prev_lost_count: Vec::new(),
+            loss_ewma: Vec::new(),
         }
     }
 
@@ -473,17 +481,18 @@ impl MultipathScheduler for LinUCBScheduler {
             rtt_ns,
             bytes_in_flight,
             cwnd,
-            loss_rate,
+            _loss_rate,
             pacing_rate_bytes_per_sec,
             ..
         ) in &raw
         {
+            let ewma_loss = self.loss_ewma.get(pid).copied().unwrap_or(0.0);
             let x = Self::make_context(
                 rtt_ns,
                 min_rtt_ns,
                 bytes_in_flight,
                 cwnd,
-                loss_rate,
+                ewma_loss,
                 pacing_rate_bytes_per_sec,
                 max_pacing_bytes_per_sec,
             );
@@ -901,6 +910,22 @@ impl MultipathScheduler for LinUCBScheduler {
         let delta_sent = sent_total.saturating_sub(self.prev_sent_count[path_id]);
         self.prev_acked_count[path_id] = acked_total;
         self.prev_sent_count[path_id] = sent_total;
+
+        // Update per-path loss EWMA for use in make_context.
+        let lost_total = path.recovery.stats.lost_count;
+        if path_id >= self.prev_lost_count.len() {
+            self.prev_lost_count.resize(path_id + 1, 0);
+        }
+        if path_id >= self.loss_ewma.len() {
+            self.loss_ewma.resize(path_id + 1, 0.0);
+        }
+        let delta_lost = lost_total.saturating_sub(self.prev_lost_count[path_id]);
+        self.prev_lost_count[path_id] = lost_total;
+        let outcomes = delta_acked.saturating_add(delta_lost);
+        if outcomes > 0 {
+            let instant_loss = (delta_lost as f64 / outcomes as f64).clamp(0.0, 1.0);
+            self.loss_ewma[path_id] = 0.2 * instant_loss + 0.8 * self.loss_ewma[path_id];
+        }
 
         let reward = Self::observed_reward(
             delta_acked,
