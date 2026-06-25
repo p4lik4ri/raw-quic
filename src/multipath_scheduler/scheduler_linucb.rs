@@ -719,11 +719,11 @@ impl MultipathScheduler for LinUCBScheduler {
                     let loss_rate = (1.0 - x[2]).clamp(0.0, 1.0);
                     let bw_norm = x[3].clamp(0.0, 1.0);
                     let ucb_total = reward_est + explore_bonus;
-                    // Normalize by alpha_init so the ratio decays from 1.0 at
-                    // the start to alpha_floor/alpha_init at steady state.
-                    // This keeps the floor visible in plots rather than
-                    // collapsing near 0 when reward_est dominates ucb_total.
-                    let explore_ratio = (explore_bonus / (self.alpha_init + 1e-12)).clamp(0.0, 1.0);
+                    // Normalize by current alpha so explore_ratio is comparable
+                    // across runs with different alpha_init values.
+                    // Equals 1.0 when bonus == alpha (full exploration) and
+                    // decays toward alpha_floor/alpha at steady state.
+                    let explore_ratio = (explore_bonus / (alpha + 1e-12)).clamp(0.0, 1.0);
                     let a_trace = if let Some(Some(arm)) = self.arms.get(pid) {
                         (0..D).map(|i| arm.a[i][i]).sum::<f64>()
                     } else {
@@ -755,8 +755,9 @@ impl MultipathScheduler for LinUCBScheduler {
                          ,\"loss/path{pid}_lost\":{lost_total}",
                     ));
                     // LinUCB internals
+                    let reward_est_log = reward_est.max(0.0);
                     jline.push_str(&format!(
-                        ",\"linucb/path{pid}_reward\":{reward_est:.4}\
+                        ",\"linucb/path{pid}_reward\":{reward_est_log:.4}\
                          ,\"linucb/path{pid}_explore_bonus\":{explore_bonus:.4}\
                          ,\"linucb/path{pid}_samples\":{n}",
                     ));
@@ -766,7 +767,7 @@ impl MultipathScheduler for LinUCBScheduler {
                         ",\"p{pid}.pct\":{pct:.2}\
                          ,\"p{pid}.rtt_us\":{rtt_us}\
                          ,\"p{pid}.rtt_ms\":{rtt_ms:.3}\
-                         ,\"p{pid}.reward\":{reward_est:.4}\
+                         ,\"p{pid}.reward\":{reward_est_log:.4}\
                          ,\"p{pid}.bonus\":{explore_bonus:.4}\
                          ,\"p{pid}.ucb_total\":{ucb_total:.4}\
                          ,\"p{pid}.explore_ratio\":{explore_ratio:.4}\
