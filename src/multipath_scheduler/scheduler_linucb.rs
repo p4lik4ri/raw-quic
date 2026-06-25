@@ -729,6 +729,13 @@ impl MultipathScheduler for LinUCBScheduler {
                     } else {
                         0.0
                     };
+                    // Bytes-based traffic share: actual bytes sent on this path
+                    // in this window as a percentage of total bytes across all paths.
+                    let traffic_share_pct = if total_delta_sent > 0 {
+                        delta_bytes as f64 * 100.0 / total_delta_sent as f64
+                    } else {
+                        0.0
+                    };
                     // traffic / latency / throughput
                     jline.push_str(&format!(
                         ",\"traffic/path{pid}_pct\":{pct:.2}\
@@ -770,7 +777,7 @@ impl MultipathScheduler for LinUCBScheduler {
                          ,\"p{pid}.pacing_mbps\":{pacing_mbps:.3}\
                          ,\"p{pid}.delivered_mbps\":{throughput_mbps:.3}\
                          ,\"p{pid}.sent_per_sec\":0\
-                         ,\"p{pid}.traffic_share_pct\":{pct:.2}\
+                         ,\"p{pid}.traffic_share_pct\":{traffic_share_pct:.2}\
                          ,\"p{pid}.bif_kb\":{inflight_kb:.2}\
                          ,\"p{pid}.cwnd_kb\":{cwnd_kb:.2}\
                          ,\"p{pid}.sent\":{sent_total}\
