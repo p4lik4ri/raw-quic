@@ -17,6 +17,7 @@
 use core::str::FromStr;
 use std::time::Instant;
 
+use self::scheduler_epsilon_greedy::*;
 use self::scheduler_linucb::*;
 use self::scheduler_minrtt::*;
 use self::scheduler_redundant::*;
@@ -108,6 +109,9 @@ pub enum MultipathAlgorithm {
     /// utilisation, making it suitable for heterogeneous multi-path
     /// environments such as combined satellite and 5G networks.
     LinUCB,
+
+    /// Epsilon-greedy contextual bandit baseline for LinUCB comparison.
+    EpsilonGreedy,
 }
 
 impl FromStr for MultipathAlgorithm {
@@ -122,6 +126,8 @@ impl FromStr for MultipathAlgorithm {
             Ok(MultipathAlgorithm::RoundRobin)
         } else if algor.eq_ignore_ascii_case("linucb") {
             Ok(MultipathAlgorithm::LinUCB)
+        } else if algor.eq_ignore_ascii_case("epsilongreedy") || algor.eq_ignore_ascii_case("egreedy") {
+            Ok(MultipathAlgorithm::EpsilonGreedy)
         } else {
             Err(Error::InvalidConfig("unknown".into()))
         }
@@ -135,6 +141,7 @@ pub(crate) fn build_multipath_scheduler(conf: &MultipathConfig) -> Box<dyn Multi
         MultipathAlgorithm::Redundant => Box::new(RedundantScheduler::new(conf)),
         MultipathAlgorithm::RoundRobin => Box::new(RoundRobinScheduler::new(conf)),
         MultipathAlgorithm::LinUCB => Box::new(LinUCBScheduler::new(conf)),
+        MultipathAlgorithm::EpsilonGreedy => Box::new(EpsilonGreedyScheduler::new(conf)),
     }
 }
 
@@ -144,6 +151,7 @@ pub(crate) fn buffer_required(algor: MultipathAlgorithm) -> bool {
         MultipathAlgorithm::Redundant => true,
         MultipathAlgorithm::RoundRobin => false,
         MultipathAlgorithm::LinUCB => false,
+        MultipathAlgorithm::EpsilonGreedy => false,
     }
 }
 

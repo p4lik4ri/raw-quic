@@ -1414,10 +1414,11 @@ impl TransportHandler for WorkerHandler {
             if !metrics.is_empty() && self.option.mode == TransferMode::Uplink {
                 if let Some(key) = self.wandb_key.take() {
                     let sched = match self.option.multipath_algor {
-                        tquic::MultipathAlgorithm::MinRtt     => "minrtt",
-                        tquic::MultipathAlgorithm::RoundRobin => "roundrobin",
-                        tquic::MultipathAlgorithm::Redundant  => "redundant",
-                        tquic::MultipathAlgorithm::LinUCB     => "linucb",
+                        tquic::MultipathAlgorithm::MinRtt        => "minrtt",
+                        tquic::MultipathAlgorithm::RoundRobin    => "roundrobin",
+                        tquic::MultipathAlgorithm::Redundant     => "redundant",
+                        tquic::MultipathAlgorithm::LinUCB        => "linucb",
+                        tquic::MultipathAlgorithm::EpsilonGreedy => "egreedy",
                     };
                     if let Some(wb) = WandbLogger::new(&key, "quic", sched) {
                         wb.upload_history(&metrics);

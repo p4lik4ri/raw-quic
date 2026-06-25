@@ -656,10 +656,11 @@ impl ServerHandler {
                 if !key.is_empty() { Some(key) } else { None }
             },
             scheduler_name: match option.multipath_algor {
-                MultipathAlgorithm::MinRtt     => "minrtt".to_string(),
-                MultipathAlgorithm::RoundRobin => "roundrobin".to_string(),
-                MultipathAlgorithm::Redundant  => "redundant".to_string(),
-                MultipathAlgorithm::LinUCB     => "linucb".to_string(),
+                MultipathAlgorithm::MinRtt        => "minrtt".to_string(),
+                MultipathAlgorithm::RoundRobin    => "roundrobin".to_string(),
+                MultipathAlgorithm::Redundant     => "redundant".to_string(),
+                MultipathAlgorithm::LinUCB        => "linucb".to_string(),
+                MultipathAlgorithm::EpsilonGreedy => "egreedy".to_string(),
             },
         })
     }
