@@ -870,22 +870,25 @@ impl MultipathScheduler for LinUCBScheduler {
         // ── RTT-jump reset ────────────────────────────────────────────────────
         // If the EMA RTT has changed by more than 30% since the previous ACK,
         // the path quality has shifted significantly (delay added or removed).
-        // Inject uncertainty into the arm's A matrix by blending it back
-        // toward the identity, which raises the exploration bonus and forces
+        // Reset the arm's A matrix to 10I, which raises the exploration bonus
+        // by lowering the effective sample count to ~10 observations and forces
         // the model to re-learn from current observations rather than relying
         // on stale history.
         //
-        // The injection magnitude (10.0 × I) is chosen so that after a jump:
-        //   alpha_effective = 1/sqrt(n_injected) ≈ 1/sqrt(10) ≈ 0.32
-        // i.e. the arm behaves as if it has only ~10 recent observations,
-        // regardless of how many ACKs it has accumulated.
+        // With A = 10I, the effective sample size is n ≈ 10, so the
+        // exploration bonus becomes alpha_effective ≈ 1/sqrt(10) ≈ 0.32.
+        // The b vector is also reset so the model estimate remains consistent.
         self.ensure_arm(path_id);
         if self.ack_counts[path_id] > 8 && old_ema > 0.0 {
             let rtt_change = (self.ema_rtt_ns[path_id] - old_ema) / old_ema;
             if rtt_change.abs() > RTT_JUMP_THRESHOLD {
                 let arm = self.arms[path_id].as_mut().unwrap();
                 for i in 0..D {
-                    arm.a[i][i] += 10.0;
+                    for j in 0..D {
+                        arm.a[i][j] = 0.0;
+                    }
+                    arm.a[i][i] = 10.0;
+                    arm.b[i] = 0.0;
                 }
             }
         }
