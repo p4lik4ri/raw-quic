@@ -673,11 +673,9 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                      ,\"epsilon_greedy/path{c.pid}_theta_reliability\":{:.4}\
                      ,\"epsilon_greedy/path{c.pid}_theta_pacing\":{:.4}\
                      ,\"epsilon_greedy/path{c.pid}_theta_bias\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_pct\":{pct:.2}\
                      ,\"p{pid}.pct\":{pct:.2}\
                      ,\"p{pid}.rtt_ms\":{rtt_ms:.3}\
                      ,\"p{pid}.reward\":{prediction_log:.4}\
-                     ,\"p{pid}.explore_ratio\":{epsilon:.4}\
                      ,\"p{pid}.traffic_share_pct\":{traffic_share_pct:.2}\
                      ,\"p{pid}.sent\":{sent_total}\
                      ,\"p{pid}.lost\":{lost_total}",
