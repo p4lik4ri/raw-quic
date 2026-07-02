@@ -549,7 +549,7 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
         }
 
         let mut candidates = Vec::with_capacity(raw.len());
-        for (pid, rtt_ns, bytes_in_flight, cwnd, pacing_rate_bytes_per_sec, ..) in raw {
+        for &(pid, rtt_ns, bytes_in_flight, cwnd, pacing_rate_bytes_per_sec, ..) in &raw {
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
             let x = Self::make_context(
@@ -619,8 +619,7 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
             .map(|t| now.duration_since(t) >= Duration::from_secs(1))
             .unwrap_or(true);
         if do_log {
-            let elapsed_s = now.duration_since(self.metrics.start_time).as_secs();
-            let timestamp = self.metrics.start_unix_secs + elapsed_s;
+            let (elapsed_s, timestamp) = self.metrics.elapsed_and_timestamp(now);
             let step = self.metrics_jsonl.len() as u64;
             let total = self.window_total.max(1);
             let epsilon = self.effective_epsilon();
@@ -661,18 +660,19 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                 let sent_total = sent_map.get(&c.pid).copied().unwrap_or(0);
                 let lost_total = lost_map.get(&c.pid).copied().unwrap_or(0);
                 let prediction_log = c.prediction.max(0.0);
+                let pid = c.pid;
 
                 jline.push_str(&format!(
-                    ",\"epsilon_greedy/path{c.pid}_prediction\":{prediction_log:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_samples\":{}\
-                     ,\"epsilon_greedy/path{c.pid}_selections\":{}\
-                     ,\"epsilon_greedy/path{c.pid}_pending\":{}\
-                     ,\"epsilon_greedy/path{c.pid}_loss_ewma\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_latency\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_cwnd\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_reliability\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_pacing\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_bias\":{:.4}\
+                    ",\"epsilon_greedy/path{pid}_prediction\":{prediction_log:.4}\
+                     ,\"epsilon_greedy/path{pid}_samples\":{}\
+                     ,\"epsilon_greedy/path{pid}_selections\":{}\
+                     ,\"epsilon_greedy/path{pid}_pending\":{}\
+                     ,\"epsilon_greedy/path{pid}_loss_ewma\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_latency\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_cwnd\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_reliability\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_pacing\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_bias\":{:.4}\
                      ,\"p{pid}.pct\":{pct:.2}\
                      ,\"p{pid}.rtt_ms\":{rtt_ms:.3}\
                      ,\"p{pid}.reward\":{prediction_log:.4}\
@@ -688,7 +688,6 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                     arm.theta[2],
                     arm.theta[3],
                     arm.theta[4],
-                    pid = c.pid,
                 ));
             }
 

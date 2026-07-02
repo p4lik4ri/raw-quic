@@ -41,6 +41,14 @@ impl TrafficMetricsCollector {
         }
     }
 
+    /// Return (elapsed_seconds_since_start, unix_timestamp_seconds_now)
+    /// using this collector's start clock.
+    pub fn elapsed_and_timestamp(&self, now: Instant) -> (u64, u64) {
+        let elapsed_s = now.duration_since(self.start_time).as_secs();
+        let timestamp = self.start_unix_secs + elapsed_s;
+        (elapsed_s, timestamp)
+    }
+
     /// Record a path selection and emit a JSONL line once per second.
     pub fn record(&mut self, best_pid: usize, paths: &mut PathMap) {
         if best_pid >= self.window_counts.len() {
