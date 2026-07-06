@@ -48,18 +48,25 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
     if parts[1] != "s" || parts[3] != "MB" || parts[5] != "Mbits/sec" { return None; }
     if !parts[0].contains('-') { return None; }
 
-    // Skip summary lines
-    let last = *parts.last().unwrap();
-    if last == "sender" || last == "receiver" { return None; }
+    // Skip summary lines, including variants with trailing explanations such
+    // as "sender (QUIC retransmitted)" and "receiver (permanently lost)".
+    if parts.iter().any(|part| *part == "sender" || *part == "receiver") {
+        return None;
+    }
 
     let bitrate_mbps: f64 = parts[4].parse().ok()?;
 
-    // Receiver row has jitter at [6] and loss at [9]: `... 0.009 ms  0/52106 (0%)`
+    // Row with jitter: `... <jitter> ms <lost>/<total> (<pct>%)`
+    // Row without jitter: `... <lost>/<total> (<pct>%)`
     let (jitter_ms, loss_pct) = if parts.len() >= 10 && parts[7] == "ms" {
         let jitter: f64 = parts[6].parse().ok()?;
         let pct_s = parts[9].trim_matches(|c: char| c == '(' || c == ')' || c == '%');
         let pct: f64   = pct_s.parse().unwrap_or(0.0);
         (jitter, pct)
+    } else if parts.len() >= 8 && parts[6].contains('/') {
+        let pct_s = parts[7].trim_matches(|c: char| c == '(' || c == ')' || c == '%');
+        let pct: f64 = pct_s.parse().unwrap_or(0.0);
+        (0.0_f64, pct)
     } else {
         (0.0_f64, 0.0_f64)
     };
@@ -73,18 +80,41 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
 
+    // Parse optional per-path throughput suffix: #path5G=XX.XXMbps,pathSat=YY.YYMbps
+    let mut path5g_mbps: Option<f64> = None;
+    let mut pathsat_mbps: Option<f64> = None;
+    for part in &parts {
+        if let Some(rest) = part.strip_prefix("#path5G=") {
+            let mut split = rest.splitn(2, ',');
+            path5g_mbps = split.next()
+                .map(|s| s.trim_end_matches("Mbps"))
+                .and_then(|s| s.parse().ok());
+            pathsat_mbps = split.next()
+                .and_then(|s| s.strip_prefix("pathSat="))
+                .map(|s| s.trim_end_matches("Mbps"))
+                .and_then(|s| s.parse().ok());
+        }
+    }
+
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
 
-    Some(serde_json::json!({
+    let mut sample = serde_json::json!({
         "timestamp":    ts,
         "interval_end": interval_end,
         "throughput":   bitrate_mbps,
         "jitter":       jitter_ms,
         "packetLoss":   loss_pct,
-    }))
+    });
+    if let Some(p) = path5g_mbps {
+        sample["5G_throughput"] = serde_json::json!(p);
+    }
+    if let Some(p) = pathsat_mbps {
+        sample["sat_throughput"] = serde_json::json!(p);
+    }
+    Some(sample)
 }
 
 // ─────────────────────────────────── spawner ──────────────────────────────────
@@ -213,6 +243,18 @@ mod tests {
         assert_eq!(loss,   0.0);
     }
 
+    #[test]
+    fn parse_sender_row_with_path_breakdown() {
+        let line = "  1.00-2.00 s    4.38 MB  35.04 Mbits/sec  54/3129 (1.73%)  #path5G=7.86Mbps,pathSat=28.81Mbps";
+        let v = parse_interval_line(line).expect("should parse");
+        let (tp, jitter, loss) = fields(&v);
+        assert!((tp - 35.04).abs() < 1e-4);
+        assert_eq!(jitter, 0.0);
+        assert!((loss - 1.73).abs() < 1e-9);
+        assert_eq!(v["5G_throughput"], serde_json::json!(7.86));
+        assert_eq!(v["sat_throughput"], serde_json::json!(28.81));
+    }
+
     // ── Summary rows must be rejected ────────────────────────────────────────
 
     #[test]
@@ -224,6 +266,15 @@ mod tests {
     #[test]
     fn skip_summary_receiver() {
         let line = "  0.00-41.00 s   993.91 MB  193.93 Mbits/sec       0.184 ms  48003/675353 (7%)  receiver";
+        assert!(parse_interval_line(line).is_none());
+    }
+
+    #[test]
+    fn skip_summary_with_suffix() {
+        let line = "  0.00-20.00 s    76.82 MB   30.73 Mbits/sec                 35/53157 (0.0658%)  sender (QUIC retransmitted)";
+        assert!(parse_interval_line(line).is_none());
+
+        let line = "  0.00-20.00 s    76.82 MB   30.73 Mbits/sec       0.169 ms  1/53157 (0.0019%)  receiver (permanently lost)";
         assert!(parse_interval_line(line).is_none());
     }
 
