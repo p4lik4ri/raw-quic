@@ -14,6 +14,8 @@
 
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use rand::Rng;
 
@@ -191,6 +193,8 @@ pub struct EpsilonGreedyScheduler {
     arms: Vec<Option<ArmState>>,
     last_min_rtt_ns: u128,
     metrics: TrafficMetricsCollector,
+    start_time: Instant,
+    start_unix_secs: u64,
     window_counts: Vec<u64>,
     window_total: u64,
     last_log: Option<Instant>,
@@ -200,10 +204,16 @@ pub struct EpsilonGreedyScheduler {
 
 impl EpsilonGreedyScheduler {
     pub fn new(_conf: &MultipathConfig) -> Self {
+        let start_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         Self {
             arms: Vec::new(),
             last_min_rtt_ns: 1,
             metrics: TrafficMetricsCollector::new(),
+            start_time: Instant::now(),
+            start_unix_secs,
             window_counts: Vec::new(),
             window_total: 0,
             last_log: None,
@@ -549,7 +559,7 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
         }
 
         let mut candidates = Vec::with_capacity(raw.len());
-        for (pid, rtt_ns, bytes_in_flight, cwnd, pacing_rate_bytes_per_sec, ..) in raw {
+        for &(pid, rtt_ns, bytes_in_flight, cwnd, pacing_rate_bytes_per_sec, ..) in &raw {
             self.ensure_arm(pid);
             let arm = self.arms[pid].as_ref().unwrap();
             let x = Self::make_context(
@@ -619,8 +629,8 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
             .map(|t| now.duration_since(t) >= Duration::from_secs(1))
             .unwrap_or(true);
         if do_log {
-            let elapsed_s = now.duration_since(self.metrics.start_time).as_secs();
-            let timestamp = self.metrics.start_unix_secs + elapsed_s;
+            let elapsed_s = now.duration_since(self.start_time).as_secs();
+            let timestamp = self.start_unix_secs + elapsed_s;
             let step = self.metrics_jsonl.len() as u64;
             let total = self.window_total.max(1);
             let epsilon = self.effective_epsilon();
@@ -663,16 +673,16 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                 let prediction_log = c.prediction.max(0.0);
 
                 jline.push_str(&format!(
-                    ",\"epsilon_greedy/path{c.pid}_prediction\":{prediction_log:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_samples\":{}\
-                     ,\"epsilon_greedy/path{c.pid}_selections\":{}\
-                     ,\"epsilon_greedy/path{c.pid}_pending\":{}\
-                     ,\"epsilon_greedy/path{c.pid}_loss_ewma\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_latency\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_cwnd\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_reliability\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_pacing\":{:.4}\
-                     ,\"epsilon_greedy/path{c.pid}_theta_bias\":{:.4}\
+                    ",\"epsilon_greedy/path{pid}_prediction\":{prediction_log:.4}\
+                     ,\"epsilon_greedy/path{pid}_samples\":{}\
+                     ,\"epsilon_greedy/path{pid}_selections\":{}\
+                     ,\"epsilon_greedy/path{pid}_pending\":{}\
+                     ,\"epsilon_greedy/path{pid}_loss_ewma\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_latency\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_cwnd\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_reliability\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_pacing\":{:.4}\
+                     ,\"epsilon_greedy/path{pid}_theta_bias\":{:.4}\
                      ,\"p{pid}.pct\":{pct:.2}\
                      ,\"p{pid}.rtt_ms\":{rtt_ms:.3}\
                      ,\"p{pid}.reward\":{prediction_log:.4}\

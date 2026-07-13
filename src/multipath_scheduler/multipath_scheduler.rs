@@ -242,6 +242,7 @@ pub(crate) mod tests {
     }
 }
 
+mod scheduler_epsilon_greedy;
 mod scheduler_linucb;
 mod scheduler_minrtt;
 mod scheduler_redundant;
