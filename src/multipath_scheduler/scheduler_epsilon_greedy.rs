@@ -293,7 +293,7 @@ impl EpsilonGreedyScheduler {
         _lost_bytes: u64,
         window_duration: Duration,
         rtt_ns: u128,
-        path_base_rtt_ns: u128,
+        global_min_rtt_ns: u128,
         pacing_rate_bytes_per_sec: u64,
         max_pacing_rate_bytes_per_sec: u64,
         bytes_in_flight: usize,
@@ -321,11 +321,12 @@ impl EpsilonGreedyScheduler {
         };
         let goodput_score = delivery_efficiency * served_rate_score;
 
-        // Context x[0] uses global min RTT for cross-path selection. Reward
-        // uses a path-local base RTT to penalize queueing/inflation on the
-        // selected path without punishing inherently high-delay paths forever.
-        let latency_score = if rtt_ns > 0 && path_base_rtt_ns > 0 {
-            (path_base_rtt_ns as f64 / rtt_ns as f64).clamp(0.25, 1.0)
+        // Reward latency uses the global min RTT (same baseline as context
+        // x[0]) so inherently high-delay paths earn a stably lower reward.
+        // This keeps reward estimates separated and prevents exploit
+        // ping-pong between paths with similar goodput.
+        let latency_score = if rtt_ns > 0 && global_min_rtt_ns > 0 {
+            (global_min_rtt_ns as f64 / rtt_ns as f64).clamp(0.25, 1.0)
         } else {
             1.0
         };
@@ -371,6 +372,7 @@ impl EpsilonGreedyScheduler {
         acked_bytes: u64,
         lost_bytes: u64,
         rtt_ns: u128,
+        global_min_rtt_ns: u128,
         pacing_rate_bytes_per_sec: u64,
         max_pacing_rate_bytes_per_sec: u64,
         bytes_in_flight: usize,
@@ -456,7 +458,7 @@ impl EpsilonGreedyScheduler {
             arm.window_lost_bytes,
             window_duration,
             rtt_ns,
-            arm.base_rtt_ns,
+            global_min_rtt_ns,
             pacing_rate_bytes_per_sec,
             max_pacing_rate_bytes_per_sec,
             bytes_in_flight,
@@ -773,6 +775,7 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                 acked_bytes,
                 lost_bytes,
                 rtt_ns,
+                self.last_min_rtt_ns,
                 pacing_rate_bytes_per_sec,
                 max_pacing_rate_bytes_per_sec,
                 bytes_in_flight,
@@ -938,6 +941,7 @@ mod tests {
             0,
             FEEDBACK_WINDOW_OUTCOMES * 1200,
             0,
+            100,
             100,
             1_000_000,
             1_000_000,
