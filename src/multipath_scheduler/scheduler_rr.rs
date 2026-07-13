@@ -21,29 +21,25 @@ use crate::Error;
 use crate::MultipathConfig;
 use crate::Result;
 
-/// RoundRobinScheduler distributes packets equally across available paths.
+/// RoundRobinScheduler distributes traffic equally across available paths.
 ///
-/// On each selection it picks the sendable path that has been sent the fewest
-/// packets so far, breaking ties by path id. This gives a true equal split
-/// even when one path temporarily has a full congestion window.
+/// On each selection it picks the sendable path that has sent the fewest
+/// bytes so far, breaking ties by path id. This gives a closer equal split of
+/// traffic even when paths have different packet sizes or capacities.
 pub struct RoundRobinScheduler {
-    sent_counts: std::collections::HashMap<usize, u64>,
-    metrics:     TrafficMetricsCollector,
+    metrics: TrafficMetricsCollector,
 }
 
 impl RoundRobinScheduler {
     pub fn new(_conf: &MultipathConfig) -> RoundRobinScheduler {
-        RoundRobinScheduler {
-            sent_counts: std::collections::HashMap::new(),
-            metrics:     TrafficMetricsCollector::new(),
-        }
+        RoundRobinScheduler { metrics: TrafficMetricsCollector::new() }
     }
 }
 
 
 
 impl MultipathScheduler for RoundRobinScheduler {
-    /// Select the sendable path with the fewest packets sent so far.
+    /// Select the sendable path with the fewest bytes sent so far.
     fn on_select(
         &mut self,
         paths: &mut PathMap,
@@ -56,20 +52,19 @@ impl MultipathScheduler for RoundRobinScheduler {
             if !path.active() || !path.recovery.can_send() {
                 continue;
             }
-            let count = self.sent_counts.get(&pid).copied().unwrap_or(0);
+            let bytes = path.recovery.stats.sent_bytes;
             match best {
-                None => best = Some((pid, count)),
-                Some((_, best_count)) => {
-                    if count < best_count {
-                        best = Some((pid, count));
+                None => best = Some((pid, bytes)),
+                Some((best_pid, best_bytes)) => {
+                    if bytes < best_bytes || (bytes == best_bytes && pid < best_pid) {
+                        best = Some((pid, bytes));
                     }
                 }
             }
         }
 
         match best {
-            Some((pid, count)) => {
-                self.sent_counts.insert(pid, count + 1);
+            Some((pid, _bytes)) => {
                 self.metrics.record(pid, paths);
                 Ok(pid)
             }
@@ -116,6 +111,25 @@ mod tests {
 
         t.set_path_active(3, false)?;
         assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn round_robin_prefers_lower_byte_usage() -> Result<()> {
+        let mut t = MultipathTester::new()?;
+        t.add_path("127.0.0.1:443", "127.0.0.2:8443", 50)?;
+
+        {
+            let path = t.paths.get_mut(0)?;
+            path.recovery.stats.sent_bytes = 1200;
+        }
+        {
+            let path = t.paths.get_mut(1)?;
+            path.recovery.stats.sent_bytes = 600;
+        }
+
+        let mut s = RoundRobinScheduler::new(&MultipathConfig::default());
+        assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 1);
         Ok(())
     }
 
