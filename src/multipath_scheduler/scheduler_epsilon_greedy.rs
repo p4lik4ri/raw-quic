@@ -41,14 +41,14 @@ const D: usize = 5;
 
 /// Initial probability of choosing a random sendable path instead of the path
 /// with the highest predicted reward.
-const EPSILON_INITIAL: f64 = 0.20;
+const EPSILON_INITIAL: f64 = 0.10;
 
 /// Exploration floor. A small non-zero epsilon lets the scheduler keep probing
 /// path quality after the model has converged.
-const EPSILON_MIN: f64 = 0.02;
+const EPSILON_MIN: f64 = 0.01;
 
 /// Number of model updates over which epsilon decays toward EPSILON_MIN.
-const EPSILON_DECAY_UPDATES: f64 = 2_000.0;
+const EPSILON_DECAY_UPDATES: f64 = 1_000.0;
 
 /// Force each available path to receive initial selections before normal
 /// epsilon-greedy exploitation starts. This is based on selections, not ACKs,
@@ -67,7 +67,7 @@ const STALE_DECISION_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Base learning rate for the online linear update. The effective rate decays
 /// as each path accumulates model updates.
-const LEARNING_RATE: f64 = 0.05;
+const LEARNING_RATE: f64 = 0.03;
 
 /// Small L2 penalty used by the online update to keep weights bounded.
 const L2_REG: f64 = 0.0001;
@@ -76,7 +76,7 @@ const L2_REG: f64 = 0.0001;
 const LOSS_EWMA_ALPHA: f64 = 0.20;
 
 /// RTT change threshold that triggers uncertainty injection.
-const RTT_JUMP_THRESHOLD: f64 = 0.30;
+const RTT_JUMP_THRESHOLD: f64 = 0.50;
 
 #[derive(Clone)]
 struct ArmState {
