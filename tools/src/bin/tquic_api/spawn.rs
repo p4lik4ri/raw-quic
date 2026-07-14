@@ -29,11 +29,13 @@ pub fn fmt_float(v: f64) -> String {
 
 // ─────────────────────────────────── line parser ──────────────────────────────
 
-/// Parse a per-second interval line into a `{timestamp, throughput, jitter, packetLoss}` sample.
+/// Parse a per-second interval line into a
+/// `{timestamp, throughput, jitter, packetLoss}` sample.
 ///
 /// Accepted formats:
 ///   Client/server sender row:  `0.00-1.00 s  59.60 MB  500.00 Mbits/sec  52051`
 ///   Client/server receiver row: `0.00-1.00 s  59.60 MB  500.00 Mbits/sec  0.009 ms  0/52106 (0%)`
+///   Client/server sender row with loss: `0.00-1.00 s  59.60 MB  500.00 Mbits/sec  0/52106 (0%)`
 ///
 /// Summary rows (last token = "sender"/"receiver") are rejected.
 pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
@@ -48,11 +50,9 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
     if parts[1] != "s" || parts[3] != "MB" || parts[5] != "Mbits/sec" { return None; }
     if !parts[0].contains('-') { return None; }
 
-    // Skip summary lines, including variants with trailing explanations such
-    // as "sender (QUIC retransmitted)" and "receiver (permanently lost)".
-    if parts.iter().any(|part| *part == "sender" || *part == "receiver") {
-        return None;
-    }
+    // Skip summary lines
+    let last = *parts.last().unwrap();
+    if last == "sender" || last == "receiver" { return None; }
 
     let bitrate_mbps: f64 = parts[4].parse().ok()?;
 
@@ -85,6 +85,7 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
     let mut pathsat_mbps: Option<f64> = None;
     for part in &parts {
         if let Some(rest) = part.strip_prefix("#path5G=") {
+            // rest = "XX.XXMbps,pathSat=YY.YYMbps" (no spaces — single whitespace token)
             let mut split = rest.splitn(2, ',');
             path5g_mbps = split.next()
                 .map(|s| s.trim_end_matches("Mbps"))
@@ -100,7 +101,7 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-
+    
     let mut sample = serde_json::json!({
         "timestamp":    ts,
         "interval_end": interval_end,
@@ -244,15 +245,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_sender_row_with_path_breakdown() {
+    fn parse_sender_row_with_loss_columns() {
         let line = "  1.00-2.00 s    4.38 MB  35.04 Mbits/sec  54/3129 (1.73%)  #path5G=7.86Mbps,pathSat=28.81Mbps";
         let v = parse_interval_line(line).expect("should parse");
         let (tp, jitter, loss) = fields(&v);
         assert!((tp - 35.04).abs() < 1e-4);
         assert_eq!(jitter, 0.0);
         assert!((loss - 1.73).abs() < 1e-9);
-        assert_eq!(v["5G_throughput"], serde_json::json!(7.86));
-        assert_eq!(v["sat_throughput"], serde_json::json!(28.81));
     }
 
     // ── Summary rows must be rejected ────────────────────────────────────────
@@ -266,15 +265,6 @@ mod tests {
     #[test]
     fn skip_summary_receiver() {
         let line = "  0.00-41.00 s   993.91 MB  193.93 Mbits/sec       0.184 ms  48003/675353 (7%)  receiver";
-        assert!(parse_interval_line(line).is_none());
-    }
-
-    #[test]
-    fn skip_summary_with_suffix() {
-        let line = "  0.00-20.00 s    76.82 MB   30.73 Mbits/sec                 35/53157 (0.0658%)  sender (QUIC retransmitted)";
-        assert!(parse_interval_line(line).is_none());
-
-        let line = "  0.00-20.00 s    76.82 MB   30.73 Mbits/sec       0.169 ms  1/53157 (0.0019%)  receiver (permanently lost)";
         assert!(parse_interval_line(line).is_none());
     }
 

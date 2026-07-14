@@ -160,6 +160,12 @@ pub struct ClientOpt {
     #[clap(long, default_value = "MINRTT", help_heading = "Protocol")]
     pub multipath_algor: MultipathAlgorithm,
 
+    /// LinUCB exploration weight α [default: 1.0].
+    /// Higher = more exploration; lower = exploit the best-known path.
+    /// Only used when --multipath-algor=LinUCB.
+    #[clap(long, default_value = "1.0", value_name = "FLOAT", help_heading = "Protocol")]
+    pub linucb_alpha: f64,
+
     /// Set active_connection_id_limit transport parameter.
     #[clap(long, default_value = "2", value_name = "NUM", help_heading = "Protocol")]
     pub active_cid_limit: u64,
@@ -407,11 +413,9 @@ impl Client {
                 last_path0 = cur_path0;
                 last_path1 = cur_path1;
                 let path_suffix = if d_path0 + d_path1 > 0 {
-                    format!(
-                        "  #path5G={:.2}Mbps,pathSat={:.2}Mbps",
+                    format!("  #path5G={:.2}Mbps,pathSat={:.2}Mbps",
                         d_path0 as f64 * 8.0 / 1e6,
-                        d_path1 as f64 * 8.0 / 1e6
-                    )
+                        d_path1 as f64 * 8.0 / 1e6)
                 } else {
                     String::new()
                 };
@@ -842,6 +846,7 @@ impl Worker {
         config.enable_multipath(option.enable_multipath);
         config.set_multipath_algorithm(option.multipath_algor);
         config.set_active_connection_id_limit(option.active_cid_limit);
+        config.enable_dplpmtud(false);
         config.enable_encryption(!option.disable_encryption);
 
         let mut tls = TlsConfig::new_client_config(
@@ -1452,29 +1457,36 @@ impl TransportHandler for WorkerHandler {
             if !metrics.is_empty() && self.option.mode == TransferMode::Uplink {
                 if let Some(key) = self.wandb_key.take() {
                     let sched = match self.option.multipath_algor {
-                        tquic::MultipathAlgorithm::MinRtt        => "minrtt",
-                        tquic::MultipathAlgorithm::RoundRobin    => "roundrobin",
-                        tquic::MultipathAlgorithm::Redundant     => "redundant",
-                        tquic::MultipathAlgorithm::LinUCB        => "linucb",
+                        tquic::MultipathAlgorithm::MinRtt     => "minrtt",
+                        tquic::MultipathAlgorithm::RoundRobin => "roundrobin",
+                        tquic::MultipathAlgorithm::Redundant  => "redundant",
+                        tquic::MultipathAlgorithm::LinUCB     => "linucb",
                         tquic::MultipathAlgorithm::EpsilonGreedy => "egreedy",
                     };
-                    if let Some(wb) = WandbLogger::new(&key, "quic", sched) {
-                        wb.upload_history(&metrics);
-                    }
+                    let sched = sched.to_string();
+                    let (tx, rx) = std::sync::mpsc::channel::<()>();
+                    std::thread::spawn(move || {
+                        if let Some(wb) = WandbLogger::new(&key, "quic", &sched) {
+                            wb.upload_history(&metrics);
+                        }
+                        let _ = tx.send(());
+                    });
+                    // Allow wandb upload a short bounded window so the process
+                    // can still terminate promptly between experiment loops.
+                    let _ = rx.recv_timeout(Duration::from_millis(1500));
                 }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
             for (i, four_tuple) in paths.iter().enumerate() {
                 if let Ok(ps) = conn.get_path_stats(four_tuple.local, four_tuple.remote) {
                     info!(
-                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  min_rtt={} µs  srtt={} µs  latest_rtt={} µs",
+                        "  path[{}] {}→{}  recv={} B ({} pkts)  sent={} B ({} pkts)  lost={} B  srtt={} µs  latest_rtt={} µs",
                         i,
                         four_tuple.local,
                         four_tuple.remote,
                         ps.recv_bytes, ps.recv_count,
                         ps.sent_bytes, ps.sent_count,
                         ps.lost_bytes,
-                        ps.min_rtt,
                         ps.srtt,
                         ps.latest_rtt,
                     );
@@ -1700,6 +1712,19 @@ impl TransportHandler for WorkerHandler {
                         // Datagram fully written — count as one app-level datagram.
                         self.live_lost.store(conn.stats().lost_count, Ordering::Relaxed);
                         self.live_sent.fetch_add(1, Ordering::Relaxed);
+                        // Per-path byte tracking for satellite/5G breakdown.
+                        if !self.local_addresses.is_empty() {
+                            if let Ok(ps) = conn.get_path_stats(self.local_addresses[0], self.remote) {
+                                let b = ps.sent_bytes;
+                                self.live_path0_bytes.store(b, Ordering::Relaxed);
+                            }
+                            if self.local_addresses.len() > 1 {
+                                if let Ok(ps) = conn.get_path_stats(self.local_addresses[1], self.remote) {
+                                    let b = ps.sent_bytes;
+                                    self.live_path1_bytes.store(b, Ordering::Relaxed);
+                                }
+                            }
+                        }
                     }
                     Err(Error::Done) => { _ = conn.stream_want_write(stream_id, true); return; }
                     Err(e) => { error!("{} uplink stream {} write: {:?}", conn.trace_id(), stream_id, e); return; }
