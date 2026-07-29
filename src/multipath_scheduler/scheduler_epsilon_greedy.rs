@@ -575,7 +575,11 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
             .min()
             .unwrap_or(0);
 
+        let epsilon = self.effective_epsilon();
+        eprintln!("DEBUG: epsilon={:.4}, candidates={}, min_selections={}", epsilon, candidates.len(), min_selections);
+
         let selected = if min_selections < WARMUP_SELECTIONS_PER_PATH {
+            eprintln!("DEBUG: Using warmup selection");
             let under_sampled: Vec<Candidate> = candidates
                 .iter()
                 .copied()
@@ -588,8 +592,10 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                 .collect();
             under_sampled[rng.gen_range(0..under_sampled.len())]
         } else if candidates.len() > 1 && rng.gen_bool(self.effective_epsilon()) {
+            eprintln!("DEBUG: Using RANDOM exploration (epsilon={:.4})", epsilon);
             candidates[rng.gen_range(0..candidates.len())]
         } else {
+            eprintln!("DEBUG: Using GREEDY selection");
             let best_prediction = candidates
                 .iter()
                 .map(|c| c.prediction)
