@@ -39,19 +39,19 @@ const D: usize = 5;
 
 /// Initial probability of choosing a random sendable path instead of the path
 /// with the highest predicted reward.
-const EPSILON_INITIAL: f64 = 0.20;
+const EPSILON_INITIAL: f64 = 0.80;
 
 /// Exploration floor. A small non-zero epsilon lets the scheduler keep probing
 /// path quality after the model has converged.
-const EPSILON_MIN: f64 = 0.02;
+const EPSILON_MIN: f64 = 0.30;
 
 /// Number of model updates over which epsilon decays toward EPSILON_MIN.
-const EPSILON_DECAY_UPDATES: f64 = 2_000.0;
+const EPSILON_DECAY_UPDATES: f64 = 10_000.0;
 
 /// Force each available path to receive initial selections before normal
 /// epsilon-greedy exploitation starts. This is based on selections, not ACKs,
 /// so bursts before the first ACK still cover every path.
-const WARMUP_SELECTIONS_PER_PATH: u64 = 5;
+const WARMUP_SELECTIONS_PER_PATH: u64 = 0;
 
 /// Flush feedback after this many observed ACK/loss outcomes on a path.
 const FEEDBACK_WINDOW_OUTCOMES: u64 = 32;
