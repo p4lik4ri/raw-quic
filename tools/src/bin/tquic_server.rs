@@ -723,6 +723,18 @@ impl TransportHandler for ServerHandler {
             s.lost_count, s.lost_bytes,
         );
 
+        // Record actual session duration so the reporter shows real elapsed time.
+        if let Some(start) = self.session_start.take() {
+            let secs = Instant::now().duration_since(start).as_secs_f64();
+            self.actual_duration_bits.store(secs.to_bits(), Ordering::Relaxed);
+        }
+        self.conns.remove(&conn.index().unwrap());
+        // Stop the interval reporter as soon as the transfer finishes. This must
+        // happen before any further (potentially slow) logging/upload work below,
+        // so the reporter thread doesn't keep ticking with stale zero-throughput
+        // intervals while this handler is still busy.
+        self.rep_done.store(true, Ordering::Relaxed);
+
         // Per-path breakdown (multipath).
         let paths: Vec<_> = conn.paths_iter().collect();
         if paths.len() > 1 {
@@ -735,9 +747,16 @@ impl TransportHandler for ServerHandler {
             let metrics = conn.multipath_scheduler_metrics_jsonl();
             if !metrics.is_empty() && !self.is_uplink.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(key) = self.wandb_key.take() {
-                    if let Some(wb) = WandbLogger::new(&key, "quic", &self.scheduler_name) {
-                        wb.upload_history(&metrics);
-                    }
+                    let scheduler_name = self.scheduler_name.clone();
+                    // Run the wandb upload on a detached background thread: it
+                    // does blocking network I/O (up to the client's 20s HTTP
+                    // timeout) and must never stall the server's main event
+                    // loop or delay processing of other connections.
+                    thread::spawn(move || {
+                        if let Some(wb) = WandbLogger::new(&key, "quic", &scheduler_name) {
+                            wb.upload_history(&metrics);
+                        }
+                    });
                 }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
@@ -758,15 +777,6 @@ impl TransportHandler for ServerHandler {
                 }
             }
         }
-
-        // Record actual session duration so the reporter shows real elapsed time.
-        if let Some(start) = self.session_start.take() {
-            let secs = Instant::now().duration_since(start).as_secs_f64();
-            self.actual_duration_bits.store(secs.to_bits(), Ordering::Relaxed);
-        }
-        self.conns.remove(&conn.index().unwrap());
-        // Stop the interval reporter as soon as the transfer finishes.
-        self.rep_done.store(true, Ordering::Relaxed);
     }
 
     fn on_stream_created(&mut self, conn: &mut Connection, stream_id: u64) {

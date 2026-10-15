@@ -306,9 +306,15 @@ pub async fn last_json_result(
             match reqwest::get(&fetch_url).await {
                 Ok(resp) => match resp.json::<serde_json::Value>().await {
                     Ok(v) => return v["server"].as_array().cloned().unwrap_or_default(),
-                    Err(e) => log::warn!("[last_json_result] parse remote intervals: {e}"),
+                    Err(e) => {
+                        log::warn!("[last_json_result] parse remote intervals: {e}");
+                        return vec![];
+                    }
                 },
-                Err(e) => log::warn!("[last_json_result] fetch {fetch_url}: {e}"),
+                Err(e) => {
+                    log::warn!("[last_json_result] fetch {fetch_url}: {e}");
+                    return vec![];
+                }
             }
         }
         vec![]
