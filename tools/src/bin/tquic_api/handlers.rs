@@ -6,10 +6,12 @@
 //! a `ProcessStatus` snapshot including the last 1 000 lines of combined output.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::State;
 use tokio::process::Command;
+use tokio::time::{sleep, Duration};
 
 use crate::models::{ClientStartRequest, OverallStatus, ServerStartRequest};
 use crate::spawn::{fmt_float, spawn_and_capture};
@@ -99,9 +101,22 @@ pub async fn client_start(
 ) -> Json<serde_json::Value> {
     let mut proc = state.client.lock().await;
     if proc.is_running() {
-        return Json(serde_json::json!({
-            "ok": false, "error": "client already running", "pid": proc.pid
-        }));
+        // In looped experiments, callers may start the next run a bit early.
+        // Wait a short grace period for the previous run to finish so loop N+1
+        // can start without requiring explicit polling in the caller.
+        let wait_start = Instant::now();
+        let wait_deadline = wait_start + Duration::from_secs(20);
+        while proc.is_running() && Instant::now() < wait_deadline {
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        if proc.is_running() {
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": "client still running; wait for /client/status running=false before starting next loop",
+                "pid": proc.pid,
+            }));
+        }
     }
 
     let bin = state.bin_dir.join("tquic_client");
@@ -124,7 +139,9 @@ pub async fn client_start(
     if let Some(v) = req.min_congestion_window     { cmd.args(["--min-congestion-window",     &v.to_string()]); }
     if let Some(v) = req.send_udp_payload_size     { cmd.args(["--send-udp-payload-size",     &v.to_string()]); }
     if let Some(v) = req.recv_udp_payload_size     { cmd.args(["--recv-udp-payload-size",     &v.to_string()]); }
-    if let Some(v) = req.handshake_timeout         { cmd.args(["--handshake-timeout",         &v.to_string()]); }
+    // API loop runs may restart immediately; use a safer handshake timeout unless provided.
+    let effective_handshake_timeout = req.handshake_timeout.unwrap_or(30000);
+    cmd.args(["--handshake-timeout", &effective_handshake_timeout.to_string()]);
     if let Some(v) = req.idle_timeout              { cmd.args(["--idle-timeout",              &v.to_string()]); }
     if let Some(v) = req.initial_rtt               { cmd.args(["--initial-rtt",               &v.to_string()]); }
     if let Some(v) = req.pto_linear_factor         { cmd.args(["--pto-linear-factor",         &v.to_string()]); }
@@ -141,6 +158,22 @@ pub async fn client_start(
     if let Some(lf)    = &req.log_file    { cmd.args(["--log-file",    lf]); }
     if let Some(qd)    = &req.qlog_dir    { cmd.args(["--qlog-dir",    qd]); }
     for a in &req.extra_args { cmd.arg(a); }
+
+    // In downlink the server is the sender, so server-side scheduler controls
+    // path selection. Setting RoundRobin only on the client won't affect data
+    // scheduling; expose this explicitly in the start response.
+    let rr_downlink_warning = if req.enable_multipath
+        && req.mode.eq_ignore_ascii_case("downlink")
+        && req.multipath_algor.as_deref().map(|a| a.eq_ignore_ascii_case("roundrobin")).unwrap_or(false)
+    {
+        Some("downlink uses server-side scheduler; configure /server/start with enable_multipath=true and multipath_algor=RoundRobin")
+    } else {
+        None
+    };
+
+    // Guard against back-to-back loop races: give the previous run a short
+    // cool-down window so remote/server state can settle before reconnecting.
+    sleep(Duration::from_millis(750)).await;
 
     proc.output.lock().await.clear();
     // Clear local server samples for same-host setup.
@@ -173,7 +206,18 @@ pub async fn client_start(
             let pid = child.id();
             proc.child = Some(child);
             proc.pid   = pid;
-            Json(serde_json::json!({ "ok": true, "pid": pid }))
+            let mut resp = serde_json::json!({
+                "ok": true,
+                "pid": pid,
+                "effective_handshake_timeout": effective_handshake_timeout,
+                "startup_cooldown_ms": 750,
+            });
+            if let Some(w) = rr_downlink_warning {
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert("warning".to_string(), serde_json::json!(w));
+                }
+            }
+            Json(resp)
         }
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
     }
@@ -244,7 +288,7 @@ pub async fn server_intervals(
 /// Matching is done by `interval_end` (relative seconds within the test,
 /// e.g. 1.0, 2.0 …) which is clock-agnostic and works across machines.
 ///
-/// Shape: `{ "client": [ { "timestamp", "throughput", "jitter", "packetLoss" }, … ] }`
+/// Shape: `{ "client": [ { "timestamp", "total_throughput", "5G_throughput", "sat_throughput", "5G_rtt_ms", "sat_rtt_ms", "jitter", "packetLoss" }, … ] }`
 pub async fn last_json_result(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
@@ -262,9 +306,15 @@ pub async fn last_json_result(
             match reqwest::get(&fetch_url).await {
                 Ok(resp) => match resp.json::<serde_json::Value>().await {
                     Ok(v) => return v["server"].as_array().cloned().unwrap_or_default(),
-                    Err(e) => log::warn!("[last_json_result] parse remote intervals: {e}"),
+                    Err(e) => {
+                        log::warn!("[last_json_result] parse remote intervals: {e}");
+                        return vec![];
+                    }
                 },
-                Err(e) => log::warn!("[last_json_result] fetch {fetch_url}: {e}"),
+                Err(e) => {
+                    log::warn!("[last_json_result] fetch {fetch_url}: {e}");
+                    return vec![];
+                }
             }
         }
         vec![]
@@ -273,20 +323,186 @@ pub async fn last_json_result(
     let mut samples: Vec<serde_json::Value> = if uplink {
         // In uplink the server is the receiver: it has the real throughput,
         // jitter and packetLoss.  Use server intervals directly.
-        get_server_samples(&state).await
+        let mut srv = get_server_samples(&state).await;
+
+        // Merge per-path (5G/satellite) throughput and RTT from client intervals.
+        // The client tracks which bytes went on each path (via PathStats sent_bytes),
+        // stores them as 5G_throughput (path0) / sat_throughput (path1) — along with
+        // 5G_rtt_ms / sat_rtt_ms from PathStats latest_rtt — in last_client, and we match
+        // by interval_end (relative seconds) which is clock-agnostic.
+        let client_samples = state.last_client.lock().await.clone();
+        if !client_samples.is_empty() {
+            // Build a lookup: interval_end → (5G_throughput, sat_throughput, packetLoss, 5G_rtt_ms, sat_rtt_ms)
+            type PathEntry = (Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+            let mut path_map: std::collections::HashMap<u64, PathEntry> =
+                std::collections::HashMap::new();
+            for cs in &client_samples {
+                // interval_end is stored as f64; use bits as hash key for exact match.
+                let ie_bits = cs["interval_end"].as_f64().map(|v| v.to_bits());
+                let p0 = cs.get("5G_throughput").and_then(|v| v.as_f64());
+                let p1 = cs.get("sat_throughput").and_then(|v| v.as_f64());
+                let pl = cs.get("packetLoss").and_then(|v| v.as_f64());
+                let r0 = cs.get("5G_rtt_ms").and_then(|v| v.as_f64());
+                let r1 = cs.get("sat_rtt_ms").and_then(|v| v.as_f64());
+                if let Some(bits) = ie_bits {
+                    path_map.insert(bits, (p0, p1, pl, r0, r1));
+                }
+            }
+            for sample in srv.iter_mut() {
+                let ie_bits = sample["interval_end"].as_f64().map(|v| v.to_bits());
+                if let Some(bits) = ie_bits {
+                    if let Some((p0, p1, pl, r0, r1)) = path_map.get(&bits) {
+                        if let Some(obj) = sample.as_object_mut() {
+                            if let Some(v) = p0 { obj.insert("5G_throughput".to_string(), serde_json::json!(v)); }
+                            if let Some(v) = p1 { obj.insert("sat_throughput".to_string(), serde_json::json!(v)); }
+                            if let Some(v) = pl { obj.insert("packetLoss".to_string(), serde_json::json!(v)); }
+                            if let Some(v) = r0 { obj.insert("5G_rtt_ms".to_string(), serde_json::json!(v)); }
+                            if let Some(v) = r1 { obj.insert("sat_rtt_ms".to_string(), serde_json::json!(v)); }
+                        }
+                    }
+                }
+            }
+        }
+        srv
     } else {
-        // In downlink the client is the receiver.
-        state.last_client.lock().await.clone()
+        // In downlink the client is the receiver (authoritative throughput/jitter/loss).
+        // Also merge sender-side per-interval loss from server intervals.
+        let mut cli = state.last_client.lock().await.clone();
+        let srv = get_server_samples(&state).await;
+        if !cli.is_empty() && !srv.is_empty() {
+            let mut sender_loss_map: std::collections::HashMap<u64, f64> =
+                std::collections::HashMap::new();
+            for ss in &srv {
+                if let (Some(ie), Some(pl)) = (
+                    ss["interval_end"].as_f64().map(|v| v.to_bits()),
+                    ss.get("packetLoss").and_then(|v| v.as_f64()),
+                ) {
+                    sender_loss_map.insert(ie, pl);
+                }
+            }
+            for sample in cli.iter_mut() {
+                if let Some(bits) = sample["interval_end"].as_f64().map(|v| v.to_bits()) {
+                    if let Some(pl) = sender_loss_map.get(&bits) {
+                        if let Some(obj) = sample.as_object_mut() {
+                            obj.insert("packetLoss".to_string(), serde_json::json!(pl));
+                        }
+                    }
+                }
+            }
+        }
+        cli
     };
 
-    // Remove the internal interval_end key before returning.
+    // Remove the internal interval_end key before returning,
+    // and rename throughput → total_throughput.
     for sample in samples.iter_mut() {
         if let Some(obj) = sample.as_object_mut() {
             obj.remove("interval_end");
+            if let Some(t) = obj.remove("throughput") {
+                obj.insert("total_throughput".to_string(), t);
+            }
         }
     }
 
     Json(serde_json::json!({ "client": samples }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    use axum::extract::State;
+    use tokio::sync::Mutex;
+
+    use crate::state::ProcessState;
+
+    fn make_state(
+        uplink: bool,
+        client_samples: Vec<serde_json::Value>,
+        server_samples: Vec<serde_json::Value>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            server: Mutex::new(ProcessState::new()),
+            client: Mutex::new(ProcessState::new()),
+            bin_dir: PathBuf::from("."),
+            last_client: Arc::new(Mutex::new(client_samples)),
+            last_server: Arc::new(Mutex::new(server_samples)),
+            last_mode_uplink: Arc::new(AtomicBool::new(uplink)),
+            server_api_url: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    #[tokio::test]
+    async fn last_json_result_keeps_expected_downlink_fields() {
+        let state = make_state(
+            false,
+            vec![serde_json::json!({
+                "timestamp": 1.0,
+                "interval_end": 1.0,
+                "throughput": 69.84,
+                "5G_throughput": 0.0,
+                "sat_throughput": 69.84,
+                "5G_rtt_ms": 24.1,
+                "sat_rtt_ms": 598.7,
+                "jitter": 0.031,
+                "packetLoss": 0.0,
+            })],
+            vec![],
+        );
+
+        let Json(body) = last_json_result(State(state)).await;
+        let sample = &body["client"][0];
+
+        assert_eq!(sample["total_throughput"], serde_json::json!(69.84));
+        assert_eq!(sample["5G_throughput"], serde_json::json!(0.0));
+        assert_eq!(sample["sat_throughput"], serde_json::json!(69.84));
+        assert_eq!(sample["5G_rtt_ms"], serde_json::json!(24.1));
+        assert_eq!(sample["sat_rtt_ms"], serde_json::json!(598.7));
+        assert_eq!(sample["jitter"], serde_json::json!(0.031));
+        assert_eq!(sample["packetLoss"], serde_json::json!(0.0));
+        assert!(sample.get("throughput").is_none());
+        assert!(sample.get("interval_end").is_none());
+    }
+
+    #[tokio::test]
+    async fn last_json_result_merges_expected_uplink_fields() {
+        let state = make_state(
+            true,
+            vec![serde_json::json!({
+                "timestamp": 1.0,
+                "interval_end": 1.0,
+                "5G_throughput": 10.5,
+                "sat_throughput": 59.34,
+                "5G_rtt_ms": 23.45,
+                "sat_rtt_ms": 612.3,
+                "packetLoss": 0.0,
+            })],
+            vec![serde_json::json!({
+                "timestamp": 2.0,
+                "interval_end": 1.0,
+                "throughput": 69.84,
+                "jitter": 0.031,
+                "packetLoss": 1.5,
+            })],
+        );
+
+        let Json(body) = last_json_result(State(state)).await;
+        let sample = &body["client"][0];
+
+        assert_eq!(sample["total_throughput"], serde_json::json!(69.84));
+        assert_eq!(sample["5G_throughput"], serde_json::json!(10.5));
+        assert_eq!(sample["sat_throughput"], serde_json::json!(59.34));
+        assert_eq!(sample["5G_rtt_ms"], serde_json::json!(23.45));
+        assert_eq!(sample["sat_rtt_ms"], serde_json::json!(612.3));
+        assert_eq!(sample["jitter"], serde_json::json!(0.031));
+        assert_eq!(sample["packetLoss"], serde_json::json!(0.0));
+        assert!(sample.get("throughput").is_none());
+        assert!(sample.get("interval_end").is_none());
+        assert!(sample.get("5g_throughput").is_none());
+        assert!(sample.get("satellite_throughput").is_none());
+    }
 }
 
 /// Returns the client-side per-second samples from the last session as

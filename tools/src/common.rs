@@ -15,6 +15,8 @@
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 
+pub mod wandb_logger;
+
 use clap::builder::PossibleValue;
 use clap::ValueEnum;
 use env_logger::Target;

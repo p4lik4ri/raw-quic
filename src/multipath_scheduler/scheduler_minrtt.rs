@@ -15,6 +15,7 @@
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
 use crate::connection::stream::StreamMap;
+use crate::multipath_scheduler::traffic_metrics::TrafficMetricsCollector;
 use crate::multipath_scheduler::MultipathScheduler;
 use crate::Error;
 use crate::MultipathConfig;
@@ -27,11 +28,15 @@ use crate::Result;
 /// The scheduler aims to optimize throughput and achieve load balancing, making
 /// it particularly advantageous for bulk transfer applications in heterogeneous
 /// networks.
-pub struct MinRttScheduler {}
+pub struct MinRttScheduler {
+    metrics: TrafficMetricsCollector,
+}
 
 impl MinRttScheduler {
     pub fn new(_conf: &MultipathConfig) -> MinRttScheduler {
-        MinRttScheduler {}
+        MinRttScheduler {
+            metrics: TrafficMetricsCollector::new(),
+        }
     }
 }
 
@@ -51,22 +56,34 @@ impl MultipathScheduler for MinRttScheduler {
                 continue;
             }
 
-            // Select the path with the minimum srtt
+            // Select the path with the minimum effective RTT.
+            // Use min(srtt, latest_rtt) so the scheduler reacts quickly
+            // when a path's conditions improve (latest_rtt drops), rather
+            // than waiting for the slow SRTT EMA to converge.
             let srtt = path.recovery.rtt.smoothed_rtt();
+            let latest = path.recovery.rtt.latest_rtt();
+            let effective = srtt.min(latest);
             match best {
-                None => best = Some((pid, srtt)),
+                None => best = Some((pid, effective)),
                 Some((_, rtt)) => {
-                    if srtt < rtt {
-                        best = Some((pid, srtt));
+                    if effective < rtt {
+                        best = Some((pid, effective));
                     }
                 }
             }
         }
 
         match best {
-            Some((i, _)) => Ok(i),
+            Some((pid, _)) => {
+                self.metrics.record(pid, paths);
+                Ok(pid)
+            }
             None => Err(Error::Done),
         }
+    }
+
+    fn scheduler_metrics_jsonl(&self) -> Vec<String> {
+        self.metrics.metrics.clone()
     }
 }
 
@@ -79,7 +96,7 @@ mod tests {
     fn minrtt_single_available_path() -> Result<()> {
         let mut t = MultipathTester::new()?;
 
-        let mut s = MinRttScheduler {};
+        let mut s = MinRttScheduler::new(&MultipathConfig::default());
         assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 0);
         assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 0);
         Ok(())
@@ -92,7 +109,7 @@ mod tests {
         t.add_path("127.0.0.1:443", "127.0.0.3:8443", 150)?;
         t.add_path("127.0.0.1:443", "127.0.0.4:8443", 100)?;
 
-        let mut s = MinRttScheduler {};
+        let mut s = MinRttScheduler::new(&MultipathConfig::default());
         assert_eq!(s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams)?, 1);
 
         t.set_path_active(1, false)?;
@@ -106,7 +123,7 @@ mod tests {
         let mut t = MultipathTester::new()?;
         t.set_path_active(0, false)?;
 
-        let mut s = MinRttScheduler {};
+        let mut s = MinRttScheduler::new(&MultipathConfig::default());
         assert_eq!(
             s.on_select(&mut t.paths, &mut t.spaces, &mut t.streams),
             Err(Error::Done)
