@@ -1153,11 +1153,10 @@ fn main() -> Result<()> {
                     "Interval", "Transfer", "Bitrate", "Jitter", "Lost/Total Datagrams"
                 );
                 // Jitter is only meaningful for the receiver; leave blank for sender (downlink).
-                let jitter_col = if uplink {
-                    format!("{:.3} ms", jitter_ms)
-                } else {
-                    String::new()
-                };
+                let mut jitter_col = String::new();
+                if uplink {
+                    jitter_col = format!("{:.3} ms", jitter_ms);
+                }
                 println!(
                     "  {:<12}  {:>10}  {:>16}  {:>13}  {}/{} ({:.2}%)  {}",
                     format!("0.00-{:.2} s", total_secs),

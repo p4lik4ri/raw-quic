@@ -318,6 +318,10 @@ struct Client {
     live_path0_bytes: Arc<AtomicU64>,
     /// Cumulative bytes received/sent on path 1 (second local address, satellite).
     live_path1_bytes: Arc<AtomicU64>,
+    /// Latest RTT in microseconds on path 0 (first local address, 5G).
+    live_path0_rtt: Arc<AtomicU64>,
+    /// Latest RTT in microseconds on path 1 (second local address, satellite).
+    live_path1_rtt: Arc<AtomicU64>,
 }
 
 impl Client {
@@ -346,6 +350,8 @@ impl Client {
             expiry_lost: Arc::new(AtomicU64::new(0)),
             live_path0_bytes: Arc::new(AtomicU64::new(0)),
             live_path1_bytes: Arc::new(AtomicU64::new(0)),
+            live_path0_rtt: Arc::new(AtomicU64::new(0)),
+            live_path1_rtt: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -367,6 +373,8 @@ impl Client {
         let reporter_expiry_lost = Arc::clone(&self.expiry_lost);
         let reporter_path0   = Arc::clone(&self.live_path0_bytes);
         let reporter_path1   = Arc::clone(&self.live_path1_bytes);
+        let reporter_path0_rtt = Arc::clone(&self.live_path0_rtt);
+        let reporter_path1_rtt = Arc::clone(&self.live_path1_rtt);
         let reporter_mode    = self.option.mode;
         let reporter_handle = thread::spawn(move || {
             let direction = match reporter_mode {
@@ -412,10 +420,15 @@ impl Client {
                 let d_path1 = cur_path1.saturating_sub(last_path1);
                 last_path0 = cur_path0;
                 last_path1 = cur_path1;
+                // RTT is an instantaneous sample (not cumulative), so no delta needed.
+                let path0_rtt_ms = reporter_path0_rtt.load(Ordering::Relaxed) as f64 / 1e3;
+                let path1_rtt_ms = reporter_path1_rtt.load(Ordering::Relaxed) as f64 / 1e3;
                 let path_suffix = if d_path0 + d_path1 > 0 {
-                    format!("  #path5G={:.2}Mbps,pathSat={:.2}Mbps",
+                    format!("  #path5G={:.2}Mbps,pathSat={:.2}Mbps,path5Grtt={:.2}ms,pathSatrtt={:.2}ms",
                         d_path0 as f64 * 8.0 / 1e6,
-                        d_path1 as f64 * 8.0 / 1e6)
+                        d_path1 as f64 * 8.0 / 1e6,
+                        path0_rtt_ms,
+                        path1_rtt_ms)
                 } else {
                     String::new()
                 };
@@ -562,8 +575,10 @@ impl Client {
             let exp_lost   = Arc::clone(&self.expiry_lost);
             let path0      = Arc::clone(&self.live_path0_bytes);
             let path1      = Arc::clone(&self.live_path1_bytes);
+            let path0_rtt  = Arc::clone(&self.live_path0_rtt);
+            let path1_rtt  = Arc::clone(&self.live_path1_rtt);
             handles.push(thread::spawn(move || {
-                Worker::new(opt, ctx, term, live, lost, sent, jitter, srv_jitter, srv_lost, srv_sent, dur_exp, exp_time, exp_sent, exp_lost, path0, path1).unwrap().start().unwrap();
+                Worker::new(opt, ctx, term, live, lost, sent, jitter, srv_jitter, srv_lost, srv_sent, dur_exp, exp_time, exp_sent, exp_lost, path0, path1, path0_rtt, path1_rtt).unwrap().start().unwrap();
             }));
         }
         for h in handles { h.join().unwrap(); }
@@ -793,6 +808,8 @@ struct Worker {
     #[allow(dead_code)] server_sent:   Arc<AtomicU64>,
     #[allow(dead_code)] live_path0_bytes: Arc<AtomicU64>,
     #[allow(dead_code)] live_path1_bytes: Arc<AtomicU64>,
+    #[allow(dead_code)] live_path0_rtt: Arc<AtomicU64>,
+    #[allow(dead_code)] live_path1_rtt: Arc<AtomicU64>,
     /// Set when duration expires; tells WorkerHandler to FIN uplink streams.
     duration_expired: Arc<AtomicBool>,
     /// Deadline after which we close even if no server reply was received.
@@ -826,6 +843,8 @@ impl Worker {
         expiry_lost: Arc<AtomicU64>,
         live_path0_bytes: Arc<AtomicU64>,
         live_path1_bytes: Arc<AtomicU64>,
+        live_path0_rtt: Arc<AtomicU64>,
+        live_path1_rtt: Arc<AtomicU64>,
     ) -> Result<Self> {
         let mut config = Config::new()?;
         config.enable_stateless_reset(!option.disable_stateless_reset);
@@ -901,6 +920,8 @@ impl Worker {
             current_pkt_recv_us.clone(),
             live_path0_bytes.clone(),
             live_path1_bytes.clone(),
+            live_path0_rtt.clone(),
+            live_path1_rtt.clone(),
         );
 
         Ok(Worker {
@@ -931,6 +952,8 @@ impl Worker {
             current_pkt_recv_us,
             live_path0_bytes,
             live_path1_bytes,
+            live_path0_rtt,
+            live_path1_rtt,
         })
     }
 
@@ -1195,6 +1218,10 @@ struct WorkerHandler {
     live_path0_bytes: Arc<AtomicU64>,
     /// Cumulative bytes on path 1 (second local address, e.g. satellite).
     live_path1_bytes: Arc<AtomicU64>,
+    /// Latest RTT in microseconds on path 0 (first local address, e.g. 5G).
+    live_path0_rtt: Arc<AtomicU64>,
+    /// Latest RTT in microseconds on path 1 (second local address, e.g. satellite).
+    live_path1_rtt: Arc<AtomicU64>,
     /// wandb API key, consumed on the first connection that has LinUCB metrics.
     /// Keeping just the key (not a live run) avoids creating empty wandb runs
     /// for tests that don't use multipath/LinUCB.
@@ -1218,6 +1245,8 @@ impl WorkerHandler {
         current_pkt_recv_us: Arc<AtomicU64>,
         live_path0_bytes: Arc<AtomicU64>,
         live_path1_bytes: Arc<AtomicU64>,
+        live_path0_rtt: Arc<AtomicU64>,
+        live_path1_rtt: Arc<AtomicU64>,
     ) -> Self {
         Self {
             option: option.clone(),
@@ -1238,6 +1267,8 @@ impl WorkerHandler {
             current_pkt_recv_us,
             live_path0_bytes,
             live_path1_bytes,
+            live_path0_rtt,
+            live_path1_rtt,
             wandb_key: {
                 const DEFAULT_KEY: &str = "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";
                 let key = std::env::var("WANDB_API_KEY")
@@ -1585,11 +1616,13 @@ impl TransportHandler for WorkerHandler {
                         if let Ok(ps) = conn.get_path_stats(self.local_addresses[0], self.remote) {
                             let b = ps.recv_bytes;
                             self.live_path0_bytes.store(b, Ordering::Relaxed);
+                            self.live_path0_rtt.store(ps.latest_rtt, Ordering::Relaxed);
                         }
                         if self.local_addresses.len() > 1 {
                             if let Ok(ps) = conn.get_path_stats(self.local_addresses[1], self.remote) {
                                 let b = ps.recv_bytes;
                                 self.live_path1_bytes.store(b, Ordering::Relaxed);
+                                self.live_path1_rtt.store(ps.latest_rtt, Ordering::Relaxed);
                             }
                         }
                     }
@@ -1660,11 +1693,13 @@ impl TransportHandler for WorkerHandler {
                                 if let Ok(ps) = conn.get_path_stats(self.local_addresses[0], self.remote) {
                                     let b = ps.sent_bytes;
                                     self.live_path0_bytes.store(b, Ordering::Relaxed);
+                                    self.live_path0_rtt.store(ps.latest_rtt, Ordering::Relaxed);
                                 }
                                 if self.local_addresses.len() > 1 {
                                     if let Ok(ps) = conn.get_path_stats(self.local_addresses[1], self.remote) {
                                         let b = ps.sent_bytes;
                                         self.live_path1_bytes.store(b, Ordering::Relaxed);
+                                        self.live_path1_rtt.store(ps.latest_rtt, Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -1717,11 +1752,13 @@ impl TransportHandler for WorkerHandler {
                             if let Ok(ps) = conn.get_path_stats(self.local_addresses[0], self.remote) {
                                 let b = ps.sent_bytes;
                                 self.live_path0_bytes.store(b, Ordering::Relaxed);
+                                self.live_path0_rtt.store(ps.latest_rtt, Ordering::Relaxed);
                             }
                             if self.local_addresses.len() > 1 {
                                 if let Ok(ps) = conn.get_path_stats(self.local_addresses[1], self.remote) {
                                     let b = ps.sent_bytes;
                                     self.live_path1_bytes.store(b, Ordering::Relaxed);
+                                    self.live_path1_rtt.store(ps.latest_rtt, Ordering::Relaxed);
                                 }
                             }
                         }

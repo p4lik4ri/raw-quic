@@ -30,7 +30,9 @@ pub fn fmt_float(v: f64) -> String {
 // ─────────────────────────────────── line parser ──────────────────────────────
 
 /// Parse a per-second interval line into a
-/// `{timestamp, throughput, jitter, packetLoss}` sample.
+/// `{timestamp, throughput, jitter, packetLoss}` sample, plus optional
+/// per-path `{5G_throughput, sat_throughput, 5G_rtt_ms, sat_rtt_ms}` fields when
+/// the line carries the `#path5G=...` suffix.
 ///
 /// Accepted formats:
 ///   Client/server sender row:  `0.00-1.00 s  59.60 MB  500.00 Mbits/sec  52051`
@@ -80,20 +82,29 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
 
-    // Parse optional per-path throughput suffix: #path5G=XX.XXMbps,pathSat=YY.YYMbps
+    // Parse optional per-path throughput/RTT suffix:
+    //   #path5G=XX.XXMbps,pathSat=YY.YYMbps,path5Grtt=AA.AAms,pathSatrtt=BB.BBms
+    // (RTT tokens are optional for backward compatibility with older client builds.)
     let mut path5g_mbps: Option<f64> = None;
     let mut pathsat_mbps: Option<f64> = None;
+    let mut path5g_rtt_ms: Option<f64> = None;
+    let mut pathsat_rtt_ms: Option<f64> = None;
     for part in &parts {
         if let Some(rest) = part.strip_prefix("#path5G=") {
-            // rest = "XX.XXMbps,pathSat=YY.YYMbps" (no spaces — single whitespace token)
-            let mut split = rest.splitn(2, ',');
-            path5g_mbps = split.next()
+            // rest is a single whitespace-free, comma-separated token list.
+            let mut tokens = rest.split(',');
+            path5g_mbps = tokens.next()
                 .map(|s| s.trim_end_matches("Mbps"))
                 .and_then(|s| s.parse().ok());
-            pathsat_mbps = split.next()
-                .and_then(|s| s.strip_prefix("pathSat="))
-                .map(|s| s.trim_end_matches("Mbps"))
-                .and_then(|s| s.parse().ok());
+            for tok in tokens {
+                if let Some(v) = tok.strip_prefix("pathSat=") {
+                    pathsat_mbps = v.trim_end_matches("Mbps").parse().ok();
+                } else if let Some(v) = tok.strip_prefix("path5Grtt=") {
+                    path5g_rtt_ms = v.trim_end_matches("ms").parse().ok();
+                } else if let Some(v) = tok.strip_prefix("pathSatrtt=") {
+                    pathsat_rtt_ms = v.trim_end_matches("ms").parse().ok();
+                }
+            }
         }
     }
 
@@ -114,6 +125,12 @@ pub fn parse_interval_line(line: &str) -> Option<serde_json::Value> {
     }
     if let Some(p) = pathsat_mbps {
         sample["sat_throughput"] = serde_json::json!(p);
+    }
+    if let Some(r) = path5g_rtt_ms {
+        sample["5G_rtt_ms"] = serde_json::json!(r);
+    }
+    if let Some(r) = pathsat_rtt_ms {
+        sample["sat_rtt_ms"] = serde_json::json!(r);
     }
     Some(sample)
 }
@@ -252,6 +269,16 @@ mod tests {
         assert!((tp - 35.04).abs() < 1e-4);
         assert_eq!(jitter, 0.0);
         assert!((loss - 1.73).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_row_with_path_rtt_suffix() {
+        let line = "  1.00-2.00 s    4.38 MB  35.04 Mbits/sec  54/3129 (1.73%)  #path5G=7.86Mbps,pathSat=28.81Mbps,path5Grtt=23.45ms,pathSatrtt=612.30ms";
+        let v = parse_interval_line(line).expect("should parse");
+        assert!((v["5G_throughput"].as_f64().unwrap() - 7.86).abs() < 1e-4);
+        assert!((v["sat_throughput"].as_f64().unwrap() - 28.81).abs() < 1e-4);
+        assert!((v["5G_rtt_ms"].as_f64().unwrap() - 23.45).abs() < 1e-4);
+        assert!((v["sat_rtt_ms"].as_f64().unwrap() - 612.30).abs() < 1e-4);
     }
 
     // ── Summary rows must be rejected ────────────────────────────────────────
