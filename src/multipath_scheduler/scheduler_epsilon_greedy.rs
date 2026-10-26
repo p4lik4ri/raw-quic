@@ -39,19 +39,19 @@ const D: usize = 5;
 
 /// Initial probability of choosing a random sendable path instead of the path
 /// with the highest predicted reward.
-const EPSILON_INITIAL: f64 = 0.80;
+const EPSILON_INITIAL: f64 = 0.20;
 
 /// Exploration floor. A small non-zero epsilon lets the scheduler keep probing
 /// path quality after the model has converged.
-const EPSILON_MIN: f64 = 0.30;
+const EPSILON_MIN: f64 = 0.02;
 
 /// Number of model updates over which epsilon decays toward EPSILON_MIN.
-const EPSILON_DECAY_UPDATES: f64 = 10_000.0;
+const EPSILON_DECAY_UPDATES: f64 = 2_000.0;
 
 /// Force each available path to receive initial selections before normal
 /// epsilon-greedy exploitation starts. This is based on selections, not ACKs,
 /// so bursts before the first ACK still cover every path.
-const WARMUP_SELECTIONS_PER_PATH: u64 = 0;
+const WARMUP_SELECTIONS_PER_PATH: u64 = 5;
 
 /// Flush feedback after this many observed ACK/loss outcomes on a path.
 const FEEDBACK_WINDOW_OUTCOMES: u64 = 32;
@@ -575,11 +575,7 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
             .min()
             .unwrap_or(0);
 
-        let epsilon = self.effective_epsilon();
-        eprintln!("DEBUG: epsilon={:.4}, candidates={}, min_selections={}", epsilon, candidates.len(), min_selections);
-
         let selected = if min_selections < WARMUP_SELECTIONS_PER_PATH {
-            eprintln!("DEBUG: Using warmup selection");
             let under_sampled: Vec<Candidate> = candidates
                 .iter()
                 .copied()
@@ -592,10 +588,8 @@ impl MultipathScheduler for EpsilonGreedyScheduler {
                 .collect();
             under_sampled[rng.gen_range(0..under_sampled.len())]
         } else if candidates.len() > 1 && rng.gen_bool(self.effective_epsilon()) {
-            eprintln!("DEBUG: Using RANDOM exploration (epsilon={:.4})", epsilon);
             candidates[rng.gen_range(0..candidates.len())]
         } else {
-            eprintln!("DEBUG: Using GREEDY selection");
             let best_prediction = candidates
                 .iter()
                 .map(|c| c.prediction)
