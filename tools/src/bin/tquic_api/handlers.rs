@@ -288,7 +288,7 @@ pub async fn server_intervals(
 /// Matching is done by `interval_end` (relative seconds within the test,
 /// e.g. 1.0, 2.0 …) which is clock-agnostic and works across machines.
 ///
-/// Shape: `{ "client": [ { "timestamp", "total_throughput", "5G_throughput", "sat_throughput", "jitter", "packetLoss" }, … ] }`
+/// Shape: `{ "client": [ { "timestamp", "total_throughput", "5G_throughput", "sat_throughput", "5G_rtt_ms", "sat_rtt_ms", "jitter", "packetLoss" }, … ] }`
 pub async fn last_json_result(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
@@ -306,9 +306,15 @@ pub async fn last_json_result(
             match reqwest::get(&fetch_url).await {
                 Ok(resp) => match resp.json::<serde_json::Value>().await {
                     Ok(v) => return v["server"].as_array().cloned().unwrap_or_default(),
-                    Err(e) => log::warn!("[last_json_result] parse remote intervals: {e}"),
+                    Err(e) => {
+                        log::warn!("[last_json_result] parse remote intervals: {e}");
+                        return vec![];
+                    }
                 },
-                Err(e) => log::warn!("[last_json_result] fetch {fetch_url}: {e}"),
+                Err(e) => {
+                    log::warn!("[last_json_result] fetch {fetch_url}: {e}");
+                    return vec![];
+                }
             }
         }
         vec![]
@@ -319,14 +325,16 @@ pub async fn last_json_result(
         // jitter and packetLoss.  Use server intervals directly.
         let mut srv = get_server_samples(&state).await;
 
-        // Merge per-path (5G/satellite) throughput from client intervals.
+        // Merge per-path (5G/satellite) throughput and RTT from client intervals.
         // The client tracks which bytes went on each path (via PathStats sent_bytes),
-        // stores them as 5G_throughput (path0) / sat_throughput (path1) in last_client,
-        // and we match by interval_end (relative seconds) which is clock-agnostic.
+        // stores them as 5G_throughput (path0) / sat_throughput (path1) — along with
+        // 5G_rtt_ms / sat_rtt_ms from PathStats latest_rtt — in last_client, and we match
+        // by interval_end (relative seconds) which is clock-agnostic.
         let client_samples = state.last_client.lock().await.clone();
         if !client_samples.is_empty() {
-            // Build a lookup: interval_end → (5G_throughput, sat_throughput, packetLoss)
-            let mut path_map: std::collections::HashMap<u64, (Option<f64>, Option<f64>, Option<f64>)> =
+            // Build a lookup: interval_end → (5G_throughput, sat_throughput, packetLoss, 5G_rtt_ms, sat_rtt_ms)
+            type PathEntry = (Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+            let mut path_map: std::collections::HashMap<u64, PathEntry> =
                 std::collections::HashMap::new();
             for cs in &client_samples {
                 // interval_end is stored as f64; use bits as hash key for exact match.
@@ -334,18 +342,22 @@ pub async fn last_json_result(
                 let p0 = cs.get("5G_throughput").and_then(|v| v.as_f64());
                 let p1 = cs.get("sat_throughput").and_then(|v| v.as_f64());
                 let pl = cs.get("packetLoss").and_then(|v| v.as_f64());
+                let r0 = cs.get("5G_rtt_ms").and_then(|v| v.as_f64());
+                let r1 = cs.get("sat_rtt_ms").and_then(|v| v.as_f64());
                 if let Some(bits) = ie_bits {
-                    path_map.insert(bits, (p0, p1, pl));
+                    path_map.insert(bits, (p0, p1, pl, r0, r1));
                 }
             }
             for sample in srv.iter_mut() {
                 let ie_bits = sample["interval_end"].as_f64().map(|v| v.to_bits());
                 if let Some(bits) = ie_bits {
-                    if let Some((p0, p1, pl)) = path_map.get(&bits) {
+                    if let Some((p0, p1, pl, r0, r1)) = path_map.get(&bits) {
                         if let Some(obj) = sample.as_object_mut() {
                             if let Some(v) = p0 { obj.insert("5G_throughput".to_string(), serde_json::json!(v)); }
                             if let Some(v) = p1 { obj.insert("sat_throughput".to_string(), serde_json::json!(v)); }
                             if let Some(v) = pl { obj.insert("packetLoss".to_string(), serde_json::json!(v)); }
+                            if let Some(v) = r0 { obj.insert("5G_rtt_ms".to_string(), serde_json::json!(v)); }
+                            if let Some(v) = r1 { obj.insert("sat_rtt_ms".to_string(), serde_json::json!(v)); }
                         }
                     }
                 }
@@ -432,6 +444,8 @@ mod tests {
                 "throughput": 69.84,
                 "5G_throughput": 0.0,
                 "sat_throughput": 69.84,
+                "5G_rtt_ms": 24.1,
+                "sat_rtt_ms": 598.7,
                 "jitter": 0.031,
                 "packetLoss": 0.0,
             })],
@@ -444,6 +458,8 @@ mod tests {
         assert_eq!(sample["total_throughput"], serde_json::json!(69.84));
         assert_eq!(sample["5G_throughput"], serde_json::json!(0.0));
         assert_eq!(sample["sat_throughput"], serde_json::json!(69.84));
+        assert_eq!(sample["5G_rtt_ms"], serde_json::json!(24.1));
+        assert_eq!(sample["sat_rtt_ms"], serde_json::json!(598.7));
         assert_eq!(sample["jitter"], serde_json::json!(0.031));
         assert_eq!(sample["packetLoss"], serde_json::json!(0.0));
         assert!(sample.get("throughput").is_none());
@@ -459,6 +475,8 @@ mod tests {
                 "interval_end": 1.0,
                 "5G_throughput": 10.5,
                 "sat_throughput": 59.34,
+                "5G_rtt_ms": 23.45,
+                "sat_rtt_ms": 612.3,
                 "packetLoss": 0.0,
             })],
             vec![serde_json::json!({
@@ -476,6 +494,8 @@ mod tests {
         assert_eq!(sample["total_throughput"], serde_json::json!(69.84));
         assert_eq!(sample["5G_throughput"], serde_json::json!(10.5));
         assert_eq!(sample["sat_throughput"], serde_json::json!(59.34));
+        assert_eq!(sample["5G_rtt_ms"], serde_json::json!(23.45));
+        assert_eq!(sample["sat_rtt_ms"], serde_json::json!(612.3));
         assert_eq!(sample["jitter"], serde_json::json!(0.031));
         assert_eq!(sample["packetLoss"], serde_json::json!(0.0));
         assert!(sample.get("throughput").is_none());
