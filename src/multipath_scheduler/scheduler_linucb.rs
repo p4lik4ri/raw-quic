@@ -137,6 +137,8 @@ pub struct LinUCBScheduler {
     /// Used in make_context instead of cumulative loss_rate so the reliability
     /// feature reacts quickly to injected loss and recovery.
     loss_ewma: Vec<f64>,
+    /// Per-path count of RTT-jump arm resets, for wandb metrics.
+    rtt_reset_count: Vec<u64>,
 }
 
 impl LinUCBScheduler {
@@ -185,6 +187,7 @@ impl LinUCBScheduler {
             prev_sent_count: Vec::new(),
             prev_lost_count: Vec::new(),
             loss_ewma: Vec::new(),
+            rtt_reset_count: Vec::new(),
         }
     }
 
@@ -617,6 +620,8 @@ impl MultipathScheduler for LinUCBScheduler {
             //                          drops at forgetting events)
             //   p{pid}.forget_count  — cumulative count of forgetting events
             //                          (idle + RTT-jump); step-function counter
+            //   p{pid}.rtt_reset_count — cumulative RTT-jump arm restarts
+            //                          (A=I, b=0, selection count reset)
             //   p{pid}.n             — cumulative ACK count for this arm
             //   p{pid}.alpha         — current α value for this arm
             //   p{pid}.x_*           — context features (rtt_norm, cwnd_p, loss_rate, bw_norm)
@@ -772,6 +777,7 @@ impl MultipathScheduler for LinUCBScheduler {
                     ));
                     // throughput-branch schema aliases (p{pid}.*)
                     let rtt_us = (rtt_ms * 1000.0) as u64;
+                    let rtt_reset_count = self.rtt_reset_count.get(pid).copied().unwrap_or(0);
                     jline.push_str(&format!(
                         ",\"p{pid}.pct\":{pct:.2}\
                          ,\"p{pid}.rtt_us\":{rtt_us}\
@@ -782,6 +788,7 @@ impl MultipathScheduler for LinUCBScheduler {
                          ,\"p{pid}.explore_ratio\":{explore_ratio:.4}\
                          ,\"p{pid}.a_trace\":{a_trace:.3}\
                          ,\"p{pid}.forget_count\":0\
+                         ,\"p{pid}.rtt_reset_count\":{rtt_reset_count}\
                          ,\"p{pid}.n\":{n}\
                          ,\"p{pid}.alpha\":{alpha:.4}\
                          ,\"p{pid}.pacing_mbps\":{pacing_mbps:.3}\
@@ -870,14 +877,17 @@ impl MultipathScheduler for LinUCBScheduler {
         // ── RTT-jump reset ────────────────────────────────────────────────────
         // If the EMA RTT has changed by more than 30% since the previous ACK,
         // the path quality has shifted significantly (delay added or removed).
-        // Reset the arm's A matrix to 10I, which raises the exploration bonus
-        // by lowering the effective sample count to ~10 observations and forces
-        // the model to re-learn from current observations rather than relying
-        // on stale history.
+        // Restart the arm as if newly created: A = I, b = 0, and reset the
+        // per-arm selection count so the exploration coefficient alpha returns
+        // to alpha_init. This makes the UCB bonus ≈ ||x||, so the arm wins the
+        // next selection almost immediately and re-learns current conditions
+        // within a few ACKs — in either direction (degradation or recovery).
         //
-        // With A = 10I, the effective sample size is n ≈ 10, so the
-        // exploration bonus becomes alpha_effective ≈ 1/sqrt(10) ≈ 0.32.
-        // The b vector is also reset so the model estimate remains consistent.
+        // The previous version reset A to 10I while keeping b = 0 but left
+        // total_counts untouched, so alpha stayed at its floor (0.15) and the
+        // post-reset score collapsed to ~0.1 — far below any exploited
+        // incumbent — meaning the arm could never be re-selected and the path
+        // was permanently abandoned right when it recovered.
         self.ensure_arm(path_id);
         if self.ack_counts[path_id] > 8 && old_ema > 0.0 {
             let rtt_change = (self.ema_rtt_ns[path_id] - old_ema) / old_ema;
@@ -885,11 +895,27 @@ impl MultipathScheduler for LinUCBScheduler {
                 let arm = self.arms[path_id].as_mut().unwrap();
                 for i in 0..D {
                     for j in 0..D {
-                        arm.a[i][j] = 0.0;
+                        arm.a[i][j] = if i == j { 1.0 } else { 0.0 };
                     }
-                    arm.a[i][i] = 10.0;
                     arm.b[i] = 0.0;
                 }
+                if path_id < self.total_counts.len() {
+                    self.total_counts[path_id] = 0;
+                }
+                if path_id < self.window_counts.len() {
+                    self.window_counts[path_id] = 0;
+                }
+                if path_id >= self.rtt_reset_count.len() {
+                    self.rtt_reset_count.resize(path_id + 1, 0);
+                }
+                self.rtt_reset_count[path_id] += 1;
+                log::info!(
+                    "LinUCB: RTT-jump reset on path {} (rtt {:.1}ms -> {:.1}ms, change {:.0}%)",
+                    path_id,
+                    old_ema / 1e6,
+                    self.ema_rtt_ns[path_id] / 1e6,
+                    rtt_change * 100.0,
+                );
             }
         }
 
