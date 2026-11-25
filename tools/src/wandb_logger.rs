@@ -58,7 +58,7 @@ impl WandbLogger {
         wlog!("step 1/4: resolving entity ...");
         let raw = client
             .post(Self::GRAPHQL)
-            .basic_auth("api", Some(api_key))
+            .header("Authorization", format!("Bearer {api_key}"))
             .json(&json!({"query": "{viewer{entity}}"}))
             .send()
             .map_err(|e| wlog!("ERROR viewer query: {e}"))
@@ -86,7 +86,7 @@ impl WandbLogger {
 
         let raw = client
             .post(Self::GRAPHQL)
-            .basic_auth("api", Some(api_key))
+            .header("Authorization", format!("Bearer {api_key}"))
             .json(&json!({
                 "query": "mutation UpsertBucket($name:String,$project:String,$entity:String) \
                           { upsertBucket(input:{name:$name,modelName:$project,entityName:$entity}) \
