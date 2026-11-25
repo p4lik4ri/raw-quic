@@ -262,3 +262,13 @@ pub fn resolve_wandb_key() -> Option<String> {
     if !key.is_empty() { Some(key) } else { None }
 }
 
+/// Local path used to hand off downlink-mode wandb scheduler metrics from
+/// `tquic_server` to the co-located `tquic_api` process, without printing
+/// anything to the server's own console/log output. The server (which may
+/// have no outbound internet access) writes this file on every multipath
+/// connection close; `tquic_api`'s `GET /server/schedulerMetrics` reads it
+/// directly from disk (both processes run on the same host).
+pub fn wandb_metrics_relay_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("tquic-wandb-metrics.json")
+}
+

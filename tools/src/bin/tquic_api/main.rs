@@ -68,8 +68,6 @@ async fn main() {
         last_server: Arc::new(Mutex::new(Vec::new())),
         last_mode_uplink: Arc::new(AtomicBool::new(false)),
         server_api_url: Arc::new(Mutex::new(None)),
-        last_server_scheduler_metrics: Arc::new(Mutex::new(Vec::new())),
-        last_server_scheduler_name: Arc::new(Mutex::new(None)),
         last_server_metrics_uploaded: Arc::new(AtomicBool::new(false)),
     });
 

@@ -735,18 +735,20 @@ impl TransportHandler for ServerHandler {
             // In downlink mode the server is the sender, so its scheduler
             // metrics are meaningful for wandb — but this host may have no
             // outbound internet access (e.g. an isolated test network), so
-            // the server never calls wandb directly. Instead it prints the
-            // metrics JSONL to stdout with a `[wandb-metrics]` tag; the local
-            // tquic_api (reachable by the client over the test network, see
-            // GET /server/schedulerMetrics) picks these lines up and relays
-            // them to the client, which has internet access and performs the
-            // actual upload. In uplink mode the client uploads its own
-            // metrics directly instead.
+            // the server never calls wandb directly. Instead it writes the
+            // metrics to a local handoff file (no console output at all);
+            // the co-located tquic_api reads it directly from disk and
+            // serves it via GET /server/schedulerMetrics, so the client
+            // (which has internet access) can fetch and upload it. In
+            // uplink mode the client uploads its own metrics directly.
             let metrics = conn.multipath_scheduler_metrics_jsonl();
             if !metrics.is_empty() && !self.is_uplink.load(std::sync::atomic::Ordering::Relaxed) {
-                println!("[wandb-metrics-scheduler] {}", self.scheduler_name);
-                for line in &metrics {
-                    println!("[wandb-metrics] {line}");
+                let payload = serde_json::json!({
+                    "scheduler": self.scheduler_name,
+                    "metrics": metrics,
+                });
+                if let Err(e) = std::fs::write(tquic_tools::wandb_metrics_relay_path(), payload.to_string()) {
+                    error!("failed to write wandb metrics relay file: {e:?}");
                 }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());

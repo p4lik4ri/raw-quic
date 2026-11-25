@@ -67,11 +67,7 @@ pub async fn server_start(
     proc.output.lock().await.clear();
     // Parse server stdout into last_server: the server is the receiver in
     // uplink mode, so its interval rows contain real jitter values.
-    let sched_store = Some((
-        Arc::clone(&state.last_server_scheduler_metrics),
-        Arc::clone(&state.last_server_scheduler_name),
-    ));
-    match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_server)), "server", sched_store).await {
+    match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_server)), "server").await {
         Ok(child) => {
             let pid = child.id();
             proc.child = Some(child);
@@ -210,7 +206,7 @@ pub async fn client_start(
     // uploaded to wandb again via /LastJsonResult.
     state.last_server_metrics_uploaded.store(false, std::sync::atomic::Ordering::Relaxed);
     // Parse interval lines from client stdout into last_client (last session only).
-    match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_client)), "client", None).await {
+    match spawn_and_capture(cmd, Arc::clone(&proc.output), Some(Arc::clone(&state.last_client)), "client").await {
         Ok(child) => {
             let pid = child.id();
             proc.child = Some(child);
@@ -274,8 +270,9 @@ pub async fn server_clear(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     state.last_server.lock().await.clear();
-    state.last_server_scheduler_metrics.lock().await.clear();
-    *state.last_server_scheduler_name.lock().await = None;
+    // Remove any stale wandb metrics relay file from a previous session so
+    // GET /server/schedulerMetrics doesn't serve data from a prior test.
+    let _ = std::fs::remove_file(tquic_tools::wandb_metrics_relay_path());
     Json(serde_json::json!({ "ok": true }))
 }
 
@@ -292,16 +289,25 @@ pub async fn server_intervals(
 /// `GET /server/schedulerMetrics` — wandb scheduler-metrics JSONL lines
 /// relayed from the last downlink session (server is the sender, so its
 /// multipath scheduler metrics are the meaningful ones to upload). The server
-/// prints these to stdout instead of uploading them directly, since it may
-/// have no outbound internet access; a client that does have internet access
-/// fetches this endpoint and performs the actual wandb upload.
-/// Cleared at the start of each new `/client/start` or `/server/clear` call.
+/// writes these to a local handoff file instead of uploading them directly or
+/// printing them to its own console, since it may have no outbound internet
+/// access; this endpoint reads that file directly off disk (both processes
+/// run on the same host) so a client with internet access can fetch and
+/// upload it. Cleared/removed at the start of each new `/client/start` or
+/// `/server/clear` call.
 pub async fn server_scheduler_metrics(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let metrics   = state.last_server_scheduler_metrics.lock().await.clone();
-    let scheduler = state.last_server_scheduler_name.lock().await.clone();
-    Json(serde_json::json!({ "metrics": metrics, "scheduler": scheduler }))
+    match std::fs::read_to_string(tquic_tools::wandb_metrics_relay_path()) {
+        Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+            Ok(v)  => Json(v),
+            Err(e) => {
+                log::warn!("[server_scheduler_metrics] parse relay file: {e}");
+                Json(serde_json::json!({ "metrics": [], "scheduler": null }))
+            }
+        },
+        Err(_) => Json(serde_json::json!({ "metrics": [], "scheduler": null })),
+    }
 }
 
 /// `GET /LastJsonResult` — per-second samples for the last session.
@@ -440,6 +446,7 @@ pub async fn last_json_result(
         let url_opt = state.server_api_url.lock().await.clone();
         if let Some(base_url) = url_opt {
             let fetch_url = format!("{base_url}/server/schedulerMetrics");
+            log::info!("[last_json_result] fetching downlink scheduler metrics from {fetch_url}");
             match reqwest::get(&fetch_url).await {
                 Ok(resp) => match resp.json::<serde_json::Value>().await {
                     Ok(v) => {
@@ -447,15 +454,23 @@ pub async fn last_json_result(
                             .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
                             .unwrap_or_default();
                         let scheduler = v["scheduler"].as_str().unwrap_or("unknown").to_string();
-                        if !metrics.is_empty() {
+                        if metrics.is_empty() {
+                            log::info!("[last_json_result] no downlink scheduler metrics available yet (server hasn't closed the connection?)");
+                        } else {
                             state.last_server_metrics_uploaded.store(true, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(key) = resolve_wandb_key() {
-                                // WandbLogger does blocking HTTP I/O; run it off the async runtime.
-                                tokio::task::spawn_blocking(move || {
-                                    if let Some(wb) = WandbLogger::new(&key, "quic", &scheduler) {
-                                        wb.upload_history(&metrics);
-                                    }
-                                });
+                            match resolve_wandb_key() {
+                                Some(key) => {
+                                    log::info!("[last_json_result] uploading {} downlink scheduler={scheduler} steps to wandb", metrics.len());
+                                    // WandbLogger does blocking HTTP I/O; run it off the async runtime.
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Some(wb) = WandbLogger::new(&key, "quic", &scheduler) {
+                                            wb.upload_history(&metrics);
+                                        } else {
+                                            log::warn!("[last_json_result] WandbLogger::new failed; see [wandb] logs above");
+                                        }
+                                    });
+                                }
+                                None => log::warn!("[last_json_result] no wandb API key resolved; skipping upload"),
                             }
                         }
                     }
@@ -493,8 +508,6 @@ mod tests {
             last_server: Arc::new(Mutex::new(server_samples)),
             last_mode_uplink: Arc::new(AtomicBool::new(uplink)),
             server_api_url: Arc::new(Mutex::new(None)),
-            last_server_scheduler_metrics: Arc::new(Mutex::new(Vec::new())),
-            last_server_scheduler_name: Arc::new(Mutex::new(None)),
             last_server_metrics_uploaded: Arc::new(AtomicBool::new(true)),
         })
     }
