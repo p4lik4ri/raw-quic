@@ -252,3 +252,13 @@ pub fn log_target(log_file: &Option<String>) -> Result<Target> {
 
     Ok(Target::Stderr)
 }
+
+/// Resolve the wandb API key to use for metrics upload: `WANDB_API_KEY` from
+/// the environment, falling back to a default key if unset. Returns `None`
+/// only if the resolved key is empty (disabling wandb upload entirely).
+pub fn resolve_wandb_key() -> Option<String> {
+    const DEFAULT_KEY: &str = "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";
+    let key = std::env::var("WANDB_API_KEY").unwrap_or_else(|_| DEFAULT_KEY.to_string());
+    if !key.is_empty() { Some(key) } else { None }
+}
+

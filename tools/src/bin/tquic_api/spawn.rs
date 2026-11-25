@@ -4,8 +4,10 @@
 //! and stderr into a shared ring buffer (`OUTPUT_CAP` lines), and optionally
 //! parses every per-second interval line with `parse_interval_line` to build
 //! live throughput / jitter / packet-loss samples for the `/LastJsonResult`
-//! endpoint.  `fmt_float` provides Python-compatible float formatting used when
-//! serialising those samples.
+//! endpoint. It can also relay `[wandb-metrics]`/`[wandb-metrics-scheduler]`
+//! tagged stdout lines (printed by a server with no internet access) into a
+//! dedicated store for `GET /server/schedulerMetrics`. `fmt_float` provides
+//! Python-compatible float formatting used when serialising those samples.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -147,6 +149,7 @@ pub async fn spawn_and_capture(
     output_buf:   Arc<Mutex<VecDeque<String>>>,
     result_store: Option<Arc<Mutex<Vec<serde_json::Value>>>>,
     source:       &'static str,
+    scheduler_metrics_store: Option<(Arc<Mutex<Vec<String>>>, Arc<Mutex<Option<String>>>)>,
 ) -> std::io::Result<Child> {
     use std::process::Stdio;
     cmd.stdout(Stdio::piped());
@@ -168,6 +171,10 @@ pub async fn spawn_and_capture(
     if let Some(ref store) = result_store {
         store.lock().await.clear();
     }
+    if let Some((ref metrics, ref name)) = scheduler_metrics_store {
+        metrics.lock().await.clear();
+        *name.lock().await = None;
+    }
 
     let mut child = cmd.spawn()?;
     log::info!("[{source}] started pid={:?}", child.id());
@@ -176,6 +183,7 @@ pub async fn spawn_and_capture(
     if let Some(stdout) = child.stdout.take() {
         let buf = Arc::clone(&output_buf);
         let res = result_store.clone();
+        let sched = scheduler_metrics_store.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -184,6 +192,16 @@ pub async fn spawn_and_capture(
                     if let Some(sample) = parse_interval_line(&line) {
                         log::debug!("[{source}] parsed sample: {sample}");
                         store.lock().await.push(sample);
+                    }
+                }
+                // Relay wandb scheduler metrics printed by the server (which
+                // may have no outbound internet access) so the client can
+                // fetch and upload them instead. See GET /server/schedulerMetrics.
+                if let Some((ref metrics, ref name)) = sched {
+                    if let Some(jline) = line.strip_prefix("[wandb-metrics] ") {
+                        metrics.lock().await.push(jline.to_string());
+                    } else if let Some(n) = line.strip_prefix("[wandb-metrics-scheduler] ") {
+                        *name.lock().await = Some(n.to_string());
                     }
                 }
                 let mut lock = buf.lock().await;

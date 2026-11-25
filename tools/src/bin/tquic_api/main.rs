@@ -9,6 +9,7 @@
 //!  POST /server/start            start tquic_server
 //!  POST /server/stop             kill running tquic_server
 //!  GET  /server/status           pid, running flag, last 1000 log lines
+//!  GET  /server/schedulerMetrics wandb scheduler-metrics JSONL relayed from server stdout
 //!  GET  /server/LastJsonResult   last session samples, Python-style plain text
 //!
 //!  POST /client/start            start tquic_client
@@ -36,7 +37,7 @@ use tokio::sync::Mutex;
 use handlers::{
     client_start, client_status, client_stop, client_intervals,
     last_json_result, overall_status, server_clear, server_intervals,
-    server_last_json_result, server_start, server_status, server_stop,
+    server_last_json_result, server_scheduler_metrics, server_start, server_status, server_stop,
 };
 use state::{AppState, ProcessState};
 
@@ -67,6 +68,9 @@ async fn main() {
         last_server: Arc::new(Mutex::new(Vec::new())),
         last_mode_uplink: Arc::new(AtomicBool::new(false)),
         server_api_url: Arc::new(Mutex::new(None)),
+        last_server_scheduler_metrics: Arc::new(Mutex::new(Vec::new())),
+        last_server_scheduler_name: Arc::new(Mutex::new(None)),
+        last_server_metrics_uploaded: Arc::new(AtomicBool::new(false)),
     });
 
     let app = Router::new()
@@ -75,6 +79,7 @@ async fn main() {
         .route("/server/clear",           post(server_clear))
         .route("/server/status",          get(server_status))
         .route("/server/intervals",       get(server_intervals))
+        .route("/server/schedulerMetrics", get(server_scheduler_metrics))
         .route("/server/LastJsonResult",  get(server_last_json_result))
         .route("/client/start",           post(client_start))
         .route("/client/stop",            post(client_stop))

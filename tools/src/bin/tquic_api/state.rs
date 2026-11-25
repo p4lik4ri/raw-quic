@@ -101,4 +101,18 @@ pub struct AppState {
     /// caller supplies server_api_url.  /LastJsonResult will fetch
     /// /server/intervals from this URL when last_server is empty.
     pub server_api_url: Arc<Mutex<Option<String>>>,
+    /// Scheduler-metrics JSONL lines relayed from the server's stdout for the
+    /// most recent downlink session. The server has no outbound internet
+    /// access in this deployment, so it prints its wandb metrics instead of
+    /// uploading them directly; the client fetches them via
+    /// GET /server/schedulerMetrics and uploads to wandb on its behalf.
+    /// Cleared automatically on each new /server/start or /server/clear call.
+    pub last_server_scheduler_metrics: Arc<Mutex<Vec<String>>>,
+    /// Scheduler name (e.g. "minrtt", "linucb") relayed alongside the metrics
+    /// above, parsed from the server's `[wandb-metrics-scheduler]` stdout line.
+    pub last_server_scheduler_name: Arc<Mutex<Option<String>>>,
+    /// Guards against re-uploading the same downlink session's metrics to
+    /// wandb if /LastJsonResult is polled more than once. Reset on each new
+    /// /client/start call.
+    pub last_server_metrics_uploaded: Arc<AtomicBool>,
 }

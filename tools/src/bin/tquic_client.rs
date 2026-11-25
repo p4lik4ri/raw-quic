@@ -1269,12 +1269,7 @@ impl WorkerHandler {
             live_path1_bytes,
             live_path0_rtt,
             live_path1_rtt,
-            wandb_key: {
-                const DEFAULT_KEY: &str = "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";
-                let key = std::env::var("WANDB_API_KEY")
-                    .unwrap_or_else(|_| DEFAULT_KEY.to_string());
-                if !key.is_empty() { Some(key) } else { None }
-            },
+            wandb_key: tquic_tools::resolve_wandb_key(),
         }
     }
 

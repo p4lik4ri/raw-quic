@@ -53,7 +53,6 @@ use tquic::TransportHandler;
 use tquic_tools::CertCompressionAlgorithmArg;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
-use tquic_tools::wandb_logger::WandbLogger;
 
 #[cfg(unix)]
 #[global_allocator]
@@ -608,8 +607,6 @@ struct ServerHandler {
     actual_duration_bits: Arc<AtomicU64>,
     /// Time of the first connection establishment in this session.
     session_start: Option<Instant>,
-    /// wandb API key, consumed on the first multipath connection with LinUCB metrics.
-    wandb_key: Option<String>,
     /// Scheduler name for the wandb run label (e.g. "minrtt", "linucb").
     scheduler_name: String,
 }
@@ -649,12 +646,6 @@ impl ServerHandler {
             rep_done,
             actual_duration_bits,
             session_start: None,
-            wandb_key: {
-                const DEFAULT_KEY: &str = "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";
-                let key = std::env::var("WANDB_API_KEY")
-                    .unwrap_or_else(|_| DEFAULT_KEY.to_string());
-                if !key.is_empty() { Some(key) } else { None }
-            },
             scheduler_name: match option.multipath_algor {
                 MultipathAlgorithm::MinRtt        => "minrtt".to_string(),
                 MultipathAlgorithm::RoundRobin    => "roundrobin".to_string(),
@@ -741,22 +732,21 @@ impl TransportHandler for ServerHandler {
             if let Some(summary) = conn.multipath_scheduler_summary() {
                 info!("{}", summary);
             }
-            // Upload metrics to wandb only in downlink mode: the server is the
-            // sender, so its scheduler metrics are meaningful. In uplink the
-            // client uploads instead.
+            // In downlink mode the server is the sender, so its scheduler
+            // metrics are meaningful for wandb — but this host may have no
+            // outbound internet access (e.g. an isolated test network), so
+            // the server never calls wandb directly. Instead it prints the
+            // metrics JSONL to stdout with a `[wandb-metrics]` tag; the local
+            // tquic_api (reachable by the client over the test network, see
+            // GET /server/schedulerMetrics) picks these lines up and relays
+            // them to the client, which has internet access and performs the
+            // actual upload. In uplink mode the client uploads its own
+            // metrics directly instead.
             let metrics = conn.multipath_scheduler_metrics_jsonl();
             if !metrics.is_empty() && !self.is_uplink.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(key) = self.wandb_key.take() {
-                    let scheduler_name = self.scheduler_name.clone();
-                    // Run the wandb upload on a detached background thread: it
-                    // does blocking network I/O (up to the client's 20s HTTP
-                    // timeout) and must never stall the server's main event
-                    // loop or delay processing of other connections.
-                    thread::spawn(move || {
-                        if let Some(wb) = WandbLogger::new(&key, "quic", &scheduler_name) {
-                            wb.upload_history(&metrics);
-                        }
-                    });
+                println!("[wandb-metrics-scheduler] {}", self.scheduler_name);
+                for line in &metrics {
+                    println!("[wandb-metrics] {line}");
                 }
             }
             info!("{} per-path stats ({} paths):", conn.trace_id(), paths.len());
